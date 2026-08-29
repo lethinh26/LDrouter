@@ -1,9 +1,17 @@
 {
   "name": "ldrouter",
-  "version": "1.5.1",
+  "version": "1.6.0",
   "description": "LateDev Router — lightweight self-hosted LLM gateway with admin UI",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lethinh26/ldrouter.git"
+  },
+  "homepage": "https://github.com/lethinh26/ldrouter#readme",
+  "bugs": {
+    "url": "https://github.com/lethinh26/ldrouter/issues"
+  },
   "main": "dist/server/app.js",
   "bin": {
     "ldrouter": "dist/cli.js"
@@ -37,7 +45,11 @@
     "test:e2e": "playwright test",
     "db:migrate": "node --import tsx/esm scripts/migrate.ts",
     "migrate": "node --import tsx/esm scripts/migrate.ts",
-    "prepack": "pnpm run build"
+    "prepack": "pnpm run build",
+    "verify": "pnpm lint && pnpm typecheck && pnpm test",
+    "release:patch": "pnpm verify && npm version patch -m \"release: v%s\"",
+    "release:minor": "pnpm verify && npm version minor -m \"release: v%s\"",
+    "release:major": "pnpm verify && npm version major -m \"release: v%s\""
   },
   "dependencies": {
     "@fastify/cookie": "^11.0.2",

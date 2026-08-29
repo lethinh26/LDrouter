@@ -12,12 +12,22 @@ RUN pnpm install --frozen-lockfile --config.dangerouslyAllowAllBuilds
 RUN pnpm run build
 RUN pnpm prune --prod
 # Copy migrations into dist for container runtime (migrations ở project root)
-COPY ../migrations ./dist/migrations
+COPY migrations ./dist/migrations
 
 # --- runtime ---
 FROM node:22-alpine
+# Version stamp: CI passes --build-arg APP_VERSION=<tag> so the container
+# knows its own release (getAppVersion reads LATEDEV_APP_VERSION first).
+ARG APP_VERSION=0.0.0
+ARG VCS_REF=unknown
+LABEL org.opencontainers.image.title="ldrouter" \
+      org.opencontainers.image.description="LateDev Router — lightweight self-hosted LLM gateway" \
+      org.opencontainers.image.version="${APP_VERSION}" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.source="https://github.com/lethinh26/ldrouter"
 WORKDIR /app
 ENV NODE_ENV=production
+ENV LATEDEV_APP_VERSION=${APP_VERSION}
 RUN addgroup -S latedev && adduser -S latedev -G latedev
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/dist ./dist

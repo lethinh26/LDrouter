@@ -2,6 +2,7 @@ import { z } from 'zod';
 import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs';
+import { getAppVersion } from '../version';
 
 const EnvSchema = z.object({
   LATEDEV_HOST: z.string().default('0.0.0.0'),
@@ -77,7 +78,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, argv: string[] 
     logLevel: parsed.LATEDEV_LOG_LEVEL,
     env: parsed.NODE_ENV,
     isContainer,
-    appVersion: process.env.npm_package_version ?? '0.1.0',
+    appVersion: getAppVersion(),
   };
   return cached;
 }

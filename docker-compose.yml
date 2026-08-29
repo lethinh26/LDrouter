@@ -1,7 +1,18 @@
+# LateDev Router — production compose file.
+#
+# Default mode uses the published image from GHCR:
+#   docker compose pull && docker compose up -d
+# To build from source instead:  docker compose up -d --build
+#
+# Auto-update (opt-in):  docker compose --profile updater up -d
+# adds a Watchtower sidecar that pulls new ghcr.io images on a schedule
+# (hourly) and restarts the gateway. The admin UI can also trigger an
+# immediate update via Settings → System → Updates.
+
 services:
   latedev-router:
     build: .
-    image: latedev-router:latest
+    image: ${LATEDEV_IMAGE:-ghcr.io/lethinh26/ldrouter:latest}
     restart: unless-stopped
     ports:
       - "8787:8787"
@@ -12,6 +23,12 @@ services:
       LATEDEV_MASTER_KEY: ${LATEDEV_MASTER_KEY:-}
       LATEDEV_TRUST_PROXY: ${LATEDEV_TRUST_PROXY:-0}
       LATEDEV_LOG_LEVEL: ${LATEDEV_LOG_LEVEL:-info}
+      # Watchtower HTTP API — enables "Update now" from the admin UI.
+      LATEDEV_WATCHTOWER_URL: ${LATEDEV_WATCHTOWER_URL:-http://watchtower:8080}
+      LATEDEV_WATCHTOWER_TOKEN: ${LATEDEV_WATCHTOWER_TOKEN:-ldrouter-watchtower}
+    labels:
+      # Only containers carrying this label are updated by Watchtower.
+      com.centurylinklabs.watchtower.enable: "true"
     volumes:
       - latedev-router-data:/data
     healthcheck:
@@ -20,6 +37,24 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+  # Auto-updater sidecar (start with --profile updater). It needs the Docker
+  # socket, which is equivalent to root access on the host — keep the API
+  # token secret and do NOT publish its port to the internet.
+  watchtower:
+    profiles: ["updater"]
+    image: containrrr/watchtower:latest
+    restart: unless-stopped
+    environment:
+      # Update only containers labeled watchtower.enable=true.
+      WATCHTOWER_LABEL_ENABLE: "true"
+      # Poll hourly for new images; the admin UI can trigger instantly too.
+      WATCHTOWER_POLL_INTERVAL: "3600"
+      WATCHTOWER_CLEANUP: "true"
+      WATCHTOWER_HTTP_API_UPDATE: "true"
+      WATCHTOWER_HTTP_API_TOKEN: ${LATEDEV_WATCHTOWER_TOKEN:-ldrouter-watchtower}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
 
 volumes:
   latedev-router-data:

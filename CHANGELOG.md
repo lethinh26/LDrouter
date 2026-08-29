@@ -4,6 +4,32 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.6.0] - 2026-08-30
+
+### Added
+- Public releases: GitHub Actions publishes `ldrouter` to npm (with
+  provenance) and builds the multi-arch Docker image
+  `ghcr.io/lethinh26/ldrouter` (`X.Y.Z`, `X.Y`, `latest`) on every `vX.Y.Z`
+  tag; manual fallback via `scripts/publish.sh`.
+- Docker auto-update via an opt-in Watchtower sidecar
+  (`docker compose --profile updater up -d`): hourly image pulls plus an
+  instant "Update now" button in Settings → System that triggers Watchtower's
+  HTTP API; `/data` survives container recreation.
+- Release tooling: `pnpm release:patch|minor|major` (runs gates, bumps the
+  version, tags `vX.Y.Z`); release process documented in CLAUDE.md.
+- Docker images are version-stamped (`APP_VERSION` build arg +
+  `LATEDEV_APP_VERSION`) with OCI labels.
+
+### Changed
+- Single source of truth for the app version (`src/server/version.ts`);
+  the npm-mode self-update now shuts down gracefully (SIGTERM) instead of a
+  hard `process.exit`.
+
+### Fixed
+- Dockerfile `COPY ../migrations` (invalid path outside the build context)
+  → `COPY migrations`; `/health` and backups reported hardcoded `0.1.0` in
+  Docker where `npm_package_version` is unset.
+
 ## [1.5.1] - 2026-08-30
 
 ### Fixed

@@ -24,7 +24,9 @@ interface SysInfo { appVersion: string; dataDir: string; masterKeyConfigured: bo
 interface UpdateInfo {
   currentVersion: string; latestVersion: string | null; hasUpdate: boolean;
   changelogUrl: string | null; checkedAt: string;
-  status: { available: boolean; reason: string | null; updating: boolean; docker: boolean };
+  /** Docker only: is the Watchtower sidecar actually reachable right now */
+  watchtowerReachable: boolean | null;
+  status: { available: boolean; reason: string | null; updating: boolean; docker: boolean; watchtower: boolean };
 }
 
 export function Settings() {
@@ -54,9 +56,9 @@ export function Settings() {
     setUpdatePhase('installing');
     setUpdateError(null);
     try {
-      await api.post('/api/admin/update/run');
+      const r = await api.post<{ ok: boolean; message: string }>('/api/admin/update/run');
       setUpdatePhase('restarting');
-      toast.success('Update installed — restarting the gateway. The page will reload shortly.');
+      toast.success(r.message || 'Update started — the gateway will restart shortly.');
       // The server exits to let its supervisor restart on the new version;
       // poll until it is back, then reload to pick up the new bundle.
       const poll = setInterval(() => {
@@ -369,7 +371,7 @@ export function Settings() {
                       <div className="font-mono">{updateInfo.latestVersion ? `v${updateInfo.latestVersion}` : '—'}</div>
                     </div>
                     {updateInfo.status.docker ? (
-                      <Badge variant="secondary">Docker</Badge>
+                      <Badge variant="secondary">{updateInfo.status.watchtower ? 'Docker + Watchtower' : 'Docker'}</Badge>
                     ) : updateInfo.latestVersion === null ? (
                       <Badge variant="secondary">Registry unreachable</Badge>
                     ) : updateInfo.hasUpdate ? (
@@ -379,19 +381,25 @@ export function Settings() {
                     )}
                   </div>
 
-                  {updateInfo.status.docker && (
-                    <p className="text-muted-foreground">This instance runs in Docker — update by pulling the new image tag instead.</p>
+                  {updateInfo.status.docker && updateInfo.status.watchtower && updateInfo.watchtowerReachable && (
+                    <p className="text-muted-foreground">Watchtower pulls new images automatically every hour — or use Update now for an instant update.</p>
+                  )}
+                  {updateInfo.status.docker && updateInfo.status.watchtower && updateInfo.watchtowerReachable === false && (
+                    <p className="text-muted-foreground">The Watchtower sidecar is configured but not running — start it with <code className="rounded bg-muted px-1 text-xs">docker compose --profile updater up -d</code>.</p>
+                  )}
+                  {updateInfo.status.docker && !updateInfo.status.watchtower && (
+                    <p className="text-muted-foreground">{updateInfo.status.reason ?? 'This instance runs in Docker — update by pulling the new image tag.'}</p>
                   )}
                   {!updateInfo.status.docker && updateInfo.latestVersion === null && (
                     <p className="text-muted-foreground">Could not reach the npm registry (offline or blocked). {updateError && <span className="text-destructive">{updateError}</span>}</p>
                   )}
 
-                  {updatePhase === 'installing' && <div className="flex items-center gap-2 text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" /> Downloading and installing the update… this can take a minute.</div>}
-                  {updatePhase === 'restarting' && <div className="flex items-center gap-2 text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" /> Update installed — restarting the gateway. This page reloads automatically.</div>}
+                  {updatePhase === 'installing' && <div className="flex items-center gap-2 text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" /> Applying the update… this can take a minute.</div>}
+                  {updatePhase === 'restarting' && <div className="flex items-center gap-2 text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" /> Update applied — the gateway is restarting on the new version. This page reloads automatically.</div>}
 
                   <div className="flex flex-wrap items-center gap-2">
-                    {!updateInfo.status.docker && updateInfo.hasUpdate && updatePhase === 'idle' && (
-                      <Button disabled={updateBusy} onClick={runUpdate}><Download className="mr-1 h-4 w-4" /> Update now</Button>
+                    {updateInfo.hasUpdate && updatePhase === 'idle' && (!updateInfo.status.docker || (updateInfo.status.watchtower && updateInfo.watchtowerReachable !== false)) && (
+                      <Button disabled={updateBusy || (updateInfo.status.docker && updateInfo.watchtowerReachable === false)} onClick={runUpdate}><Download className="mr-1 h-4 w-4" /> Update now</Button>
                     )}
                     {updateInfo.hasUpdate && updateInfo.changelogUrl && (
                       <Button variant="outline" asChild><a href={updateInfo.changelogUrl} target="_blank" rel="noreferrer">View changes</a></Button>

@@ -45,6 +45,23 @@ Every completed change ships with a version bump — never merge a finished fix/
 
 Procedure for every completed change: bump `package.json` `version`, add an entry at the top of `CHANGELOG.md` (version, date, one-line summary per change), and commit both with the code. The in-app updater compares against the npm registry, so a published version must always be strictly newer than the previous one.
 
+## Release process (npm + Docker, every release)
+
+Publishing is one tag push; npm and the GHCR image always share the same version.
+
+1. Bump + CHANGELOG + commit (see above), or use `pnpm release:patch|minor|major` (runs lint/typecheck/test, bumps `package.json`, creates git tag `vX.Y.Z`).
+2. `git push && git push --tags` — the tag triggers `.github/workflows/release.yml`, which:
+   - runs all acceptance gates,
+   - `npm publish --provenance --access public` (needs the `NPM_TOKEN` repo secret),
+   - builds `linux/amd64`+`linux/arm64` with buildx and pushes `ghcr.io/lethinh26/ldrouter:X.Y.Z`, `:X.Y`, `:latest` (stamped via the `APP_VERSION` build arg).
+3. Verify: `npm view ldrouter version`, `docker pull ghcr.io/lethinh26/ldrouter:latest`.
+
+Manual fallback without CI: `bash scripts/publish.sh` (requires `npm login` + `docker login ghcr.io`). The repo must be on GitHub at `lethinh26/ldrouter` with the `NPM_TOKEN` secret configured.
+
+Updating a running deployment:
+- **npm install**: Settings → System → Updates → "Update now" (installs globally with the detected package manager, then graceful restart).
+- **Docker**: start with `docker compose --profile updater up -d` to add a Watchtower sidecar — hourly image pulls plus an instant "Update now" button; `/data` survives container recreation.
+
 ## Big-picture architecture (spans several docs)
 
 **Routers are software modules, not services.** One process owns the whole stack: HTTP compatibility layer → auth/IP/limits → model/alias resolver → combo router → protocol adapters → upstream client → logs/metrics/audit → admin API → static UI, over one SQLite WAL database.
@@ -81,7 +98,7 @@ When unspecified, decision defaults: fewer dependencies, secure-by-default, expl
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **LateDev Router** (1433 symbols, 3499 relationships, 109 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **LateDev Router** (1473 symbols, 3614 relationships, 113 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
 

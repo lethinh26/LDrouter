@@ -11,9 +11,9 @@ import { recordAudit } from '../../db/repositories/audit';
 import { loadConfig } from '../../config/index';
 import { getSettings } from '../../db/repositories/settings';
 import { GatewayError } from '../../errors';
+import { getAppVersion } from '../../version';
 
 const BACKUP_VERSION = 1;
-const APP_VERSION = '0.1.0';
 
 interface BackupEnvelope {
   format: 'latedev-backup';
@@ -47,7 +47,7 @@ export async function registerBackupRoutes(app: FastifyInstance): Promise<void> 
     const envelope: BackupEnvelope = {
       format: 'latedev-backup',
       version: BACKUP_VERSION,
-      appVersion: APP_VERSION,
+      appVersion: getAppVersion(),
       schemaVersion: settings.schemaVersion,
       masterKeyConfigured: settings.masterKeyConfigured,
       createdAt: new Date().toISOString(),
