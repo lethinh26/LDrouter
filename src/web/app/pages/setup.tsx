@@ -1,4 +1,6 @@
-// Setup page: first-run admin creation.
+// Setup page: first-run admin creation. The master encryption key is REQUIRED
+// (unless already configured via LATEDEV_MASTER_KEY) — provider credentials are
+// encrypted with it, so the admin must keep a copy.
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Button } from '../../components/ui/button';
@@ -13,7 +15,20 @@ export function Setup() {
   const [password, setPassword] = useState('');
   const [masterKey, setMasterKey] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  // true = master key must be entered on this form; false = already configured
+  // via LATEDEV_MASTER_KEY (field hidden).
+  const [masterKeyRequired, setMasterKeyRequired] = useState(true);
   const navigate = useNavigate();
+
+  useEffect(() => {
+    api.get<{ masterKeyConfigured: boolean }>('/api/admin/setup/status')
+      .then((s) => setMasterKeyRequired(!s.masterKeyConfigured))
+      .catch(() => setMasterKeyRequired(true));
+  }, []);
+
+  const keyOk = !masterKeyRequired || masterKey.trim().length >= 32;
+  const canSubmit = !submitting && password.length >= 12 && keyOk;
+
   return (
     <div className="flex min-h-screen items-center justify-center bg-background p-4">
       <Card className="w-full max-w-md">
@@ -33,20 +48,26 @@ export function Setup() {
             <Label>Password (12+ chars)</Label>
             <Input type="password" value={password} onChange={(e) => setPassword(e.target.value)} />
           </div>
-          <div className="space-y-1">
-            <Label>Master encryption key (optional, 32+ chars)</Label>
-            <Input value={masterKey} onChange={(e) => setMasterKey(e.target.value)} placeholder="Auto-generated if empty" />
-            <p className="text-xs text-muted-foreground">Once set, provider credentials will be encrypted with this key. Save it somewhere safe.</p>
-          </div>
+          {masterKeyRequired && (
+            <div className="space-y-1">
+              <Label>Master encryption key (required, 32+ chars)</Label>
+              <Input type="password" value={masterKey} onChange={(e) => setMasterKey(e.target.value)} placeholder="Paste or generate a 32+ character key" />
+              <p className="text-xs text-muted-foreground">
+                Provider API keys are encrypted with this key (AES-256-GCM). Store it somewhere safe —
+                if it is lost, stored provider credentials cannot be recovered.
+                Generate one with:{' '}
+                <code className="break-all">{'node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'base64\'))"'}</code>
+              </p>
+            </div>
+          )}
         </CardContent>
         <CardFooter>
-          <Button disabled={submitting || password.length < 12} onClick={async () => {
+          <Button disabled={!canSubmit} onClick={async () => {
             setSubmitting(true);
             try {
-              await api.post('/api/admin/setup', { username, password, setupMasterKey: masterKey || undefined });
+              await api.post('/api/admin/setup', { username, password, setupMasterKey: masterKeyRequired ? masterKey.trim() : undefined });
               toast.success('Admin account created');
               navigate('/login', { replace: true });
-              window.location.reload();
             } catch (e) {
               toast.error((e as Error).message);
             } finally { setSubmitting(false); }

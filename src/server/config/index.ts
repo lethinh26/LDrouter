@@ -32,6 +32,16 @@ export interface RuntimeConfig {
 
 let cached: RuntimeConfig | null = null;
 
+/** Empty-string env vars (e.g. `LATEDEV_MASTER_KEY:` in docker-compose) must not
+ *  shadow real defaults — treat them as unset. */
+function normalizeEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = { ...env };
+  for (const k of Object.keys(out)) {
+    if (out[k] === '') delete out[k];
+  }
+  return out;
+}
+
 function readMasterKeyFile(dataDir: string): string | null {
   try {
     const p = path.join(dataDir, 'master.key');
@@ -47,7 +57,7 @@ function readMasterKeyFile(dataDir: string): string | null {
 export function loadConfig(env: NodeJS.ProcessEnv = process.env, argv: string[] = process.argv): RuntimeConfig {
   if (cached) return cached;
 
-  const parsed = EnvSchema.parse(env);
+  const parsed = EnvSchema.parse(normalizeEnv(env));
   const cliArgs = parseArgs(argv);
   const dataDir =
     cliArgs.dataDir ??

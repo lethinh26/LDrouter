@@ -15,7 +15,7 @@ function extractPngFromSvg(svgPath: string): Buffer {
   return Buffer.from(match[1]!, 'base64');
 }
 
-function boxDownsample(src: PNG.PNG, targetSize: number): PNG.PNG {
+function boxDownsample(src: PNG, targetSize: number): PNG {
   const dst = new PNG({ width: targetSize, height: targetSize });
   const scale = src.width / targetSize; // source pixels per output pixel
   for (let y = 0; y < targetSize; y++) {
@@ -26,7 +26,7 @@ function boxDownsample(src: PNG.PNG, targetSize: number): PNG.PNG {
       for (let sy = y0; sy < y1; sy++) {
         for (let sx = x0; sx < x1; sx++) {
           const i = (sy * src.width + sx) * 4;
-          r += src.data[i]; g += src.data[i + 1]; b += src.data[i + 2]; a += src.data[i + 3];
+          r += src.data[i]!; g += src.data[i + 1]!; b += src.data[i + 2]!; a += src.data[i + 3]!;
           n++;
         }
       }

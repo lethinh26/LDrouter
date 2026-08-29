@@ -11,6 +11,19 @@ import { runMigrations } from './migrate';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+/** Locate the migrations directory across the possible layouts:
+ *  - Docker dist:          dist/server/db → ../../migrations   (dist/migrations)
+ *  - npm package dist:     dist/server/db → ../../../migrations (<pkg>/migrations)
+ *  - source tree (dev/test): src/server/db → ../../../migrations (repo/migrations)
+ */
+function resolveMigrationsDir(): string {
+  const distDir = path.resolve(__dirname, '../../migrations');
+  const rootDir = path.resolve(__dirname, '../../../migrations');
+  if (fs.existsSync(distDir)) return distDir;
+  if (fs.existsSync(rootDir)) return rootDir;
+  return distDir; // let runMigrations log the missing-dir fallback
+}
+
 let _db: BetterSQLite3Database<typeof schema> | null = null;
 let _raw: Database.Database | null = null;
 
@@ -37,7 +50,7 @@ export function openDb(dbFile: string): DbHandle {
   _raw = raw;
   _db = db;
 
-  runMigrations(raw, getLogger(), path.resolve(__dirname, '../../migrations'));
+  runMigrations(raw, getLogger(), resolveMigrationsDir());
   return { db, raw };
 }
 

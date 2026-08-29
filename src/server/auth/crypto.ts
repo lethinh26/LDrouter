@@ -20,28 +20,29 @@ export class MasterKeyError extends Error {
 let cachedKey: Buffer | null = null;
 let cachedKeyVersion = 1;
 
+/** Parse a raw master-key string into 32 key bytes. Accepts 32-byte base64
+ *  (44 chars) or a plain 32-character string. Exported so setup can reject
+ *  malformed keys up front instead of failing later at first encrypt. */
+export function parseMasterKey(raw: string): Buffer {
+  let decoded: Buffer;
+  try {
+    decoded = Buffer.from(raw, 'base64');
+  } catch {
+    decoded = Buffer.alloc(0);
+  }
+  if (decoded.length === 32) return decoded;
+  if (raw.length === 32) return Buffer.from(raw, 'utf8');
+  throw new MasterKeyError('Master key must be 32 bytes encoded as base64 (44 chars) or a plain 32-character string');
+}
+
 export function getMasterKey(): Buffer {
   if (cachedKey) return cachedKey;
   const cfg = loadConfig();
   if (!cfg.masterKey) {
     throw new MasterKeyError('LATEDEV_MASTER_KEY is not configured');
   }
-  let key: Buffer;
-  try {
-    key = Buffer.from(cfg.masterKey, 'base64');
-  } catch {
-    key = Buffer.alloc(0);
-  }
-  if (key.length !== 32) {
-    // Accept a plain 32-char string too; otherwise error.
-    if (cfg.masterKey.length === 32) {
-      key = Buffer.from(cfg.masterKey, 'utf8');
-    } else {
-      throw new MasterKeyError('LATEDEV_MASTER_KEY must be 32 bytes base64 or a 32-char string');
-    }
-  }
-  cachedKey = key;
-  return key;
+  cachedKey = parseMasterKey(cfg.masterKey);
+  return cachedKey;
 }
 
 export function isMasterKeyConfigured(): boolean {

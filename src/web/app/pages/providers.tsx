@@ -31,6 +31,7 @@ export function Providers() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editForm, setEditForm] = useState<typeof EMPTY>(EMPTY);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [deleteSubmitting, setDeleteSubmitting] = useState(false);
 
   const reload = () => api.get<{ providers: Provider[] }>('/api/admin/providers').then((r) => setRows(r.providers));
   useEffect(() => { void reload(); }, []);
@@ -85,11 +86,12 @@ export function Providers() {
     finally { setSubmitting(false); }
   };
 
+  // Runs after the AlertDialog confirmation — deletingId is the row under deletion.
   const del = async (id: string) => {
-    setDeletingId(id);
+    setDeleteSubmitting(true);
     try { await api.del(`/api/admin/providers/${id}`); toast.success('Provider removed'); void reload(); }
     catch (e) { toast.error((e as Error).message); }
-    finally { setDeletingId(null); }
+    finally { setDeleteSubmitting(false); setDeletingId(null); }
   };
 
   return (
@@ -152,7 +154,7 @@ export function Providers() {
                     <div className="flex justify-end gap-1">
                       <Button size="sm" variant="outline" disabled={testingId === p.id} onClick={() => test(p.id)}><Play className="h-3 w-3" /></Button>
                       <Button size="sm" variant="outline" onClick={() => startEdit(p)}>✎</Button>
-                      <Button size="sm" variant="outline" disabled={deletingId === p.id} onClick={() => del(p.id)}><Trash2 className="h-3 w-3" /></Button>
+                      <Button size="sm" variant="outline" onClick={() => setDeletingId(p.id)}><Trash2 className="h-3 w-3" /></Button>
                     </div>
                   </TableCell>
                 </TableRow>
@@ -198,7 +200,16 @@ export function Providers() {
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction disabled={!!deletingId} onClick={() => deletingId && del(deletingId)}>Delete</AlertDialogAction>
+            <AlertDialogAction
+              disabled={deleteSubmitting}
+              onClick={(e) => {
+                if (!deletingId) return;
+                e.preventDefault(); // keep the dialog open until the request settles
+                void del(deletingId);
+              }}
+            >
+              {deleteSubmitting ? 'Deleting…' : 'Delete'}
+            </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>

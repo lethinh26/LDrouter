@@ -13,6 +13,7 @@ import { getLogger } from './logging/logger';
 import { openDb, closeDb, getDb, schema } from './db/index';
 import { getSettings, markSetupComplete } from './db/repositories/settings';
 import { GatewayError, toAnthropicError, toOpenAIError } from './errors';
+import { ZodError } from 'zod';
 import { generateRequestId } from './auth/ids';
 import { recordAudit } from './db/repositories/audit';
 import { isMasterKeyConfigured } from './auth/crypto';
@@ -57,13 +58,25 @@ export async function buildApp(opts: AppOptions = {}): Promise<App> {
   });
 
   app.setErrorHandler((err: unknown, req: { id: string | number; headers: Record<string, string | string[] | undefined>; url: string; log: { error: (o: object, m: string) => void; warn: (o: object, m: string) => void } }, reply: { code: (n: number) => { send: (v: unknown) => void }; send: (v: unknown) => void }) => {
-    const g = err instanceof GatewayError ? err : null;
+    // Zod validation failures surface as 400 with readable field messages;
+    // otherwise they fall through to the generic 500 "Gateway error" envelope.
+    const normalized = err instanceof ZodError
+      ? new GatewayError('invalid_request_error', err.issues.map((i) => `${i.path.join('.') || 'body'}: ${i.message}`).join('; '), { status: 400 })
+      : err;
+    const g = normalized instanceof GatewayError ? normalized : null;
     const status = g?.status ?? 500;
     const requestId = req.id as string;
-    const log = req.log;
-    const errMsg = err instanceof Error ? err.message : String(err);
-    if (status >= 500) log.error({ err: errMsg, requestId }, 'request error');
-    else log.warn({ err: { type: (g?.type ?? 'error'), message: errMsg }, requestId }, 'request rejected');
+    // Fastify runs with `logger: false`, so req.log is a silent no-op — use the app
+    // logger so failures actually show up in `docker logs`.
+    const log = getLogger();
+    const errMsg = normalized instanceof Error ? normalized.message : String(normalized);
+    const errDetail = {
+      name: normalized instanceof Error ? normalized.name : undefined,
+      message: errMsg,
+      stack: normalized instanceof Error ? normalized.stack : undefined,
+    };
+    if (status >= 500) log.error({ requestId, url: req.url, err: errDetail }, 'request error');
+    else log.warn({ requestId, url: req.url, err: { type: (g?.type ?? 'error'), message: errMsg } }, 'request rejected');
 
     const accept = (req.headers['accept'] ?? '').toString();
     const isAnthropic = accept.includes('application/vnd.anthropic') || req.url.includes('/v1/messages');

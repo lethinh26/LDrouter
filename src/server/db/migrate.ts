@@ -7,8 +7,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
-const SCHEMA_VERSION = 2;
-
 interface MigrationFile {
   version: number;
   name: string;
@@ -52,8 +50,8 @@ export function runMigrations(raw: Database.Database, log: Logger, migrationsDir
     return { version: ver, name: f.replace(/^\d+_/, '').replace(/\.sql$/, ''), sql };
   });
 
-  // Always ensure a version 1 bootstrap exists
-  if (!parsed.some((m) => m.version === SCHEMA_VERSION) && applied.size === 0) {
+  // Always ensure a version 1 bootstrap exists on fresh databases
+  if (!parsed.some((m) => m.version === 1) && applied.size === 0) {
     const bootstrap = generateBootstrapMigration();
     parsed.unshift(bootstrap);
   }
@@ -80,11 +78,14 @@ function ensureSettingsRow(raw: Database.Database, log: Logger): void {
 }
 
 function generateBootstrapMigration(): MigrationFile {
-  // The complete bootstrap SQL. Version 1 contains the entire initial schema.
-  // Subsequent migrations are loaded from /migrations folder if present.
+  // The complete bootstrap SQL. Version 1 contains the entire initial schema;
+  // subsequent migrations (0002+) are loaded from the migrations folder and
+  // applied on top. Keeping this at version 1 (not SCHEMA_VERSION) matters:
+  // file migrations use the same 1-based numbering, so a bootstrap stamped
+  // with a higher version would block the real file migrations.
   const schemaSql = buildInitialSchemaSql();
   return {
-    version: SCHEMA_VERSION,
+    version: 1,
     name: 'initial_schema',
     sql: schemaSql,
   };

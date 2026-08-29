@@ -37,6 +37,26 @@ describe('config master key', () => {
     expect(cfg.masterKey).toBeNull();
   });
 
+  it('empty-string LATEDEV_MASTER_KEY does not shadow master.key file (docker-compose case)', () => {
+    // docker-compose `LATEDEV_MASTER_KEY: ${LATEDEV_MASTER_KEY:-}` injects an EMPTY
+    // STRING (not undefined) when the host var is unset. That empty string used to
+    // win over the master.key file via `??`, breaking all provider decrypts after a
+    // container restart with "Gateway error".
+    fs.mkdirSync(tmpDir, { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, 'master.key'), 'b'.repeat(32), 'utf8');
+    process.env.LATEDEV_MASTER_KEY = '';
+    const cfg = loadConfig(process.env, []);
+    expect(cfg.masterKey).toBe('b'.repeat(32));
+    expect(isMasterKeyConfigured()).toBe(true);
+  });
+
+  it('empty-string env vars fall back to schema defaults', () => {
+    process.env.LATEDEV_LOG_LEVEL = '';
+    const cfg = loadConfig(process.env, []);
+    expect(cfg.logLevel).toBe('info');
+    delete process.env.LATEDEV_LOG_LEVEL;
+  });
+
   it('setConfigMasterKey updates cached config for crypto reads', () => {
     resetConfigForTests();
     loadConfig(process.env, []);
