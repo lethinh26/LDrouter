@@ -1,0 +1,16 @@
+node_modules
+dist
+.tmp
+.cache
+.git
+.env
+.env.local
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+data
+playwright-report
+test-results
+coverage
+.vite
+.DS_Store

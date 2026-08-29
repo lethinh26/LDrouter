@@ -1,0 +1,25 @@
+services:
+  latedev-router:
+    build: .
+    image: latedev-router:latest
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    environment:
+      LATEDEV_HOST: 0.0.0.0
+      LATEDEV_PORT: 8787
+      LATEDEV_DATA_DIR: /data
+      LATEDEV_MASTER_KEY: ${LATEDEV_MASTER_KEY:-}
+      LATEDEV_TRUST_PROXY: ${LATEDEV_TRUST_PROXY:-0}
+      LATEDEV_LOG_LEVEL: ${LATEDEV_LOG_LEVEL:-info}
+    volumes:
+      - latedev-router-data:/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:8787/health', r => process.exit(r.statusCode===200?0:1)).on('error', () => process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  latedev-router-data:
