@@ -183,6 +183,15 @@ describe('gateway smoke', () => {
     expect((await chat.json()).choices[0].message.content).toBe('via combo');
   });
 
+  it('GET /api/admin/stats returns summary, series and top tables', async () => {
+    const res = await fetch(`${baseUrl}/api/admin/stats?preset=7d`, { headers: { cookie: csrfCookies } });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.summary.totalRequests).toBeGreaterThan(0);
+    expect(Array.isArray(body.series)).toBe(true);
+    expect(body.topModels.some((m: { publicId: string }) => m.publicId === 'mock/gpt-mock')).toBe(true);
+  });
+
   it('rejects invalid keys', async () => {
     const res = await fetch(`${baseUrl}/v1/chat/completions`, {
       method: 'POST',

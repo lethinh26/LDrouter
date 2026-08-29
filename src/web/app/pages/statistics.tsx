@@ -26,8 +26,18 @@ interface Stats {
 export function Statistics() {
   const [preset, setPreset] = useState<'today' | '7d' | '30d'>('7d');
   const [data, setData] = useState<Stats | null>(null);
-  useEffect(() => { api.get<Stats>(`/api/admin/stats?preset=${preset}`).then(setData).catch(() => setData(null)); }, [preset]);
-  if (!data) return <div className="text-muted-foreground">Loading…</div>;
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    setLoading(true);
+    setError(null);
+    api.get<Stats>(`/api/admin/stats?preset=${preset}`)
+      .then((r) => { setData(r); })
+      .catch((e) => { setError((e as Error).message); })
+      .finally(() => setLoading(false));
+  }, [preset]);
+  if (loading) return <div className="text-muted-foreground">Loading…</div>;
+  if (error || !data) return <div className="text-destructive">Failed to load statistics: {error ?? 'unknown error'}</div>;
   const s = data.summary;
   return (
     <div>

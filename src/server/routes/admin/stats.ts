@@ -126,7 +126,9 @@ export async function registerStatsRoutes(app: FastifyInstance): Promise<void> {
       .from(schema.requests)
       .where(and(...conds))
       .groupBy(schema.requests.finalModelId)
-      .orderBy(desc(sql`c`))
+      // Order by the aggregate expression itself: SQLite rejects ORDER BY on a
+      // quoted select alias ("no such column: c").
+      .orderBy(desc(sql`COUNT(*)`))
       .limit(10)
       .all();
     const models = db.select().from(schema.models).all();
@@ -140,7 +142,7 @@ export async function registerStatsRoutes(app: FastifyInstance): Promise<void> {
       .from(schema.requests)
       .where(and(...conds))
       .groupBy(schema.requests.apiKeyId)
-      .orderBy(desc(sql`c`))
+      .orderBy(desc(sql`COUNT(*)`))
       .limit(10)
       .all();
     const keys = db.select().from(schema.apiKeys).all();
@@ -155,7 +157,7 @@ export async function registerStatsRoutes(app: FastifyInstance): Promise<void> {
       .from(schema.requestAttempts)
       .where(and(gte(schema.requestAttempts.startedAt, fromIso), lte(schema.requestAttempts.startedAt, toIso)))
       .groupBy(schema.requestAttempts.providerId)
-      .orderBy(desc(sql`c`))
+      .orderBy(desc(sql`COUNT(*)`))
       .all();
     const providers = db.select().from(schema.providers).all();
     const providerMap = new Map(providers.map((p) => [p.id, p]));
