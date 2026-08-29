@@ -2,7 +2,7 @@
 
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { eq } from 'drizzle-orm';
+import { eq, inArray } from 'drizzle-orm';
 import { getDb, schema } from '../../db/index';
 import { authenticateGatewayKey, type AuthenticatedKey } from '../../auth/api-key';
 import { resolveClientIp } from '../../util/client-ip';
@@ -42,13 +42,12 @@ export async function registerOpenAIRoutes(app: FastifyInstance): Promise<void> 
     if (!key.allowAllModels) {
       const perms = db.select().from(schema.apiKeyModelPermissions).where(eq(schema.apiKeyModelPermissions.apiKeyId, key.id)).all();
       const allowedModelIds = new Set(perms.filter((p) => p.targetKind === 'model').map((p) => p.targetId));
-      const allowedComboIds = new Set(perms.filter((p) => p.targetKind === 'combo').map((p) => p.targetId));
       models = models.filter((m) => allowedModelIds.has(m.id) || (m.enabled && m.upstreamAvailable));
-      void allowedComboIds;
     } else {
       models = models.filter((m) => m.enabled && m.upstreamAvailable);
     }
-    return openAIModelList(models.map((m) => ({ publicModelId: m.publicModelId, upstreamModelId: m.upstreamModelId })));
+    const ids = listRoutableModelIds(models, key, db);
+    return openAIModelList(ids.map((id) => ({ publicModelId: id, upstreamModelId: id })));
   });
 
   app.post('/v1/chat/completions', async (req, reply) => {
@@ -196,6 +195,51 @@ export async function registerOpenAIRoutes(app: FastifyInstance): Promise<void> 
       throw e;
     }
   });
+}
+
+// The routable surface visible to a gateway key: physical models + enabled
+// combos + enabled aliases. Eligibility mirrors resolveRequestedModel() so
+// every advertised id actually routes. Physical models are listed even when
+// their provider is disabled — the resolver accepts them too and candidates
+// get filtered at route time (explicit behavior over silent omission).
+interface ModelRow { id: string; publicModelId: string }
+type GatewayDb = ReturnType<typeof getDb>;
+export function listRoutableModelIds(models: ModelRow[], key: AuthenticatedKey, db: GatewayDb): string[] {
+  const modelIds = new Set(models.map((m) => m.id));
+  const modelById = new Map(models.map((m) => [m.id, m.publicModelId]));
+
+  let combos = db.select().from(schema.combos).where(eq(schema.combos.enabled, true)).all();
+  const members = combos.length > 0
+    ? db.select().from(schema.comboMembers).where(inArray(schema.comboMembers.comboId, combos.map((c) => c.id))).all()
+    : [];
+  const memberByCombo = new Map<string, Set<string>>();
+  for (const mm of members) {
+    if (!memberByCombo.has(mm.comboId)) memberByCombo.set(mm.comboId, new Set());
+    memberByCombo.get(mm.comboId)!.add(mm.modelId);
+  }
+  // A combo with no routable members would always fail at runtime — hide it.
+  combos = combos.filter((c) => {
+    const ids = memberByCombo.get(c.id);
+    return ids !== undefined && ids.size > 0 && [...ids].some((id) => modelIds.has(id));
+  });
+
+  let aliases = db.select().from(schema.modelAliases).where(eq(schema.modelAliases.enabled, true)).all();
+  aliases = aliases.filter((a) => {
+    if (a.targetKind === 'model') return modelById.has(a.targetId);
+    return combos.some((c) => c.id === a.targetId);
+  });
+
+  const ids = models.map((m) => m.publicModelId).concat(combos.map((c) => c.publicModelId), aliases.map((a) => a.alias));
+
+  if (key.allowAllModels) return ids;
+  const perms = db.select().from(schema.apiKeyModelPermissions).where(eq(schema.apiKeyModelPermissions.apiKeyId, key.id)).all();
+  const allowModels = new Set(perms.filter((p) => p.targetKind === 'model').map((p) => p.targetId));
+  const allowCombos = new Set(perms.filter((p) => p.targetKind === 'combo').map((p) => p.targetId));
+  return ids.filter((id) =>
+    models.some((m) => m.publicModelId === id && allowModels.has(m.id))
+    || combos.some((c) => c.publicModelId === id && allowCombos.has(c.id))
+    || aliases.some((a) => a.alias === id && (a.targetKind === 'model' ? allowModels.has(a.targetId) : allowCombos.has(a.targetId))),
+  );
 }
 
 function authenticateGatewayHeaders(req: { headers: Record<string, string | string[] | undefined> }): AuthenticatedKey {

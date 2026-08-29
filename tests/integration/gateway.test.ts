@@ -109,6 +109,28 @@ describe('gateway smoke', () => {
     expect(body.data.some((m: { id: string }) => m.id === 'mock/gpt-mock')).toBe(true);
   });
 
+  it('GET /v1/models lists enabled combos and aliases; hides memberless combos', async () => {
+    const db = (await import('../../src/server/db/index')).getDb();
+    const sch = await import('../../src/server/db/schema');
+    const { uuid } = await import('../../src/server/auth/ids');
+    const model = db.select().from(sch.models).all().find((m) => m.publicModelId === 'mock/gpt-mock')!;
+    const comboId = uuid();
+    db.insert(sch.combos).values({ id: comboId, name: 'sol-combo', slug: 'sol-combo', publicModelId: 'combo/sol-combo', mode: 'fallback', enabled: true }).run();
+    db.insert(sch.comboMembers).values({ id: uuid(), comboId, modelId: model.id, position: 0, weight: 1, enabled: true }).run();
+    db.insert(sch.modelAliases).values({ id: uuid(), alias: 'my-alias', targetKind: 'combo', targetId: comboId, enabled: true }).run();
+    // A combo with no members can never route — must not be advertised.
+    db.insert(sch.combos).values({ id: uuid(), name: 'empty-combo', slug: 'empty-combo', publicModelId: 'combo/empty-combo', mode: 'fallback', enabled: true }).run();
+
+    const res = await fetch(`${baseUrl}/v1/models`, { headers: { authorization: `Bearer ${apiKey!.secret}` } });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    const ids = body.data.map((m: { id: string }) => m.id) as string[];
+    expect(ids).toContain('mock/gpt-mock');
+    expect(ids).toContain('combo/sol-combo');
+    expect(ids).toContain('my-alias');
+    expect(ids).not.toContain('combo/empty-combo');
+  });
+
   it('rejects invalid keys', async () => {
     const res = await fetch(`${baseUrl}/v1/chat/completions`, {
       method: 'POST',
