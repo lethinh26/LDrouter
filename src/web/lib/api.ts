@@ -9,10 +9,14 @@ export class ApiError extends Error {
 }
 
 async function request<T>(method: string, path: string, body?: unknown, init?: RequestInit): Promise<T> {
+  // Only set content-type when there IS a body: Fastify rejects an empty
+  // request body that carries `content-type: application/json`
+  // ("Body cannot be empty when content-type is set to 'application/json'").
+  const hasBody = body !== undefined;
   const res = await fetch(`${baseUrl}${path}`, {
     method,
-    headers: { 'content-type': 'application/json', ...(init?.headers ?? {}) },
-    body: body !== undefined ? JSON.stringify(body) : undefined,
+    headers: { ...(hasBody ? { 'content-type': 'application/json' } : {}), ...(init?.headers ?? {}) },
+    body: hasBody ? JSON.stringify(body) : undefined,
     credentials: 'include',
     ...init,
   });
