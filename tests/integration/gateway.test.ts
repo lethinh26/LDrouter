@@ -192,6 +192,15 @@ describe('gateway smoke', () => {
     expect(body.topModels.some((m: { publicId: string }) => m.publicId === 'mock/gpt-mock')).toBe(true);
   });
 
+  it('GET /api/admin/update/check never 500s (registry unreachable or unpublished package)', async () => {
+    const res = await fetch(`${baseUrl}/api/admin/update/check?force=1`, { headers: { cookie: csrfCookies } });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.currentVersion).toBeTypeOf('string');
+    expect(typeof body.hasUpdate).toBe('boolean');
+    expect(body.status).toHaveProperty('available');
+  });
+
   it('rejects invalid keys', async () => {
     const res = await fetch(`${baseUrl}/v1/chat/completions`, {
       method: 'POST',

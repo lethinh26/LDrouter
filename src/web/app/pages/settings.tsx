@@ -6,10 +6,12 @@ import { Input } from '../../components/ui/input';
 import { Label } from '../../components/ui/label';
 import { Switch } from '../../components/ui/switch';
 import { Button } from '../../components/ui/button';
+import { Badge } from '../../components/ui/badge';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../../components/ui/select';
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger } from '../../components/ui/alert-dialog';
 import { api } from '../../lib/api';
 import { toast } from 'sonner';
+import { CheckCircle2, Download, Loader2 } from 'lucide-react';
 
 interface Settings {
   setupComplete: boolean; retentionDays: number; contentLogMode: string; dbSizeLimitMb: number;
@@ -19,10 +21,58 @@ interface Settings {
 
 interface SysInfo { appVersion: string; dataDir: string; masterKeyConfigured: boolean; masterKeyVersion: number; environment: string; }
 
+interface UpdateInfo {
+  currentVersion: string; latestVersion: string | null; hasUpdate: boolean;
+  changelogUrl: string | null; checkedAt: string;
+  status: { available: boolean; reason: string | null; updating: boolean; docker: boolean };
+}
+
 export function Settings() {
   const [s, setS] = useState<Settings | null>(null);
   const [sys, setSys] = useState<SysInfo | null>(null);
   const [passwords, setPasswords] = useState({ current: '', next: '' });
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
+  const [updateBusy, setUpdateBusy] = useState(false);
+  const [updatePhase, setUpdatePhase] = useState<'idle' | 'checking' | 'installing' | 'restarting' | 'error'>('idle');
+  const [updateError, setUpdateError] = useState<string | null>(null);
+
+  const checkUpdate = async (force = false) => {
+    setUpdatePhase('checking');
+    setUpdateError(null);
+    try {
+      const r = await api.get<UpdateInfo>(`/api/admin/update/check${force ? '?force=1' : ''}`);
+      setUpdateInfo(r);
+      setUpdatePhase('idle');
+    } catch (e) {
+      setUpdateError((e as Error).message);
+      setUpdatePhase('error');
+    }
+  };
+
+  const runUpdate = async () => {
+    setUpdateBusy(true);
+    setUpdatePhase('installing');
+    setUpdateError(null);
+    try {
+      await api.post('/api/admin/update/run');
+      setUpdatePhase('restarting');
+      toast.success('Update installed — restarting the gateway. The page will reload shortly.');
+      // The server exits to let its supervisor restart on the new version;
+      // poll until it is back, then reload to pick up the new bundle.
+      const poll = setInterval(() => {
+        fetch('/health').then((r) => {
+          if (r.ok) { clearInterval(poll); window.location.reload(); }
+        }).catch(() => { /* still restarting */ });
+      }, 3000);
+      setTimeout(() => clearInterval(poll), 120_000);
+    } catch (e) {
+      toast.error((e as Error).message);
+      setUpdateError((e as Error).message);
+      setUpdatePhase('error');
+    } finally {
+      setUpdateBusy(false);
+    }
+  };
   // TOTP state
   const [totpState, setTotpState] = useState<'disabled' | 'enabled' | 'setup' | 'verifying' | 'showingRecovery'>('disabled');
   const [totpSecret, setTotpSecret] = useState('');
@@ -45,7 +95,7 @@ export function Settings() {
       setTotpState(me.totpEnabled ? 'enabled' : 'disabled');
     } catch { /* ignore */ }
   };
-  useEffect(() => { void reload(); }, []);
+  useEffect(() => { void reload(); void checkUpdate(); }, []);
   if (!s) return <div className="text-muted-foreground">Loading…</div>;
   const update = async (patch: Partial<Settings>) => {
     try { await api.patch('/api/admin/settings', patch); toast.success('Saved'); void reload(); }
@@ -294,6 +344,64 @@ export function Settings() {
                 <div><Label>Cache max size (MB)</Label><Input type="number" min={1} value={s.gatewayCacheMaxSizeMb} onChange={(e) => update({ gatewayCacheMaxSizeMb: Number(e.target.value) })} /></div>
               </div>
               <Button variant="outline" onClick={async () => { const r = await api.post<{ deleted: number }>('/api/admin/settings/cache/clear'); toast.success(`Cleared ${r.deleted} entries`); }}>Clear gateway cache</Button>
+            </CardContent>
+          </Card>
+
+          <Card className="mt-4">
+            <CardHeader>
+              <CardTitle className="text-base">Updates</CardTitle>
+              <CardDescription>Automatic updates from the npm registry</CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-3 text-sm">
+              {updatePhase === 'checking' && !updateInfo && (
+                <div className="flex items-center gap-2 text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" /> Checking for updates…</div>
+              )}
+              {updateInfo && (
+                <>
+                  <div className="flex flex-wrap items-center gap-4">
+                    <div>
+                      <div className="text-xs text-muted-foreground">Current version</div>
+                      <div className="font-mono">v{updateInfo.currentVersion}</div>
+                    </div>
+                    <span className="text-muted-foreground">→</span>
+                    <div>
+                      <div className="text-xs text-muted-foreground">Latest version</div>
+                      <div className="font-mono">{updateInfo.latestVersion ? `v${updateInfo.latestVersion}` : '—'}</div>
+                    </div>
+                    {updateInfo.status.docker ? (
+                      <Badge variant="secondary">Docker</Badge>
+                    ) : updateInfo.latestVersion === null ? (
+                      <Badge variant="secondary">Registry unreachable</Badge>
+                    ) : updateInfo.hasUpdate ? (
+                      <Badge variant="success">Update available</Badge>
+                    ) : (
+                      <Badge variant="outline"><CheckCircle2 className="mr-1 h-3 w-3" /> Up to date</Badge>
+                    )}
+                  </div>
+
+                  {updateInfo.status.docker && (
+                    <p className="text-muted-foreground">This instance runs in Docker — update by pulling the new image tag instead.</p>
+                  )}
+                  {!updateInfo.status.docker && updateInfo.latestVersion === null && (
+                    <p className="text-muted-foreground">Could not reach the npm registry (offline or blocked). {updateError && <span className="text-destructive">{updateError}</span>}</p>
+                  )}
+
+                  {updatePhase === 'installing' && <div className="flex items-center gap-2 text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" /> Downloading and installing the update… this can take a minute.</div>}
+                  {updatePhase === 'restarting' && <div className="flex items-center gap-2 text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" /> Update installed — restarting the gateway. This page reloads automatically.</div>}
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    {!updateInfo.status.docker && updateInfo.hasUpdate && updatePhase === 'idle' && (
+                      <Button disabled={updateBusy} onClick={runUpdate}><Download className="mr-1 h-4 w-4" /> Update now</Button>
+                    )}
+                    {updateInfo.hasUpdate && updateInfo.changelogUrl && (
+                      <Button variant="outline" asChild><a href={updateInfo.changelogUrl} target="_blank" rel="noreferrer">View changes</a></Button>
+                    )}
+                    {updatePhase === 'idle' && (
+                      <Button variant="ghost" disabled={updateBusy} onClick={() => checkUpdate(true)}>Check again</Button>
+                    )}
+                  </div>
+                </>
+              )}
             </CardContent>
           </Card>
         </TabsContent>

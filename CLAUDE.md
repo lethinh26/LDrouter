@@ -33,7 +33,17 @@ docker compose config
 docker compose up -d        # /health must become healthy, UI loads
 ```
 
-CLI runs: `npx latedev-router`, `latedev-router --host 0.0.0.0 --port 8787`. Env vars `LATEDEV_HOST/PORT/DATA_DIR/MASTER_KEY/TRUST_PROXY/LOG_LEVEL`. Default data dir `~/.latedev-router/`, container default `/data`.
+CLI runs: `npx ldrouter`, `ldrouter --host 0.0.0.0 --port 8787` (npm package name is **ldrouter**; `latedev-router` appears only in docs/examples). Env vars `LATEDEV_HOST/PORT/DATA_DIR/MASTER_KEY/TRUST_PROXY/LOG_LEVEL`. Default data dir `~/.latedev-router/`, container default `/data`.
+
+## Versioning policy (mandatory)
+
+Every completed change ships with a version bump — never merge a finished fix/feature without one. Follow semver against the **current** `version` in `package.json`:
+
+- **patch** (`x.y.Z`): bug fixes, test-only changes, docs, refactors with no behavior change.
+- **minor** (`x.Y.0`): new features or behavior changes that are backward-compatible (new endpoints, new UI pages, new config options).
+- **major** (`X.0.0`): breaking changes (removed/renamed endpoints or config, incompatible data formats, changed public model ID rules).
+
+Procedure for every completed change: bump `package.json` `version`, add an entry at the top of `CHANGELOG.md` (version, date, one-line summary per change), and commit both with the code. The in-app updater compares against the npm registry, so a published version must always be strictly newer than the previous one.
 
 ## Big-picture architecture (spans several docs)
 

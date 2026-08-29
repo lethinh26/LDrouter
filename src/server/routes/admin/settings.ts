@@ -193,4 +193,18 @@ export async function registerSettingsRoutes(app: FastifyInstance): Promise<void
       environment: cfg.env,
     };
   });
+
+  // Self-update: check the npm registry and (optionally) install + restart.
+  app.get('/api/admin/update/check', async (req) => {
+    const { getSelfUpdater } = await import('../../selfupdate/index');
+    const u = getSelfUpdater();
+    const force = (req.query as Record<string, string | undefined>).force === '1';
+    const result = await u.check(force);
+    return { ...result, status: u.status() };
+  });
+
+  app.post('/api/admin/update/run', async () => {
+    const { getSelfUpdater } = await import('../../selfupdate/index');
+    return getSelfUpdater().run();
+  });
 }
