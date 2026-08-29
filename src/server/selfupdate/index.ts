@@ -6,9 +6,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
+import { fileURLToPath } from 'node:url';
 import { execa } from 'execa';
 import semver from 'semver';
 import { getLogger } from '../logging/logger';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 export interface PackageManager {
   pm: 'npm' | 'pnpm' | 'yarn' | 'bun';
@@ -143,8 +146,26 @@ export class SelfUpdater {
   }
 }
 
+// The running version: walk up from this file to the first package.json
+// (works from dist/server/selfupdate AND the source tree, and in Docker
+// where npm_package_version is unset) and fall back to the npm-injected
+// env var.
+function readInstalledVersion(): string {
+  let dir = __dirname;
+  for (let i = 0; i < 6; i++) {
+    try {
+      const v = (JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')) as { version?: string }).version;
+      if (v) return v;
+    } catch { /* keep climbing */ }
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return process.env.npm_package_version ?? '0.0.0';
+}
+
 let updater: SelfUpdater | null = null;
 export function getSelfUpdater(): SelfUpdater {
-  if (!updater) updater = new SelfUpdater('ldrouter', process.env.npm_package_version ?? '0.0.0');
+  if (!updater) updater = new SelfUpdater('ldrouter', readInstalledVersion());
   return updater;
 }

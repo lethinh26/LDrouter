@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.1] - 2026-08-30
+
+### Fixed
+- Self-update reported version `0.0.0` in Docker/direct-node runs where
+  `npm_package_version` is unset; it now reads the version from the
+  package.json on disk.
+
 ## [1.5.0] - 2026-08-30
 
 ### Added
