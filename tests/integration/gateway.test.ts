@@ -131,6 +131,58 @@ describe('gateway smoke', () => {
     expect(ids).not.toContain('combo/empty-combo');
   });
 
+  it('combo without slug keeps the name as its model ID (no "combo/" prefix)', async () => {
+    const db = (await import('../../src/server/db/index')).getDb();
+    const sch = await import('../../src/server/db/schema');
+    const model = db.select().from(sch.models).all().find((m) => m.publicModelId === 'mock/gpt-mock')!;
+
+    const create = async (payload: object) =>
+      fetch(`${baseUrl}/api/admin/combos`, {
+        method: 'POST', headers: { 'content-type': 'application/json', cookie: csrfCookies },
+        body: JSON.stringify({ mode: 'fallback', members: [{ modelId: model.id, position: 0, weight: 1, enabled: true }], ...payload }),
+      });
+
+    // No slug → public id is the normalized name, dots preserved.
+    const noSlug = await create({ name: 'gpt-5.5' });
+    expect(noSlug.status).toBe(200);
+    expect((await noSlug.json()).publicModelId).toBe('gpt-5.5');
+
+    // Explicit slug → "combo/" prefix.
+    const withSlug = await create({ name: 'another', slug: 'sol' });
+    expect(withSlug.status).toBe(200);
+    expect((await withSlug.json()).publicModelId).toBe('combo/sol');
+
+    // Duplicate id rejected (clashes with the first combo).
+    const dup = await create({ name: 'gpt-5.5' });
+    expect(dup.status).toBe(400);
+
+    // Listed and routable under the plain name.
+    const list = await fetch(`${baseUrl}/v1/models`, { headers: { authorization: `Bearer ${apiKey!.secret}` } });
+    const ids = ((await list.json()).data as Array<{ id: string }>).map((m) => m.id);
+    expect(ids).toContain('gpt-5.5');
+    expect(ids).toContain('combo/sol');
+
+    const { reset, pushHandler } = (await import('./_mock-control.js'));
+    reset();
+    pushHandler((_req: unknown, res: { statusCode: number; setHeader: (k: string, v: string) => void; end: (s: string) => void }, body: string) => {
+      expect(JSON.parse(body).model).toBe('gpt-mock');
+      res.statusCode = 200;
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({
+        id: 'cmpl-1', object: 'chat.completion', created: 0, model: 'gpt-mock',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'via combo' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 1, completion_tokens: 2, total_tokens: 3 },
+      }));
+    });
+    const chat = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey!.secret}` },
+      body: JSON.stringify({ model: 'gpt-5.5', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    expect(chat.status).toBe(200);
+    expect((await chat.json()).choices[0].message.content).toBe('via combo');
+  });
+
   it('rejects invalid keys', async () => {
     const res = await fetch(`${baseUrl}/v1/chat/completions`, {
       method: 'POST',

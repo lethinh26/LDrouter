@@ -6,7 +6,7 @@ import { eq, sql } from 'drizzle-orm';
 import { getDb, schema } from '../../db/index';
 import { requireAdminAuth } from '../../auth/middleware';
 import { recordAudit } from '../../db/repositories/audit';
-import { uuid, slugify } from '../../auth/ids';
+import { uuid } from '../../auth/ids';
 import { GatewayError } from '../../errors';
 
 const MemberSpec = z.object({ modelId: z.string(), position: z.number().int().min(0), weight: z.number().int().min(1).default(1), enabled: z.boolean().default(true) });
@@ -27,6 +27,22 @@ const ComboCreate = z.object({
 });
 
 const ComboUpdate = ComboCreate.partial().extend({ id: z.string() });
+
+// Combo public IDs default to the (normalized) name WITHOUT a prefix — e.g.
+// name "gpt-5.5" becomes model id "gpt-5.5". Only when the client explicitly
+// supplies a slug does the id get the "combo/" prefix ("combo/<slug>").
+// Unlike slugify(), dots are preserved: they are legal in model IDs
+// (e.g. "gpt-5.6-sol").
+function comboSlug(input: string): string {
+  return (
+    input
+      .trim()
+      .toLowerCase()
+      .replace(/[\s/]+/g, '-')
+      .replace(/[^a-z0-9._-]+/g, '')
+      .slice(0, 64) || 'item'
+  );
+}
 
 export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
   app.addHook('preHandler', requireAdminAuth);
@@ -86,9 +102,17 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
   app.post('/api/admin/combos', async (req) => {
     const body = ComboCreate.parse(req.body);
     const db = getDb();
-    const slug = body.slug ? slugify(body.slug) : slugify(body.name);
-    const dup = db.select().from(schema.combos).where(eq(schema.combos.slug, slug)).get();
-    if (dup) throw new GatewayError('invalid_request_error', 'Combo slug in use', { status: 400 });
+    // No slug given → the public id IS the normalized name (no "combo/" prefix).
+    const slug = comboSlug(body.slug ?? body.name);
+    const publicModelId = body.slug ? `combo/${slug}` : slug;
+    // The id must be globally unique across combos AND physical models — the
+    // resolver treats every name as one routing surface.
+    if (db.select().from(schema.combos).where(eq(schema.combos.publicModelId, publicModelId)).get()) {
+      throw new GatewayError('invalid_request_error', 'Combo ID already in use', { status: 400 });
+    }
+    if (db.select().from(schema.models).where(eq(schema.models.publicModelId, publicModelId)).get()) {
+      throw new GatewayError('invalid_request_error', `A model with ID "${publicModelId}" already exists`, { status: 400 });
+    }
 
     // Verify all referenced models exist and are physical
     const modelIds = body.members.map((m) => m.modelId);
@@ -96,7 +120,6 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
     if (models.length !== new Set(modelIds).size) throw new GatewayError('invalid_request_error', 'One or more members are not valid physical models', { status: 400 });
 
     const id = uuid();
-    const publicModelId = `combo/${slug}`;
     db.insert(schema.combos).values({
       id,
       name: body.name,
@@ -127,7 +150,18 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
     if (!c) throw new GatewayError('invalid_request_error', 'Combo not found', { status: 404 });
     const update: Partial<typeof schema.combos.$inferInsert> = { updatedAt: new Date().toISOString(), configVersion: c.configVersion + 1 };
     if (body.name) update.name = body.name;
-    if (body.slug) update.slug = slugify(body.slug);
+    if (body.slug !== undefined) {
+      // Same rule as creation: empty slug → plain id, provided slug → combo/<slug>.
+      const slug = comboSlug(body.slug || body.name || c.name);
+      const publicModelId = body.slug ? `combo/${slug}` : slug;
+      const clashCombo = db.select().from(schema.combos).where(eq(schema.combos.publicModelId, publicModelId)).get();
+      if (clashCombo && clashCombo.id !== body.id) throw new GatewayError('invalid_request_error', 'Combo ID already in use', { status: 400 });
+      if (db.select().from(schema.models).where(eq(schema.models.publicModelId, publicModelId)).get()) {
+        throw new GatewayError('invalid_request_error', `A model with ID "${publicModelId}" already exists`, { status: 400 });
+      }
+      update.slug = slug;
+      update.publicModelId = publicModelId;
+    }
     if (body.mode) update.mode = body.mode;
     if (body.enabled !== undefined) update.enabled = body.enabled;
     if (body.maxTotalAttempts !== undefined) update.maxTotalAttempts = body.maxTotalAttempts;

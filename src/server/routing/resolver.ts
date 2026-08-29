@@ -16,11 +16,10 @@ export function resolveRequestedModel(requested: string): ResolvedTarget {
   if (model && model.enabled) {
     return { kind: 'model', modelId: model.id, publicModelId: model.publicModelId };
   }
-  // Combo
-  if (requested.startsWith('combo/')) {
-    const c = db.select().from(schema.combos).where(eq(schema.combos.publicModelId, requested)).get();
-    if (c && c.enabled) return { kind: 'combo', comboId: c.id, publicModelId: c.publicModelId };
-  }
+  // Combo by exact public ID — with-prefix ("combo/<slug>") or the
+  // prefix-less default (<slug>).
+  const combo = db.select().from(schema.combos).where(eq(schema.combos.publicModelId, requested)).get();
+  if (combo && combo.enabled) return { kind: 'combo', comboId: combo.id, publicModelId: combo.publicModelId };
   // Alias (one hop only)
   const alias = db.select().from(schema.modelAliases).where(and(eq(schema.modelAliases.alias, requested), eq(schema.modelAliases.enabled, true))).get();
   if (alias) {
