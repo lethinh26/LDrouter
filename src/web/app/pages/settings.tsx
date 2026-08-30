@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { PageHeader } from '../../components/ui/skeleton';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '../../components/ui/card';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '../../components/ui/tabs';
@@ -148,10 +149,12 @@ export function Settings() {
     } catch (e) { toast.error((e as Error).message); }
     setTotpRegenerating(false);
   };
+  const [searchParams] = useSearchParams();
+  const defaultTab = searchParams.get('tab') || 'logging';
   return (
     <div>
       <PageHeader title="Settings" description="Logging, security, backup, and system info" />
-      <Tabs defaultValue="logging">
+      <Tabs defaultValue={defaultTab}>
         <TabsList>
           <TabsTrigger value="logging">Logging</TabsTrigger>
           <TabsTrigger value="security">Security</TabsTrigger>

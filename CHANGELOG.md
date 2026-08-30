@@ -4,6 +4,15 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.6.5] - 2026-08-30
+
+### Added
+
+- **Update notification badge in admin UI top bar**: When a new version is
+  available, users see an "Update vX.Y.Z" button that links directly to
+  Settings → System tab with one-click installation. Previously the check existed
+  but required manual navigation; now it's surfaced at glance in the header.
+
 ## [1.6.4] - 2026-08-30
 
 ### Fixed
