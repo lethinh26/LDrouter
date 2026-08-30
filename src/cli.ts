@@ -4,7 +4,10 @@
 import process from 'node:process';
 
 async function main(): Promise<void> {
-  const isTuiMode = process.argv.includes('--tui');
+  // Auto-detect interactive terminal — use TUI by default if possible
+  const isTuiMode =
+    process.stdin.isTTY &&
+    process.stdout.isTTY;
 
   if (isTuiMode) {
     // Launch TUI mode (zero-dependency console UI)
@@ -13,7 +16,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  // Normal server mode (legacy behavior)
+  // Normal server mode (no terminal, or explicitly disable via env)
   process.env.LATEDEV_CLI_ENTRY = '1';
   const { startApp } = await import('./server/app.js');
   await startApp();

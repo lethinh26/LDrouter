@@ -319,24 +319,28 @@ function shutdown(code = 0, respawnAfter = false): void {
 }
 
 export async function runCliTui(): Promise<void> {
-  // Keep the TUI clean: suppress routine logs (fatal only). Must be set before
-  // loadConfig() reads it.
-  if (!process.env.LATEDEV_LOG_LEVEL) process.env.LATEDEV_LOG_LEVEL = 'fatal';
+  // MUST be set BEFORE loadConfig() reads it — critical for clean TUI output
+  if (!process.env.LATEDEV_LOG_LEVEL) process.env.LATEDEV_LOG_LEVEL = 'error';
 
   cfg = loadConfig();
 
+  // Enter raw mode EARLY — before any logging happens
+  process.stdin.setRawMode(true);
+  process.stdin.resume();
+
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    process.stdin.setRawMode(false);
+    process.stdin.pause();
     // No interactive terminal — fall back to the plain server.
     const { startApp } = await import('../../app');
     await startApp();
     return;
   }
 
+  out(hideCursor);
+
   process.on('SIGINT', () => shutdown(0));
   process.on('SIGTERM', () => shutdown(0));
-  process.stdin.setRawMode(true);
-  process.stdin.resume();
-  out(hideCursor);
 
   try {
     app = await buildApp(); // opens the DB + runs migrations
