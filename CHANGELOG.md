@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.6.1] - 2026-08-30
+
+### Added
+- Interactive console UI: `ldrouter --tui` boots the gateway and shows a
+  zero-dependency terminal menu (open dashboard, check/apply updates, exit)
+  with live uptime; falls back to the plain server when stdout is not a TTY.
+
+### Changed
+- CI: npm tarball verification prints the full pack output with explicit
+  per-file error messages; the redundant `prepack` build hook was removed.
+
 ## [1.6.0] - 2026-08-30
 
 ### Added
