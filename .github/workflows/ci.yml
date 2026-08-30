@@ -21,12 +21,16 @@ jobs:
       - run: pnpm lint
       - run: pnpm typecheck
       - run: pnpm test
-      - run: pnpm build
-      - name: Verify npm tarball contents
+      - name: Build and verify npm tarball contents
         run: |
-          npm pack --dry-run > pack.txt
-          grep -q "dist/cli.js" pack.txt
-          grep -q "dist/web/index.html" pack.txt
-          grep -q "migrations/0001_initial_schema.sql" pack.txt
-          grep -q "CHANGELOG.md" pack.txt
-          echo "tarball OK"
+          # Run explicit build (no need for prepack hook since we removed it)
+          pnpm run build
+          # Capture npm pack output to verify all required files are included
+          OUTPUT=$(npm pack --dry-run 2>&1 || true)
+          echo "Tarball contents:"
+          echo "$OUTPUT"
+          echo "$OUTPUT" | grep -q "dist/cli.js" || { echo "FAIL: dist/cli.js not in tarball"; exit 1; }
+          echo "$OUTPUT" | grep -q "dist/web/index.html" || { echo "FAIL: dist/web/index.html not in tarball"; exit 1; }
+          echo "$OUTPUT" | grep -q "migrations/0001_initial_schema.sql" || { echo "FAIL: migrations not in tarball"; exit 1; }
+          echo "$OUTPUT" | grep -q "CHANGELOG.md" || { echo "FAIL: CHANGELOG.md not in tarball"; exit 1; }
+          echo "✓ tarball OK"

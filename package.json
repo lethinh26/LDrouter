@@ -45,7 +45,6 @@
     "test:e2e": "playwright test",
     "db:migrate": "node --import tsx/esm scripts/migrate.ts",
     "migrate": "node --import tsx/esm scripts/migrate.ts",
-    "prepack": "pnpm run build",
     "verify": "pnpm lint && pnpm typecheck && pnpm test",
     "release:patch": "pnpm verify && npm version patch -m \"release: v%s\"",
     "release:minor": "pnpm verify && npm version minor -m \"release: v%s\"",
