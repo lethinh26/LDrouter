@@ -16,6 +16,29 @@ import { buildApp } from '../../app';
 import { closeDb } from '../../db/index';
 import { getSelfUpdater, type CheckResult } from '../../selfupdate/index';
 
+// Suppress stdout completely during TUI mode — all log output breaks the render.
+// stderr still works but is filtered below.
+const suppressConsoleOutput = () => {
+  const origStdoutWrite = process.stdout.write;
+  const origStderrWrite = process.stderr.write.bind(process.stderr);
+  (process.stdout as any).write = () => {};
+  // Filter stderr to only allow critical errors (others would break TUI)
+  (process.stderr as any).write = (data: string) => {
+    if (!data || typeof data !== 'string') return false;
+    // Allow fatal error messages that TUI will render in its message screens
+    if (/^Fatal:|^Error:|^\{ "level":4|^\[.*\] \[error\]/.test(data.trim())) {
+      return origStderrWrite(data);
+    }
+    // Drop deprecation warnings, logs, and other noise
+    return true;
+  };
+};
+
+// Restore console to normal state
+const restoreConsoleOutput = () => {
+  // No-op in production; we just exit anyway
+};
+
 // Key sequences as escape literals (never raw control bytes in source).
 const KEY = {
   up: '\x1B[A', // ESC [ A
@@ -319,7 +342,13 @@ function shutdown(code = 0, respawnAfter = false): void {
 }
 
 export async function runCliTui(): Promise<void> {
-  // MUST be set BEFORE loadConfig() reads it — critical for clean TUI output
+  // Suppress console output BEFORE building anything — Fastify deprecation warnings
+  // and logs go directly to stderr/stdout and would corrupt the TUI render.
+  suppressConsoleOutput();
+
+  // Set TUI mode flag FIRST — logger will use error-only level for any Pino logs
+  process.env.LATEDEV_TUI_MODE = '1';
+
   if (!process.env.LATEDEV_LOG_LEVEL) process.env.LATEDEV_LOG_LEVEL = 'error';
 
   cfg = loadConfig();

@@ -1,13 +1,22 @@
 import pino from 'pino';
+import process from 'node:process';
 import { loadConfig } from '../config/index';
+
+// Environment variable set by TUI mode — suppress all info/debug/warn logs
+// when running in interactive terminal UI.
+const IS_TUI_MODE = Boolean(process.env.LATEDEV_TUI_MODE);
 
 let _logger: pino.Logger | null = null;
 
 export function getLogger(): pino.Logger {
   if (_logger) return _logger;
   const cfg = loadConfig();
+
+  // In TUI mode, use error-only level to keep console clean
+  const effectiveLogLevel = IS_TUI_MODE ? 'error' : cfg.logLevel;
+
   _logger = pino({
-    level: cfg.logLevel,
+    level: effectiveLogLevel,
     base: { app: 'latedev-router', version: cfg.appVersion },
     redact: {
       paths: [
