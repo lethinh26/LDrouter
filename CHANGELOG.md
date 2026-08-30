@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.6.3] - 2026-08-30
+
+### Changed
+
+- **TUI mode defaults**: Running `ldrouter` without args now enters interactive
+  TUI automatically if stdout is a TTY. Added `--no-tui` flag to force plain
+  server mode when needed (e.g., CI pipelines, logging redirects).
+
+### Fixed
+
+- **Log pollution in TUI**: Reduced log level from `fatal` → `error` so that
+  deprecation warnings and other routine logs don't break the terminal UI
+  layout. Raw stdin mode activated earlier to capture all key presses cleanly.
+
 ## [1.6.2] - 2026-08-30
 
 ### Fixed
