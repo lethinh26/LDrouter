@@ -31,6 +31,7 @@ interface UpdateInfo {
 }
 
 export function Settings() {
+  const [searchParams] = useSearchParams();
   const [s, setS] = useState<Settings | null>(null);
   const [sys, setSys] = useState<SysInfo | null>(null);
   const [passwords, setPasswords] = useState({ current: '', next: '' });
@@ -149,7 +150,6 @@ export function Settings() {
     } catch (e) { toast.error((e as Error).message); }
     setTotpRegenerating(false);
   };
-  const [searchParams] = useSearchParams();
   const defaultTab = searchParams.get('tab') || 'logging';
   return (
     <div>

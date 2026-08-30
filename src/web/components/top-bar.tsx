@@ -4,7 +4,6 @@ import { Button } from './ui/button';
 import { useTheme } from './theme-provider';
 import { useAuth } from '../app/auth';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from './ui/dropdown-menu';
-import { Badge } from './ui/badge';
 import { useState, useEffect } from 'react';
 import { api } from '../lib/api';
 import { useNavigate } from 'react-router-dom';

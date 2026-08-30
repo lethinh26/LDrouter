@@ -19,12 +19,13 @@ import { getSelfUpdater, type CheckResult } from '../../selfupdate/index';
 // Suppress stdout completely during TUI mode — all log output breaks the render.
 // stderr still works but is filtered below.
 const suppressConsoleOutput = () => {
-  const origStdoutWrite = process.stdout.write;
   const origStderrWrite = process.stderr.write.bind(process.stderr);
-  (process.stdout as any).write = () => {};
+  type WriteFn = (chunk: unknown, encoding?: string) => boolean;
+  const writeFn: WriteFn = () => true;
+  (process.stdout as unknown as { write: WriteFn }).write = writeFn;
   // Filter stderr to only allow critical errors (others would break TUI)
-  (process.stderr as any).write = (data: string) => {
-    if (!data || typeof data !== 'string') return false;
+  (process.stderr as unknown as { write: WriteFn }).write = (data: unknown): boolean => {
+    if (typeof data !== 'string') return false;
     // Allow fatal error messages that TUI will render in its message screens
     if (/^Fatal:|^Error:|^\{ "level":4|^\[.*\] \[error\]/.test(data.trim())) {
       return origStderrWrite(data);
@@ -32,11 +33,6 @@ const suppressConsoleOutput = () => {
     // Drop deprecation warnings, logs, and other noise
     return true;
   };
-};
-
-// Restore console to normal state
-const restoreConsoleOutput = () => {
-  // No-op in production; we just exit anyway
 };
 
 // Key sequences as escape literals (never raw control bytes in source).
