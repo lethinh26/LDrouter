@@ -4,6 +4,15 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.6.2] - 2026-08-30
+
+### Fixed
+
+- **CI/CD:** GitHub Actions now builds `dist/` before publishing to npm (the
+  previous release missed the build step in the `npm-publish` job; manual
+  `scripts/publish.sh` always ran `pnpm build`). The published tarball now
+  includes the CLI binary so `ldrouter --tui` works after `npm install -g`.
+
 ## [1.6.1] - 2026-08-30
 
 ### Added
