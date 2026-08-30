@@ -1,6 +1,6 @@
 {
   "name": "ldrouter",
-  "version": "1.6.4",
+  "version": "1.6.5",
   "description": "LateDev Router — lightweight self-hosted LLM gateway with admin UI",
   "type": "module",
   "license": "MIT",
