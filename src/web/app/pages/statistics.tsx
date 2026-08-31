@@ -1,48 +1,42 @@
-// Statistics page.
-import { useEffect, useState } from 'react';
+// Statistics page: production-grade realtime monitoring dashboard.
+// Summary cards, routing flow, recent requests, top models/keys, bottom metrics.
+import { useState } from 'react';
 import { PageHeader } from '../../components/ui/skeleton';
-import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '../../components/ui/card';
 import { Tabs, TabsList, TabsTrigger } from '../../components/ui/tabs';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../../components/ui/table';
-import { api } from '../../lib/api';
-import { formatNumber, formatPercent, formatLatencyMs } from '../../lib/utils';
-
-interface Stats {
-  range: { from: string; to: string; bucket: string };
-  summary: {
-    totalRequests: number; successfulRequests: number; failedRequests: number; successRate: number;
-    inputTokens: number; outputTokens: number; totalTokens: number;
-    cacheReadTokens: number; cacheWriteTokens: number; reasoningTokens: number;
-    averageLatencyMs: number; p95LatencyMs: number;
-    averageTtftMs: number | null; p95TtftMs: number | null;
-    cacheHitRate: number; gatewayCacheHitRate: number; fallbackRate: number;
-  };
-  series: Array<{ t: string; requests: number; errors: number; inputTokens: number; outputTokens: number }>;
-  topModels: Array<{ publicId: string; requests: number; errorRate: number; totalTokens: number }>;
-  topApiKeys: Array<{ name: string; requests: number; totalTokens: number }>;
-  topProviders: Array<{ name: string; slug: string; requests: number; errorRate: number }>;
-}
+import { Card, CardHeader, CardTitle, CardContent } from '../../components/ui/card';
+import { formatNumber, formatPercent } from '../../lib/utils';
+import { useLiveStats, type Preset } from '../../lib/use-live-stats';
+import { SummaryCard } from '../../components/statistics/summary-card';
+import { RoutingFlow } from '../../components/statistics/routing-flow';
+import { RecentRequests } from '../../components/statistics/recent-requests';
+import { BottomMetrics } from '../../components/statistics/bottom-metrics';
+import { Activity, CheckCircle2, Cpu, Database, Clock, Gauge, Route, TrendingUp } from 'lucide-react';
 
 export function Statistics() {
-  const [preset, setPreset] = useState<'today' | '7d' | '30d'>('7d');
-  const [data, setData] = useState<Stats | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  useEffect(() => {
-    setLoading(true);
-    setError(null);
-    api.get<Stats>(`/api/admin/stats?preset=${preset}`)
-      .then((r) => { setData(r); })
-      .catch((e) => { setError((e as Error).message); })
-      .finally(() => setLoading(false));
-  }, [preset]);
+  const [preset, setPreset] = useState<Preset>('7d');
+  const { snapshot, live, recent, providers, pulses, loading, error } = useLiveStats(preset);
+
   if (loading) return <div className="text-muted-foreground">Loading…</div>;
-  if (error || !data) return <div className="text-destructive">Failed to load statistics: {error ?? 'unknown error'}</div>;
-  const s = data.summary;
+  if (error || !snapshot) return <div className="text-destructive">Failed to load statistics: {error ?? 'unknown error'}</div>;
+
+  const s = live;
+  const prev = snapshot.previous;
+  const series = snapshot.series;
+
+  // Deltas: (current - previous) / previous for each summary metric.
+  function delta(cur: number, prev: number): number | undefined {
+    return prev > 0 ? (cur - prev) / prev : undefined;
+  }
+
+  // Sparkline data: extract requests per bucket (for summary cards).
+  const sparkRequests = series.map((b) => b.requests);
+  const sparkLatency = series.map((b) => b.avgLatency);
+
   return (
     <div>
-      <PageHeader title="Statistics" description="Aggregated metrics for the selected range" actions={
-        <Tabs value={preset} onValueChange={(v) => setPreset(v as 'today' | '7d' | '30d')}>
+      <PageHeader title="Statistics" description="Real-time monitoring dashboard" actions={
+        <Tabs value={preset} onValueChange={(v) => void setPreset(v as Preset)}>
           <TabsList>
             <TabsTrigger value="today">Today</TabsTrigger>
             <TabsTrigger value="7d">7 days</TabsTrigger>
@@ -50,66 +44,72 @@ export function Statistics() {
           </TabsList>
         </Tabs>
       } />
+
+      {/* Summary cards */}
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
-        <Card><CardHeader className="pb-1"><CardTitle className="text-sm text-muted-foreground">Requests</CardTitle></CardHeader><CardContent className="text-2xl font-semibold">{formatNumber(s.totalRequests)}</CardContent></Card>
-        <Card><CardHeader className="pb-1"><CardTitle className="text-sm text-muted-foreground">Success rate</CardTitle></CardHeader><CardContent className="text-2xl font-semibold">{formatPercent(s.successRate)}</CardContent></Card>
-        <Card><CardHeader className="pb-1"><CardTitle className="text-sm text-muted-foreground">Total tokens</CardTitle></CardHeader><CardContent className="text-2xl font-semibold">{formatNumber(s.totalTokens)}</CardContent></Card>
-        <Card><CardHeader className="pb-1"><CardTitle className="text-sm text-muted-foreground">Cache hit rate</CardTitle></CardHeader><CardContent className="text-2xl font-semibold">{formatPercent(s.cacheHitRate)}</CardContent></Card>
-        <Card><CardHeader className="pb-1"><CardTitle className="text-sm text-muted-foreground">Avg latency</CardTitle></CardHeader><CardContent>{formatLatencyMs(s.averageLatencyMs)}</CardContent></Card>
-        <Card><CardHeader className="pb-1"><CardTitle className="text-sm text-muted-foreground">p95 latency</CardTitle></CardHeader><CardContent>{formatLatencyMs(s.p95LatencyMs)}</CardContent></Card>
-        <Card><CardHeader className="pb-1"><CardTitle className="text-sm text-muted-foreground">Avg TTFT</CardTitle></CardHeader><CardContent>{s.averageTtftMs ? formatLatencyMs(s.averageTtftMs) : '—'}</CardContent></Card>
-        <Card><CardHeader className="pb-1"><CardTitle className="text-sm text-muted-foreground">Fallback rate</CardTitle></CardHeader><CardContent>{formatPercent(s.fallbackRate)}</CardContent></Card>
+        <SummaryCard icon={Activity} label="Requests" value={s.totalRequests} delta={delta(s.totalRequests, prev.totalRequests)} sparkData={sparkRequests} />
+        <SummaryCard icon={CheckCircle2} label="Success rate" format="percent" value={s.successRate} delta={delta(s.successRate, prev.successRate)} sparkData={sparkRequests} sparkStroke="stroke-emerald-500" />
+        <SummaryCard icon={Cpu} label="Total tokens" value={s.totalTokens} delta={delta(s.totalTokens, prev.totalTokens)} sparkData={series.map((b) => b.inputTokens + b.outputTokens)} />
+        <SummaryCard icon={Database} label="Cache hit rate" format="percent" value={s.cacheHitRate} delta={delta(s.cacheHitRate, prev.cacheHitRate)} sparkData={series.map((b) => b.cacheRead)} />
+        <SummaryCard icon={Clock} label="Avg latency" format="latency" value={s.averageLatencyMs} delta={delta(s.averageLatencyMs, prev.averageLatencyMs)} deltaInverse sparkData={sparkLatency} sparkStroke="stroke-amber-500" />
+        <SummaryCard icon={Gauge} label="p95 latency" format="latency" value={s.p95LatencyMs} />
+        <SummaryCard icon={TrendingUp} label="Avg TTFT" format="latency" value={s.averageTtftMs ?? 0} />
+        <SummaryCard icon={Route} label="Fallback rate" format="percent" value={s.fallbackRate} delta={delta(s.fallbackRate, prev.fallbackRate)} deltaInverse />
       </div>
 
-      <div className="mt-6 grid gap-4 lg:grid-cols-2">
-        <Card>
-          <CardHeader><CardTitle className="text-base">Top models</CardTitle></CardHeader>
-          <CardContent>
-            <Table>
-              <TableHeader><TableRow><TableHead>Model</TableHead><TableHead>Requests</TableHead><TableHead>Errors</TableHead><TableHead>Tokens</TableHead></TableRow></TableHeader>
-              <TableBody>
-                {data.topModels.length === 0 && <TableRow><TableCell colSpan={4} className="text-muted-foreground text-center">No data</TableCell></TableRow>}
-                {data.topModels.map((m) => (
-                  <TableRow key={m.publicId}>
-                    <TableCell className="font-mono text-xs">{m.publicId}</TableCell>
-                    <TableCell>{formatNumber(m.requests)}</TableCell>
-                    <TableCell>{formatPercent(m.errorRate)}</TableCell>
-                    <TableCell>{formatNumber(m.totalTokens)}</TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardHeader><CardTitle className="text-base">Top API keys</CardTitle></CardHeader>
-          <CardContent>
-            <Table>
-              <TableHeader><TableRow><TableHead>Key</TableHead><TableHead>Requests</TableHead><TableHead>Tokens</TableHead></TableRow></TableHeader>
-              <TableBody>
-                {data.topApiKeys.length === 0 && <TableRow><TableCell colSpan={3} className="text-muted-foreground text-center">No data</TableCell></TableRow>}
-                {data.topApiKeys.map((k, i) => (
-                  <TableRow key={i}><TableCell>{k.name}</TableCell><TableCell>{formatNumber(k.requests)}</TableCell><TableCell>{formatNumber(k.totalTokens)}</TableCell></TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </CardContent>
-        </Card>
+      {/* Routing flow */}
+      <div className="mt-6">
+        <RoutingFlow liveRequests={s.totalRequests} successRate={s.successRate} providers={providers} pulses={pulses} />
       </div>
 
-      <Card className="mt-6">
-        <CardHeader><CardTitle className="text-base">Series (requests / errors over time)</CardTitle><CardDescription>Buckets: {data.range.bucket}</CardDescription></CardHeader>
-        <CardContent>
-          <div className="grid grid-cols-12 gap-1 text-xs">
-            {data.series.map((s) => (
-              <div key={s.t} className="flex flex-col items-center" title={`${s.t}: ${s.requests} req, ${s.errors} err`}>
-                <div className="w-full bg-primary/80" style={{ height: `${Math.min(80, s.requests * 4)}px` }} />
-                <div className="text-[10px] text-muted-foreground">{s.t.slice(5, 10)}</div>
-              </div>
-            ))}
-          </div>
-        </CardContent>
-      </Card>
+      {/* Recent Requests + Top Models + Top API Keys */}
+      <div className="mt-6 grid gap-4 lg:grid-cols-3">
+        <div className="lg:col-span-2">
+          <RecentRequests rows={recent} />
+        </div>
+
+        <div className="space-y-4">
+          <Card>
+            <CardHeader className="pb-2"><CardTitle className="text-base">Top Models</CardTitle></CardHeader>
+            <CardContent>
+              <Table>
+                <TableHeader><TableRow><TableHead>Model</TableHead><TableHead>Req</TableHead><TableHead>Errors</TableHead><TableHead>Tokens</TableHead></TableRow></TableHeader>
+                <TableBody>
+                  {snapshot.topModels.length === 0 && <TableRow><TableCell colSpan={4} className="text-muted-foreground text-center">No data</TableCell></TableRow>}
+                  {snapshot.topModels.map((m) => (
+                    <TableRow key={m.publicId}>
+                      <TableCell className="font-mono text-xs">{m.publicId}</TableCell>
+                      <TableCell className="text-xs">{formatNumber(m.requests)}</TableCell>
+                      <TableCell className="text-xs"><span className={m.errorRate > 0.1 ? 'text-destructive' : 'text-muted-foreground'}>{formatPercent(m.errorRate)}</span></TableCell>
+                      <TableCell className="text-xs">{formatNumber(m.totalTokens)}</TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader className="pb-2"><CardTitle className="text-base">Top API Keys</CardTitle></CardHeader>
+            <CardContent>
+              <Table>
+                <TableHeader><TableRow><TableHead>Key</TableHead><TableHead>Requests</TableHead><TableHead>Tokens</TableHead></TableRow></TableHeader>
+                <TableBody>
+                  {snapshot.topApiKeys.length === 0 && <TableRow><TableCell colSpan={3} className="text-muted-foreground text-center">No data</TableCell></TableRow>}
+                  {snapshot.topApiKeys.map((k, i) => (
+                    <TableRow key={i}><TableCell className="text-xs">{k.name}</TableCell><TableCell className="text-xs">{formatNumber(k.requests)}</TableCell><TableCell className="text-xs">{formatNumber(k.totalTokens)}</TableCell></TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </CardContent>
+          </Card>
+        </div>
+      </div>
+
+      {/* Bottom metrics */}
+      <div className="mt-6">
+        <BottomMetrics successRate={s.successRate} averageLatencyMs={s.averageLatencyMs} latencySpark={sparkLatency} />
+      </div>
     </div>
   );
 }

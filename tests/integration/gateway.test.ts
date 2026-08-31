@@ -190,6 +190,16 @@ describe('gateway smoke', () => {
     expect(body.summary.totalRequests).toBeGreaterThan(0);
     expect(Array.isArray(body.series)).toBe(true);
     expect(body.topModels.some((m: { publicId: string }) => m.publicId === 'mock/gpt-mock')).toBe(true);
+    // v1.9.0: routing dashboard additions
+    expect(body.previous).toBeDefined();
+    expect(typeof body.previous.totalRequests).toBe('number');
+    expect(Array.isArray(body.recent)).toBe(true);
+    expect(body.recent.length).toBeGreaterThan(0);
+    expect(body.recent[0]).toHaveProperty('providerId');
+    expect(body.recent[0]).toHaveProperty('providerName');
+    expect(Array.isArray(body.providers)).toBe(true);
+    expect(body.providers[0]).toHaveProperty('health');
+    expect(body.providers[0]).toHaveProperty('modelCount');
   });
 
   it('GET /api/admin/update/check never 500s (registry unreachable or unpublished package)', async () => {

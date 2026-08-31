@@ -131,6 +131,9 @@ export interface RequestLogSummary {
   requestedModel: string;
   resolvedTargetKind: 'model' | 'combo' | 'alias' | 'unknown';
   finalModelPublicId: string | null;
+  // Added v1.9.0: provider id/name derived from finalModelId (for routing aggregation).
+  providerId: string | null;
+  providerName: string | null;
   streaming: boolean;
   httpStatus: number;
   success: boolean;
@@ -198,6 +201,19 @@ export interface StatsSummary {
   cacheHitRate: number;
   gatewayCacheHitRate: number;
   fallbackRate: number;
+}
+
+/** Per-provider traffic/latency/health summary for the routing-flow dashboard (v1.9.0). */
+export interface RoutingProvider {
+  id: string;
+  name: string;
+  slug: string;
+  health: 'healthy' | 'degraded' | 'down' | 'circuit_open' | 'unknown';
+  enabled: boolean;
+  modelCount: number;
+  requests: number;
+  errorRate: number;
+  avgLatencyMs: number;
 }
 
 export interface AuditLogEntry {

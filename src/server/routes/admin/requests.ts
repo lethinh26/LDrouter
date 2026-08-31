@@ -10,10 +10,30 @@ import type { RequestLogSummary, AttemptLog } from '../../../shared/types';
 
 type RequestRow = typeof schema.requests.$inferSelect;
 
-// Shared row → API summary mapping (used by the list endpoint and the SSE stream).
-function toSummary(r: RequestRow, keyMap: Map<string, { name: string }>, modelMap: Map<string, { publicModelId: string }>): RequestLogSummary {
+interface SummaryMaps {
+  keyMap: Map<string, { name: string }>;
+  modelMap: Map<string, { providerId: string | null; publicModelId: string }>;
+  providerMap: Map<string, { name: string }>;
+}
+
+export function loadSummaryMaps(): SummaryMaps {
+  const db = getDb();
+  const keys = db.select().from(schema.apiKeys).all();
+  const models = db.select().from(schema.models).all();
+  const providers = db.select().from(schema.providers).all();
+  return {
+    keyMap: new Map(keys.map((k) => [k.id, k])),
+    modelMap: new Map(models.map((m) => [m.id, m])),
+    providerMap: new Map(providers.map((p) => [p.id, p])),
+  };
+}
+
+// Shared row → API summary mapping (used by the list endpoint, the SSE stream, and stats).
+export function toSummary(r: RequestRow, maps: SummaryMaps): RequestLogSummary {
+  const { keyMap, modelMap, providerMap } = maps;
   const key = r.apiKeyId ? keyMap.get(r.apiKeyId) : null;
   const finalModel = r.finalModelId ? modelMap.get(r.finalModelId) : null;
+  const provider = finalModel?.providerId ? providerMap.get(finalModel.providerId) : null;
   return {
     id: r.id,
     createdAt: r.createdAt,
@@ -26,6 +46,8 @@ function toSummary(r: RequestRow, keyMap: Map<string, { name: string }>, modelMa
     requestedModel: r.requestedModel,
     resolvedTargetKind: r.resolvedTargetKind,
     finalModelPublicId: finalModel?.publicModelId ?? null,
+    providerId: provider ? finalModel!.providerId : null,
+    providerName: provider?.name ?? null,
     streaming: Boolean(r.streaming),
     httpStatus: r.httpStatus,
     success: Boolean(r.success),
@@ -70,14 +92,11 @@ export async function registerRequestRoutes(app: FastifyInstance): Promise<void>
 
     const rows = db.select().from(schema.requests).where(whereExpr).orderBy(desc(schema.requests.createdAt)).limit(limit).offset(offset).all();
     const totalRow = db.select({ c: sql<number>`COUNT(*)` }).from(schema.requests).where(whereExpr).get();
-    const keys = db.select().from(schema.apiKeys).all();
-    const keyMap = new Map(keys.map((k) => [k.id, k]));
-    const models = db.select().from(schema.models).all();
-    const modelMap = new Map(models.map((m) => [m.id, m]));
+    const maps = loadSummaryMaps();
 
     return {
       total: totalRow?.c ?? 0,
-      requests: rows.map((r) => toSummary(r, keyMap, modelMap)),
+      requests: rows.map((r) => toSummary(r, maps)),
     };
   });
 
@@ -108,10 +127,7 @@ export async function registerRequestRoutes(app: FastifyInstance): Promise<void>
     };
 
     const db = getDb();
-    const keys = db.select().from(schema.apiKeys).all();
-    const keyMap = new Map(keys.map((k) => [k.id, k]));
-    const models = db.select().from(schema.models).all();
-    const modelMap = new Map(models.map((m) => [m.id, m]));
+    const maps = loadSummaryMaps();
 
     // History replay: up to 20 most recent rows after `since` (oldest first so the client renders in order).
     const historyRows = db
@@ -125,7 +141,7 @@ export async function registerRequestRoutes(app: FastifyInstance): Promise<void>
     const replayIds = new Set<string>();
     for (const r of historyRows) {
       replayIds.add(r.id);
-      send(`event: request\ndata: ${JSON.stringify(toSummary(r, keyMap, modelMap))}\n\n`);
+      send(`event: request\ndata: ${JSON.stringify(toSummary(r, maps))}\n\n`);
     }
 
     // Live: subscribe to the event bus.
@@ -133,7 +149,7 @@ export async function registerRequestRoutes(app: FastifyInstance): Promise<void>
       if (closed || replayIds.has(requestId)) return;
       const row = db.select().from(schema.requests).where(eq(schema.requests.id, requestId)).get();
       if (!row) return;
-      send(`event: request\ndata: ${JSON.stringify(toSummary(row, keyMap, modelMap))}\n\n`);
+      send(`event: request\ndata: ${JSON.stringify(toSummary(row, maps))}\n\n`);
     };
     onRequestLogged(handleRequestLogged);
 

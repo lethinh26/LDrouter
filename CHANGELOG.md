@@ -4,7 +4,14 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [1.8.0] - 2026-09-01
+## [1.9.0] - 2026-09-01
+
+### Added
+
+- **Realtime monitoring dashboard (/statistics)**: redesigned into a production-grade overview — summary cards now show icons, animated count-up, % delta vs previous period, and mini sparklines; a live **request routing flow** diagram (Incoming Traffic → AI Gateway → Providers with curved paths and animated pulse dots on each active route); a **Recent Requests** table with green/red status dots and time-ago labels; bottom metrics with circular Success Rate progress and Average Latency sparkline. All driven by the existing SSE stream (no new dependencies, CSS/SVG-native animations).
+- **Stats API extensions**: `GET /api/admin/stats` now returns `previous` (same-window comparison for deltas), `recent` (last 10 requests with provider info), `providers` (traffic/error-rate/latency/health per provider), and per-bucket `avgLatency`/`cacheRead` in `series`; `RequestLogSummary` gained `providerId`/`providerName`.
+
+
 
 ### Added
 

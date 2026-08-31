@@ -1,10 +1,12 @@
-// Admin API: statistics (Today/7d/30d).
+// Admin API: statistics (Today/7d/30d) + routing dashboard data.
 
 import type { FastifyInstance } from 'fastify';
 import { and, eq, gte, lte, sql, desc } from 'drizzle-orm';
+import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
 import { getDb, schema } from '../../db/index';
 import { requireAdminAuth } from '../../auth/middleware';
-import type { StatsSummary, StatsRange } from '../../../shared/types';
+import { toSummary, loadSummaryMaps } from './requests';
+import type { StatsSummary, StatsRange, RoutingProvider } from '../../../shared/types';
 
 const PRESETS: Record<string, () => { from: Date; to: Date; bucket: 'hour' | 'day' }> = {
   today: () => {
@@ -108,6 +110,8 @@ export async function registerStatsRoutes(app: FastifyInstance): Promise<void> {
         errors: sql<number>`SUM(CASE WHEN success=0 THEN 1 ELSE 0 END)`,
         inputTokens: sql<number>`COALESCE(SUM(input_tokens),0)`,
         outputTokens: sql<number>`COALESCE(SUM(output_tokens),0)`,
+        avgLatency: sql<number>`COALESCE(AVG(CASE WHEN success=1 THEN total_latency_ms END),0)`,
+        cacheRead: sql<number>`COALESCE(SUM(cache_read_tokens),0)`,
       })
       .from(schema.requests)
       .where(and(...conds))
@@ -148,25 +152,68 @@ export async function registerStatsRoutes(app: FastifyInstance): Promise<void> {
     const keys = db.select().from(schema.apiKeys).all();
     const keyMap = new Map(keys.map((k) => [k.id, k]));
 
-    const topProviders = db
+    // ─── Previous period (for delta badges in summary cards) ───────────────
+    const durationMs = to.getTime() - from.getTime();
+    const prevFrom = new Date(from.getTime() - durationMs).toISOString();
+    const prevTo   = from.toISOString();
+    const previousSummary = buildSummary(db, prevFrom, prevTo);
+
+    // ─── Recent requests (last 10, full RequestLogSummary) ─────────────────
+    const maps = loadSummaryMaps();
+    const recentRows = db
+      .select()
+      .from(schema.requests)
+      .orderBy(desc(schema.requests.createdAt))
+      .limit(10)
+      .all();
+    const recent = recentRows.map((r) => toSummary(r, maps));
+
+    // ─── Providers: traffic + latency + health for routing-flow diagram ────
+    const providerAggs = db
       .select({
         providerId: schema.requestAttempts.providerId,
-        c: sql<number>`COUNT(*)`,
-        err: sql<number>`SUM(CASE WHEN success=0 THEN 1 ELSE 0 END)`,
+        total:     sql<number>`COUNT(*)`,
+        err:       sql<number>`SUM(CASE WHEN success=0 THEN 1 ELSE 0 END)`,
+        avgLat:    sql<number>`COALESCE(AVG(CASE WHEN success=1 THEN latency_ms END),0)`,
       })
       .from(schema.requestAttempts)
       .where(and(gte(schema.requestAttempts.startedAt, fromIso), lte(schema.requestAttempts.startedAt, toIso)))
       .groupBy(schema.requestAttempts.providerId)
-      .orderBy(desc(sql`COUNT(*)`))
       .all();
-    const providers = db.select().from(schema.providers).all();
-    const providerMap = new Map(providers.map((p) => [p.id, p]));
+    const allProviders = db.select().from(schema.providers).all();
+    const providerLookup = new Map(allProviders.map((p) => [p.id, p]));
+    const modelCounts = db
+      .select({ providerId: schema.models.providerId, c: sql<number>`COUNT(*)` })
+      .from(schema.models)
+      .groupBy(schema.models.providerId)
+      .all();
+    const countMap = new Map(modelCounts.map((r) => [r.providerId, Number(r.c)]));
+    const providers: RoutingProvider[] = providerAggs
+      .map((r) => {
+        const p = providerLookup.get(r.providerId);
+        if (!p) return null;
+        const total = Number(r.total);
+        return {
+          id: r.providerId,
+          name: p.name,
+          slug: p.slug,
+          health: p.healthState as RoutingProvider['health'],
+          enabled: p.enabled,
+          modelCount: countMap.get(r.providerId) ?? 0,
+          requests: total,
+          errorRate: total > 0 ? Number(r.err) / total : 0,
+          avgLatencyMs: Number(r.avgLat),
+        };
+      })
+      .filter((x): x is RoutingProvider => x !== null)
+      .sort((a, b) => b.requests - a.requests);
 
     const range: StatsRange = { from: fromIso, to: toIso, bucket };
     return {
       range,
       summary: statsSummary,
-      series: seriesRows.map((r) => ({ t: r.t, requests: Number(r.requests), errors: Number(r.errors), inputTokens: Number(r.inputTokens), outputTokens: Number(r.outputTokens) })),
+      previous: previousSummary,
+      series: seriesRows.map((r) => ({ t: r.t, requests: Number(r.requests), errors: Number(r.errors), inputTokens: Number(r.inputTokens), outputTokens: Number(r.outputTokens), avgLatency: Number(r.avgLatency ?? 0), cacheRead: Number(r.cacheRead ?? 0) })),
       topModels: topModels.map((r) => ({
         publicId: r.modelId ? modelMap.get(r.modelId)?.publicModelId ?? r.modelId : 'unknown',
         requests: Number(r.c),
@@ -178,14 +225,61 @@ export async function registerStatsRoutes(app: FastifyInstance): Promise<void> {
         requests: Number(r.c),
         totalTokens: Number(r.tokens),
       })),
-      topProviders: topProviders.map((r) => ({
-        name: providerMap.get(r.providerId)?.name ?? r.providerId,
-        slug: providerMap.get(r.providerId)?.slug ?? '',
-        requests: Number(r.c),
-        errorRate: Number(r.c) > 0 ? Number(r.err) / Number(r.c) : 0,
-      })),
+      recent,
+      providers,
     };
   });
+}
+
+/**
+ * Fast summary (no percentiles / TTFT — used for previous window and live
+ * incremental aggregation). Returns counts sufficient to derive ratios.
+ */
+function buildSummary(db: BetterSQLite3Database<typeof schema>, fromIso: string, toIso: string): StatsSummary {
+  const conds = [gte(schema.requests.createdAt, fromIso), lte(schema.requests.createdAt, toIso)];
+  const r = db
+    .select({
+      total: sql<number>`COUNT(*)`,
+      success: sql<number>`SUM(CASE WHEN success=1 THEN 1 ELSE 0 END)`,
+      failed: sql<number>`SUM(CASE WHEN success=0 THEN 1 ELSE 0 END)`,
+      inputTokens: sql<number>`COALESCE(SUM(input_tokens),0)`,
+      outputTokens: sql<number>`COALESCE(SUM(output_tokens),0)`,
+      cacheRead: sql<number>`COALESCE(SUM(cache_read_tokens),0)`,
+      cacheWrite: sql<number>`COALESCE(SUM(cache_write_tokens),0)`,
+      reasoning: sql<number>`COALESCE(SUM(reasoning_tokens),0)`,
+      avgLatency: sql<number>`COALESCE(AVG(CASE WHEN success=1 THEN total_latency_ms END),0)`,
+      avgTtft: sql<number | null>`AVG(CASE WHEN success=1 AND ttft_ms IS NOT NULL THEN ttft_ms END)`,
+      gatewayCacheHits: sql<number>`SUM(CASE WHEN gateway_cache_hit=1 THEN 1 ELSE 0 END)`,
+      fallbacks: sql<number>`SUM(CASE WHEN attempts_count > 1 THEN 1 ELSE 0 END)`,
+    })
+    .from(schema.requests)
+    .where(and(...conds))
+    .get();
+
+  const total = Number(r?.total ?? 0);
+  const success = Number(r?.success ?? 0);
+  const cacheRead = Number(r?.cacheRead ?? 0);
+  const inputTokens = Number(r?.inputTokens ?? 0);
+
+  return {
+    totalRequests: total,
+    successfulRequests: success,
+    failedRequests: Number(r?.failed ?? 0),
+    successRate: total ? success / total : 0,
+    inputTokens,
+    outputTokens: Number(r?.outputTokens ?? 0),
+    totalTokens: inputTokens + Number(r?.outputTokens ?? 0),
+    cacheReadTokens: cacheRead,
+    cacheWriteTokens: Number(r?.cacheWrite ?? 0),
+    reasoningTokens: Number(r?.reasoning ?? 0),
+    averageLatencyMs: Number(r?.avgLatency ?? 0),
+    p95LatencyMs: 0,   // caller fills via percentile query
+    averageTtftMs: (r?.avgTtft ?? null) as number | null,
+    p95TtftMs: null,
+    cacheHitRate: success ? cacheRead > 0 ? cacheRead / Math.max(1, inputTokens + cacheRead) : 0 : 0,
+    gatewayCacheHitRate: total ? Number(r?.gatewayCacheHits ?? 0) / total : 0,
+    fallbackRate: total ? Number(r?.fallbacks ?? 0) / total : 0,
+  };
 }
 
 function percentile(sorted: number[], p: number): number {
