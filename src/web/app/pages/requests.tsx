@@ -1,5 +1,5 @@
-// Requests page: paginated list with filters.
-import { useCallback, useEffect, useState } from 'react';
+// Requests page: paginated list with filters + live updates via the SSE stream.
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { PageHeader } from '../../components/ui/skeleton';
 import { Card, CardContent, CardHeader, CardTitle } from '../../components/ui/card';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../../components/ui/table';
@@ -20,14 +20,35 @@ interface RequestRow {
   apiKeyName: string | null; clientIp: string; gatewayCacheHit: boolean;
 }
 
+type Filters = { success: string; protocol: string; streaming: string; model: string };
+
+const RECONNECT_MS = 3000;
+
+// Client-side mirror of the list endpoint's filters, used to decide whether a
+// live SSE row belongs in the currently visible (unfiltered page-0) result set.
+function matchesFilters(r: RequestRow, f: Filters): boolean {
+  if (f.success !== 'all' && r.success !== (f.success === 'true')) return false;
+  if (f.protocol !== 'all' && r.protocol !== f.protocol) return false;
+  if (f.streaming !== 'all' && r.streaming !== (f.streaming === 'true')) return false;
+  if (f.model && !r.requestedModel.toLowerCase().includes(f.model.toLowerCase())) return false;
+  return true;
+}
+
 export function Requests() {
   const [rows, setRows] = useState<RequestRow[]>([]);
   const [total, setTotal] = useState(0);
   const [offset, setOffset] = useState(0);
-  const [filters, setFilters] = useState({ success: 'all', protocol: 'all', streaming: 'all', model: '' });
+  const [filters, setFilters] = useState<Filters>({ success: 'all', protocol: 'all', streaming: 'all', model: '' });
   const [openId, setOpenId] = useState<string | null>(null);
   const [detail, setDetail] = useState<{ request: RequestRow; attempts: Array<Record<string, unknown>> } | null>(null);
+  const [newCount, setNewCount] = useState(0); // live rows arrived since last reload/filter change
   const limit = 50;
+
+  // Live-stream state: cursor (epoch ms of newest row seen), seen ids, latest filters/offset.
+  const sinceRef = useRef<number>(Date.now());
+  const seenIdsRef = useRef<Set<string>>(new Set());
+  const filtersRef = useRef(filters); filtersRef.current = filters;
+  const offsetRef = useRef(offset); offsetRef.current = offset;
 
   const reload = useCallback(async () => {
     const q = new URLSearchParams();
@@ -39,8 +60,59 @@ export function Requests() {
     if (filters.model) q.set('requestedModel', filters.model);
     const r = await api.get<{ total: number; requests: RequestRow[] }>(`/api/admin/requests?${q.toString()}`);
     setRows(r.requests); setTotal(r.total);
+    // Seed the live-stream dedup set from the fresh page.
+    for (const row of r.requests) seenIdsRef.current.add(row.id);
   }, [offset, filters]);
   useEffect(() => { void reload(); }, [reload]);
+
+  // Reset the "new requests" counter whenever the visible window changes.
+  useEffect(() => { setNewCount(0); }, [offset, filters]);
+
+  // Live updates: subscribe to the SSE stream (same reconnect pattern as the
+  // notification hook). Rows that match the active filters land in the table
+  // immediately when viewing page 1; every arrival bumps the counter badge.
+  useEffect(() => {
+    let cancelled = false;
+    let es: EventSource | null = null;
+    const timers = new Set<ReturnType<typeof setTimeout>>();
+
+    const connect = (): void => {
+      if (cancelled) return;
+      es = new EventSource(`/api/admin/requests/stream?since=${sinceRef.current}`);
+      es.addEventListener('request', (ev) => {
+        if (cancelled) return;
+        try {
+          const data = JSON.parse((ev as MessageEvent).data as string) as RequestRow;
+          const seenMs = new Date(data.createdAt).getTime();
+          if (Number.isFinite(seenMs)) sinceRef.current = Math.max(sinceRef.current, seenMs);
+          if (seenIdsRef.current.has(data.id)) return; // replay duplicate — ignore
+          seenIdsRef.current.add(data.id);
+          setNewCount((n) => n + 1);
+          if (offsetRef.current === 0 && matchesFilters(data, filtersRef.current)) {
+            setRows((prev) => {
+              if (prev.some((r) => r.id === data.id)) return prev;
+              return [data, ...prev].slice(0, limit);
+            });
+            setTotal((t) => t + 1);
+          }
+        } catch { /* malformed event — ignore */ }
+      });
+      es.onerror = () => {
+        es?.close();
+        es = null;
+        if (!cancelled) timers.add(setTimeout(connect, RECONNECT_MS));
+      };
+    };
+
+    connect();
+
+    return () => {
+      cancelled = true;
+      es?.close();
+      for (const t of timers) clearTimeout(t);
+      timers.clear();
+    };
+  }, []);
 
   const open = async (id: string) => {
     setOpenId(id);
@@ -50,7 +122,7 @@ export function Requests() {
 
   return (
     <div>
-      <PageHeader title="Requests" description={`${total} matching · server-side paginated`} />
+      <PageHeader title="Requests" description={`${total} matching · live updates`} />
       <Card>
         <CardHeader>
           <div className="flex flex-wrap items-center gap-2">
@@ -67,6 +139,11 @@ export function Requests() {
               <SelectContent><SelectItem value="all">Any</SelectItem><SelectItem value="true">Streaming</SelectItem><SelectItem value="false">Non-stream</SelectItem></SelectContent>
             </Select>
             <Input className="max-w-xs" placeholder="Model contains…" value={filters.model} onChange={(e) => { setOffset(0); setFilters({ ...filters, model: e.target.value }); }} />
+            {newCount > 0 && (
+              <Button size="sm" variant="secondary" onClick={() => { setNewCount(0); void reload(); }}>
+                {newCount} new request{newCount > 1 ? 's' : ''} — refresh
+              </Button>
+            )}
           </div>
           <CardTitle className="mt-3 text-base">Results</CardTitle>
         </CardHeader>

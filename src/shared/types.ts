@@ -49,6 +49,9 @@ export interface AppSettings {
   gatewayCacheMaxSizeMb: number;
   masterKeyConfigured: boolean;
   masterKeyVersion: number;
+  // v1.8.0 — admin UI notification preferences
+  notificationsEnabled: boolean;
+  notificationSoundEnabled: boolean;
 }
 
 export interface AdminSessionInfo {

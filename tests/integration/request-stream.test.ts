@@ -219,4 +219,37 @@ describe('/api/admin/requests/stream', () => {
     expect(summary.inputTokens).toBe(1);
     expect(summary.requestedModel).toBe('mock/gpt-mock');
   });
+
+  it('persists notification preferences (default on, toggle round-trip)', async () => {
+    interface SettingsShape { notificationsEnabled: boolean; notificationSoundEnabled: boolean }
+
+    // Defaults: both enabled.
+    const get0 = await fetch(`${baseUrl}/api/admin/settings`, { headers: { cookie: csrfCookies } });
+    expect(get0.status).toBe(200);
+    const s0 = ((await get0.json()) as { settings: SettingsShape }).settings;
+    expect(s0.notificationsEnabled).toBe(true);
+    expect(s0.notificationSoundEnabled).toBe(true);
+
+    // Toggle both off.
+    const patch = await fetch(`${baseUrl}/api/admin/settings`, {
+      method: 'PATCH', headers: { 'content-type': 'application/json', cookie: csrfCookies },
+      body: JSON.stringify({ notificationsEnabled: false, notificationSoundEnabled: false }),
+    });
+    expect(patch.status).toBe(200);
+    const get1 = await fetch(`${baseUrl}/api/admin/settings`, { headers: { cookie: csrfCookies } });
+    const s1 = ((await get1.json()) as { settings: SettingsShape }).settings;
+    expect(s1.notificationsEnabled).toBe(false);
+    expect(s1.notificationSoundEnabled).toBe(false);
+
+    // Back on.
+    const patch2 = await fetch(`${baseUrl}/api/admin/settings`, {
+      method: 'PATCH', headers: { 'content-type': 'application/json', cookie: csrfCookies },
+      body: JSON.stringify({ notificationsEnabled: true, notificationSoundEnabled: true }),
+    });
+    expect(patch2.status).toBe(200);
+    const get2 = await fetch(`${baseUrl}/api/admin/settings`, { headers: { cookie: csrfCookies } });
+    const s2 = ((await get2.json()) as { settings: SettingsShape }).settings;
+    expect(s2.notificationsEnabled).toBe(true);
+    expect(s2.notificationSoundEnabled).toBe(true);
+  });
 });

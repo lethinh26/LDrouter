@@ -2,7 +2,6 @@
 // (unless already configured via LATEDEV_MASTER_KEY) — provider credentials are
 // encrypted with it, so the admin must keep a copy.
 import { useEffect, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
 import { Button } from '../../components/ui/button';
 import { Input } from '../../components/ui/input';
 import { Label } from '../../components/ui/label';
@@ -18,7 +17,6 @@ export function Setup() {
   // true = master key must be entered on this form; false = already configured
   // via LATEDEV_MASTER_KEY (field hidden).
   const [masterKeyRequired, setMasterKeyRequired] = useState(true);
-  const navigate = useNavigate();
 
   useEffect(() => {
     api.get<{ masterKeyConfigured: boolean }>('/api/admin/setup/status')
@@ -67,7 +65,10 @@ export function Setup() {
             try {
               await api.post('/api/admin/setup', { username, password, setupMasterKey: masterKeyRequired ? masterKey.trim() : undefined });
               toast.success('Admin account created');
-              navigate('/login', { replace: true });
+              // Hard reload, not router navigate: SetupGate cached setupComplete=false on mount and
+              // would bounce a soft navigate('/login') straight back to /setup. A full page load
+              // remounts the app, refetches setupComplete=true, and lands on /login cleanly.
+              window.location.assign('/login');
             } catch (e) {
               toast.error((e as Error).message);
             } finally { setSubmitting(false); }

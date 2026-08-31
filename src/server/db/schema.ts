@@ -22,6 +22,9 @@ export const appSettings = sqliteTable('app_settings', {
   gatewayCacheMaxSizeMb: integer('gateway_cache_max_size_mb').notNull().default(256),
   masterKeyVersion: integer('master_key_version').notNull().default(1),
   masterKeyConfigured: integer('master_key_configured', { mode: 'boolean' }).notNull().notNull().default(false),
+  // Admin UI notification preferences (v1.8.0). Default true: notifications on, sound on.
+  notificationsEnabled: integer('notifications_enabled', { mode: 'boolean' }).notNull().default(true),
+  notificationSoundEnabled: integer('notification_sound_enabled', { mode: 'boolean' }).notNull().default(true),
   updatedAt: text('updated_at').notNull().default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ','now'))`),
 });
 

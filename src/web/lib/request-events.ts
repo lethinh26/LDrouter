@@ -1,6 +1,8 @@
 // Live request notifications: subscribes to the SSE stream and play a sound per event.
 // Each notification auto-dismisses after 5s and can be closed manually.
+// Both the cards and the sound are gated by Settings prefs (see notification-settings.ts).
 import { useEffect, useRef, useState } from 'react';
+import { useNotificationPrefs, loadNotificationPrefs } from './notification-settings';
 
 export interface RequestNotificationItem {
   id: string;
@@ -35,8 +37,27 @@ export function useRequestNotifications(): { items: RequestNotificationItem[]; d
   const esRef = useRef<EventSource | null>(null);
   const timersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
   const lastSeenRef = useRef<number>(Date.now()); // epoch ms, sent as `since` on (re)connect
+  const prefs = useNotificationPrefs();
+  const soundRef = useRef(prefs.sound); // tracks each render so the SSE effect stays stable
+  soundRef.current = prefs.sound;
+
+  // Fetch prefs from the server once (defaults apply before it resolves).
+  useEffect(() => { void loadNotificationPrefs(); }, []);
+
+  const enabled = prefs.enabled;
 
   useEffect(() => {
+    if (!enabled) {
+      // Preferences off: tear down any stream and clear cards.
+      esRef.current?.close();
+      esRef.current = null;
+      const timers = timersRef.current;
+      for (const t of timers.values()) clearTimeout(t);
+      timers.clear();
+      setItems([]);
+      return;
+    }
+
     let cancelled = false;
     const timers = timersRef.current; // stable across the effect lifetime
 
@@ -60,7 +81,7 @@ export function useRequestNotifications(): { items: RequestNotificationItem[]; d
             timers.delete(data.id);
           }, DISMISS_MS);
           timers.set(data.id, t);
-          playSound();
+          if (soundRef.current) playSound();
         } catch { /* malformed event — ignore */ }
       });
 
@@ -81,7 +102,7 @@ export function useRequestNotifications(): { items: RequestNotificationItem[]; d
       for (const t of timers.values()) clearTimeout(t);
       timers.clear();
     };
-  }, []);
+  }, [enabled]);
 
   const dismiss = (id: string): void => {
     const t = timersRef.current.get(id);

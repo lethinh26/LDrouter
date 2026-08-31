@@ -21,6 +21,8 @@ const UpdateBody = z.object({
   gatewayCacheEnabled: z.boolean().optional(),
   gatewayCacheDefaultTtlSeconds: z.number().int().min(1).max(86400).optional(),
   gatewayCacheMaxSizeMb: z.number().int().min(1).max(10240).optional(),
+  notificationsEnabled: z.boolean().optional(),
+  notificationSoundEnabled: z.boolean().optional(),
 });
 
 const PasswordChange = z.object({

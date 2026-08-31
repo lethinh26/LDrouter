@@ -20,6 +20,8 @@ function rowToSettings(row: typeof schema.appSettings.$inferSelect): AppSettings
     gatewayCacheMaxSizeMb: row.gatewayCacheMaxSizeMb,
     masterKeyConfigured: row.masterKeyConfigured,
     masterKeyVersion: row.masterKeyVersion,
+    notificationsEnabled: row.notificationsEnabled,
+    notificationSoundEnabled: row.notificationSoundEnabled,
   };
 }
 
@@ -50,6 +52,8 @@ export function updateSettings(patch: Partial<Omit<AppSettings, 'schemaVersion' 
   if (patch.gatewayCacheDefaultTtlSeconds !== undefined) update.gatewayCacheDefaultTtlSeconds = patch.gatewayCacheDefaultTtlSeconds;
   if (patch.gatewayCacheMaxSizeMb !== undefined) update.gatewayCacheMaxSizeMb = patch.gatewayCacheMaxSizeMb;
   if (patch.masterKeyConfigured !== undefined) update.masterKeyConfigured = patch.masterKeyConfigured;
+  if (patch.notificationsEnabled !== undefined) update.notificationsEnabled = patch.notificationsEnabled;
+  if (patch.notificationSoundEnabled !== undefined) update.notificationSoundEnabled = patch.notificationSoundEnabled;
   db.update(schema.appSettings).set(update).where(eq(schema.appSettings.id, 1)).run();
   return getSettings();
 }

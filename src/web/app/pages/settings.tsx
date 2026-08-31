@@ -12,7 +12,8 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '.
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger } from '../../components/ui/alert-dialog';
 import { api } from '../../lib/api';
 import { toast } from 'sonner';
-import { CheckCircle2, Download, Loader2 } from 'lucide-react';
+import { CheckCircle2, Download, Loader2, Bell, Volume2 } from 'lucide-react';
+import { useNotificationPrefs, saveNotificationPrefs, loadNotificationPrefs } from '../../lib/notification-settings';
 
 interface Settings {
   setupComplete: boolean; retentionDays: number; contentLogMode: string; dbSizeLimitMb: number;
@@ -99,6 +100,8 @@ export function Settings() {
       setTotpState(me.totpEnabled ? 'enabled' : 'disabled');
     } catch { /* ignore */ }
   };
+  // Refresh shared notification prefs store after every settings reload.
+  useEffect(() => { void loadNotificationPrefs(true); }, []);
   useEffect(() => { void reload(); void checkUpdate(); }, []);
   if (!s) return <div className="text-muted-foreground">Loading…</div>;
   const update = async (patch: Partial<Settings>) => {
@@ -352,6 +355,8 @@ export function Settings() {
             </CardContent>
           </Card>
 
+          <NotificationsCard />
+
           <Card className="mt-4">
             <CardHeader>
               <CardTitle className="text-base">Updates</CardTitle>
@@ -418,5 +423,26 @@ export function Settings() {
         </TabsContent>
       </Tabs>
     </div>
+  );
+}
+
+// Notification toggles card — lives in System tab. Shared prefs with useRequestNotifications.
+function NotificationsCard() {
+  const prefs = useNotificationPrefs();
+  return (
+    <Card className="mt-4">
+      <CardHeader><CardTitle className="text-base flex items-center gap-2"><Bell className="h-4 w-4" /> Notifications</CardTitle></CardHeader>
+      <CardContent className="space-y-3 text-sm">
+        <div className="flex items-center justify-between">
+          <span>Show request notifications</span>
+          <Switch checked={prefs.enabled} onCheckedChange={(v) => void saveNotificationPrefs({ enabled: v })} />
+        </div>
+        <div className="flex items-center justify-between">
+          <span className="flex items-center gap-1"><Volume2 className="h-3 w-3" /> Play notification sound</span>
+          <Switch checked={prefs.sound} onCheckedChange={(v) => void saveNotificationPrefs({ sound: v })} />
+        </div>
+        <p className="text-xs text-muted-foreground mt-2">Notifications are disabled while muted. Changes apply immediately.</p>
+      </CardContent>
+    </Card>
   );
 }

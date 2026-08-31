@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.8.0] - 2026-09-01
+
+### Added
+
+- **Notification toggles in Settings**: request notification cards and the notification sound can each be turned on/off in Settings → System ("Notifications" card); preferences persist server-side (`app_settings`) and apply immediately across the whole admin UI.
+- **Real-time /requests page**: the Requests log now subscribes to the SSE stream — new requests appear in the table live (page 1, honoring active filters) plus a "N new requests — refresh" badge, no manual page refresh needed.
+
+### Fixed
+
+- **Setup redirect (permanent fix)**: after creating the admin account the app now hard-reloads to `/login` instead of soft-navigating. Root cause: `SetupGate` cached `setupComplete=false` on mount and re-bounced every post-setup route back to `/setup`; a full reload clears the stale state.
+
 ## [1.7.0] - 2026-08-31
 
 ### Added

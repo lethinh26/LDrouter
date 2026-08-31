@@ -108,6 +108,8 @@ function buildInitialSchemaSql(): string {
       gateway_cache_max_size_mb INTEGER NOT NULL DEFAULT 256,
       master_key_version INTEGER NOT NULL DEFAULT 1,
       master_key_configured INTEGER NOT NULL DEFAULT 0,
+      notifications_enabled INTEGER NOT NULL DEFAULT 1,
+      notification_sound_enabled INTEGER NOT NULL DEFAULT 1,
       updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
     );
 
