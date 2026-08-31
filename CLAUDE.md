@@ -98,7 +98,7 @@ When unspecified, decision defaults: fewer dependencies, secure-by-default, expl
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **LateDev Router** (1475 symbols, 3643 relationships, 110 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **LDrouter** (1622 symbols, 4043 relationships, 128 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
 
@@ -122,10 +122,10 @@ This project is indexed by GitNexus as **LateDev Router** (1475 symbols, 3643 re
 
 | Resource | Use for |
 |----------|---------|
-| `gitnexus://repo/LateDev Router/context` | Codebase overview, check index freshness |
-| `gitnexus://repo/LateDev Router/clusters` | All functional areas |
-| `gitnexus://repo/LateDev Router/processes` | All execution flows |
-| `gitnexus://repo/LateDev Router/process/{name}` | Step-by-step execution trace |
+| `gitnexus://repo/LDrouter/context` | Codebase overview, check index freshness |
+| `gitnexus://repo/LDrouter/clusters` | All functional areas |
+| `gitnexus://repo/LDrouter/processes` | All execution flows |
+| `gitnexus://repo/LDrouter/process/{name}` | Step-by-step execution trace |
 
 ## CLI
 

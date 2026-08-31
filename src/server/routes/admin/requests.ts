@@ -5,7 +5,44 @@ import { and, desc, eq, gte, like, lte, sql } from 'drizzle-orm';
 import { getDb, schema } from '../../db/index';
 import { requireAdminAuth } from '../../auth/middleware';
 import { redactJsonString } from '../../security/redact';
+import { onRequestLogged, offRequestLogged } from '../../gateway/events';
 import type { RequestLogSummary, AttemptLog } from '../../../shared/types';
+
+type RequestRow = typeof schema.requests.$inferSelect;
+
+// Shared row → API summary mapping (used by the list endpoint and the SSE stream).
+function toSummary(r: RequestRow, keyMap: Map<string, { name: string }>, modelMap: Map<string, { publicModelId: string }>): RequestLogSummary {
+  const key = r.apiKeyId ? keyMap.get(r.apiKeyId) : null;
+  const finalModel = r.finalModelId ? modelMap.get(r.finalModelId) : null;
+  return {
+    id: r.id,
+    createdAt: r.createdAt,
+    completedAt: r.completedAt,
+    apiKeyName: key?.name ?? null,
+    keyPrefix: r.keyPrefixSnapshot,
+    clientIp: r.clientIp,
+    protocol: r.protocol,
+    endpoint: r.endpoint,
+    requestedModel: r.requestedModel,
+    resolvedTargetKind: r.resolvedTargetKind,
+    finalModelPublicId: finalModel?.publicModelId ?? null,
+    streaming: Boolean(r.streaming),
+    httpStatus: r.httpStatus,
+    success: Boolean(r.success),
+    totalLatencyMs: r.totalLatencyMs,
+    ttftMs: r.ttftMs,
+    inputTokens: r.inputTokens,
+    outputTokens: r.outputTokens,
+    cacheReadTokens: r.cacheReadTokens,
+    cacheWriteTokens: r.cacheWriteTokens,
+    reasoningTokens: r.reasoningTokens,
+    totalTokens: r.totalTokens,
+    attemptsCount: r.attemptsCount,
+    errorType: r.errorType,
+    errorMessage: r.errorMessage ?? null,
+    gatewayCacheHit: Boolean(r.gatewayCacheHit),
+  } satisfies RequestLogSummary as RequestLogSummary;
+}
 
 export async function registerRequestRoutes(app: FastifyInstance): Promise<void> {
   app.addHook('preHandler', requireAdminAuth);
@@ -40,39 +77,86 @@ export async function registerRequestRoutes(app: FastifyInstance): Promise<void>
 
     return {
       total: totalRow?.c ?? 0,
-      requests: rows.map((r) => {
-        const key = r.apiKeyId ? keyMap.get(r.apiKeyId) : null;
-        const finalModel = r.finalModelId ? modelMap.get(r.finalModelId) : null;
-        return {
-          id: r.id,
-          createdAt: r.createdAt,
-          completedAt: r.completedAt,
-          apiKeyName: key?.name ?? null,
-          keyPrefix: r.keyPrefixSnapshot,
-          clientIp: r.clientIp,
-          protocol: r.protocol,
-          endpoint: r.endpoint,
-          requestedModel: r.requestedModel,
-          resolvedTargetKind: r.resolvedTargetKind,
-          finalModelPublicId: finalModel?.publicModelId ?? null,
-          streaming: Boolean(r.streaming),
-          httpStatus: r.httpStatus,
-          success: Boolean(r.success),
-          totalLatencyMs: r.totalLatencyMs,
-          ttftMs: r.ttftMs,
-          inputTokens: r.inputTokens,
-          outputTokens: r.outputTokens,
-          cacheReadTokens: r.cacheReadTokens,
-          cacheWriteTokens: r.cacheWriteTokens,
-          reasoningTokens: r.reasoningTokens,
-          totalTokens: r.totalTokens,
-          attemptsCount: r.attemptsCount,
-          errorType: r.errorType,
-          errorMessage: r.errorMessage ?? null,
-          gatewayCacheHit: Boolean(r.gatewayCacheHit),
-        } satisfies RequestLogSummary;
-      }),
+      requests: rows.map((r) => toSummary(r, keyMap, modelMap)),
     };
+  });
+
+  // SSE stream of request completions (client reconnects with `since` of its last seen event).
+  app.get('/api/admin/requests/stream', async (req, reply) => {
+    reply.hijack();
+    const q = req.query as Record<string, string | undefined>;
+    const parsedSince = Number(q.since);
+    const since = Number.isFinite(parsedSince) && parsedSince > 0 ? parsedSince : Date.now() - 5_000;
+    const response = reply.raw;
+
+    // Standard SSE headers
+    response.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+    });
+    response.flushHeaders(); // ensure the client sees the stream immediately, even with an empty replay
+
+    let closed = false;
+    const send = (data: string): void => {
+      if (closed) return;
+      try {
+        response.write(data);
+      } catch {
+        closed = true;
+      }
+    };
+
+    const db = getDb();
+    const keys = db.select().from(schema.apiKeys).all();
+    const keyMap = new Map(keys.map((k) => [k.id, k]));
+    const models = db.select().from(schema.models).all();
+    const modelMap = new Map(models.map((m) => [m.id, m]));
+
+    // History replay: up to 20 most recent rows after `since` (oldest first so the client renders in order).
+    const historyRows = db
+      .select()
+      .from(schema.requests)
+      .where(gte(schema.requests.createdAt, new Date(since).toISOString()))
+      .orderBy(desc(schema.requests.createdAt))
+      .limit(20)
+      .all()
+      .reverse();
+    const replayIds = new Set<string>();
+    for (const r of historyRows) {
+      replayIds.add(r.id);
+      send(`event: request\ndata: ${JSON.stringify(toSummary(r, keyMap, modelMap))}\n\n`);
+    }
+
+    // Live: subscribe to the event bus.
+    const handleRequestLogged = (requestId: string): void => {
+      if (closed || replayIds.has(requestId)) return;
+      const row = db.select().from(schema.requests).where(eq(schema.requests.id, requestId)).get();
+      if (!row) return;
+      send(`event: request\ndata: ${JSON.stringify(toSummary(row, keyMap, modelMap))}\n\n`);
+    };
+    onRequestLogged(handleRequestLogged);
+
+    // Keepalive ping every 25s.
+    const keepAlive = setInterval(() => send(': ping\n\n'), 25_000);
+    // Auto-close after 5 min; the client reconnects with its last seen timestamp.
+    const autoClose = setTimeout(() => {
+      response.end();
+      response.destroy();
+    }, 5 * 60_000);
+
+    const cleanup = (): void => {
+      closed = true;
+      clearInterval(keepAlive);
+      clearTimeout(autoClose);
+      offRequestLogged(handleRequestLogged);
+    };
+    // Listen on the *response*: req.raw (IncomingMessage) emits 'close' as soon as the
+    // request message is consumed (immediately for a GET), which would tear down the
+    // stream before any live event. reply.raw (ServerResponse) 'close' fires when the
+    // response completes or the connection terminates — the canonical SSE signal.
+    reply.raw.on('close', cleanup);
+    reply.raw.on('error', cleanup);
   });
 
   app.get('/api/admin/requests/:id', async (req, reply) => {

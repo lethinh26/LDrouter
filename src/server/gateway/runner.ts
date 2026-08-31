@@ -19,6 +19,7 @@ import { getSettings } from '../db/repositories/settings';
 import { buildCacheKey, lookupCache, storeCache, cacheAllowed } from '../caching/store';
 import { metrics } from '../metrics/registry';
 import type { FastifyReply } from 'fastify';
+import { emitRequestLogged } from './events';
 
 export interface GatewayContext {
   requestId: string;
@@ -782,6 +783,8 @@ export class GatewayRunner {
         upstreamRequestId: a.upstreamRequestId,
       } as never).run();
     }
+
+    emitRequestLogged(requestId);
   }
 }
 

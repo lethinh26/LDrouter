@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.7.0] - 2026-08-31
+
+### Added
+
+- **Real-time request notifications**: every gateway request completion shows a notification card in the admin UI (stacked, all visible simultaneously). Cards show model/request, in/out tokens, cache tokens, success/failure, duration + TTFT; auto-dismiss after 5s with manual close button; red on failure, amber when slow (>15s), default surface otherwise. Plays `notification.mp3` per notification.
+- **SSE stream endpoint** (`GET /api/admin/requests/stream`): server-push of request log rows behind admin auth, with `since`-based history replay so clients never miss events across reconnects.
+
 ## [1.6.8] - 2026-08-31
 
 ### Added

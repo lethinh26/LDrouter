@@ -17,6 +17,8 @@ import { AuditLogs } from './pages/audit';
 import { Settings } from './pages/settings';
 import { useEffect, useState } from 'react';
 import { api } from '../lib/api';
+import { RequestNotifications } from '../components/request-notifications';
+import { useRequestNotifications } from '../lib/request-events';
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
   const { user, loading } = useAuth();
@@ -27,6 +29,7 @@ function RequireAuth({ children }: { children: React.ReactNode }) {
 }
 
 function Shell() {
+  const { items, dismiss } = useRequestNotifications();
   return (
     <div className="flex h-screen bg-background text-foreground">
       <Sidebar />
@@ -47,6 +50,7 @@ function Shell() {
           </Routes>
         </main>
       </div>
+      <RequestNotifications items={items} onDismiss={dismiss} />
     </div>
   );
 }
