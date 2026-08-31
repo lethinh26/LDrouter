@@ -1,4 +1,5 @@
 // Sidebar with primary navigation.
+import { useEffect, useState } from 'react';
 import { NavLink } from 'react-router-dom';
 import { Activity, Boxes, Code2, Cog, FileText, Gauge, KeyRound, Layers, Network, ScrollText, ShieldCheck } from 'lucide-react';
 import { cn } from '../lib/utils';
@@ -17,6 +18,19 @@ const items = [
 ];
 
 export function Sidebar() {
+  const [version, setVersion] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/admin/settings/system', { credentials: 'include' })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d: { appVersion?: string } | null) => {
+        if (!cancelled && d?.appVersion) setVersion(d.appVersion);
+      })
+      .catch(() => { /* keep placeholder */ });
+    return () => { cancelled = true; };
+  }, []);
+
   return (
     <aside className="hidden w-60 shrink-0 border-r bg-sidebar text-sidebar-foreground md:flex md:flex-col">
       <div className="flex h-14 items-center gap-2 border-b px-4">
@@ -42,7 +56,7 @@ export function Sidebar() {
         ))}
       </nav>
       <div className="border-t p-3 text-xs text-muted-foreground flex items-center gap-2">
-        <ShieldCheck className="h-3.5 w-3.5 text-primary" /> v0.1.0
+        <ShieldCheck className="h-3.5 w-3.5 text-primary" /> {version ? `v${version}` : 'v…'}
       </div>
     </aside>
   );

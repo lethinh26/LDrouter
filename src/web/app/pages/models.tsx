@@ -11,7 +11,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '.
 import { Checkbox } from '../../components/ui/checkbox';
 import { api } from '../../lib/api';
 import { toast } from 'sonner';
-import { Download } from 'lucide-react';
+import { Download, Trash2, FlaskConical, Loader2, Search, X } from 'lucide-react';
 
 interface ModelRow {
   id: string; providerId: string; providerSlug: string; providerType: string;
@@ -20,6 +20,14 @@ interface ModelRow {
 }
 interface Provider { id: string; name: string; slug: string; type: string; }
 interface Discovered { upstreamId: string; displayName: string; capabilities: Record<string, unknown>; alreadyImported: boolean; existingModelId: string | null; }
+interface TestResult {
+  success: boolean;
+  text: string;
+  latencyMs: number;
+  ttftMs: number | null;
+  usage: { input: number; output: number; cacheRead: number; cacheWrite: number; reasoning: number; total: number };
+  attempts: Array<{ providerName: string; modelId: string; latencyMs: number; ttftMs: number | null; success: boolean; failureReason: string | null }>;
+}
 
 export function Models() {
   const [rows, setRows] = useState<ModelRow[]>([]);
@@ -31,6 +39,11 @@ export function Models() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [fetching, setFetching] = useState(false);
   const [search, setSearch] = useState('');
+  const [discoverSearch, setDiscoverSearch] = useState('');
+  const [testingId, setTestingId] = useState<string | null>(null);
+  const [testOpen, setTestOpen] = useState(false);
+  const [testResult, setTestResult] = useState<{ model: string; result: TestResult | null; error: string | null } | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<ModelRow | null>(null);
 
   const reload = async () => {
     const [m, p] = await Promise.all([
@@ -46,6 +59,13 @@ export function Models() {
     if (providerFilter !== 'all' && m.providerId !== providerFilter) return false;
     if (search && !m.publicModelId.toLowerCase().includes(search.toLowerCase())) return false;
     return true;
+  });
+
+  // Discovered models filtered by search
+  const filteredDiscovered = discovered.filter((d) => {
+    if (!discoverSearch) return true;
+    const q = discoverSearch.toLowerCase();
+    return d.upstreamId.toLowerCase().includes(q) || d.displayName.toLowerCase().includes(q);
   });
 
   const fetch = async () => {
@@ -69,9 +89,30 @@ export function Models() {
     } catch (e) { toast.error((e as Error).message); }
   };
 
-  const toggle = (id: string, on: boolean) => {
-    api.post(`/api/admin/models/${id}/toggle`).then(() => reload()).catch((e) => toast.error((e as Error).message));
-    void on;
+  const handleDelete = async () => {
+    if (!deleteTarget) return;
+    try {
+      await api.del(`/api/admin/models/${deleteTarget.id}`);
+      toast.success('Model deleted');
+      setDeleteTarget(null);
+      void reload();
+    } catch (e) {
+      toast.error((e as Error).message);
+    }
+  };
+
+  const testModel = async (id: string) => {
+    setTestingId(id);
+    setTestOpen(true);
+    setTestResult({ model: id, result: null, error: null });
+    try {
+      const r = await api.post<TestResult>(`/api/admin/models/${id}/test`);
+      setTestResult({ model: id, result: r, error: null });
+    } catch (e) {
+      setTestResult({ model: id, result: null, error: (e as Error).message });
+    } finally {
+      setTestingId(null);
+    }
   };
 
   return (
@@ -95,28 +136,41 @@ export function Models() {
               </div>
               {discovered.length > 0 && (
                 <div className="space-y-2">
-                  <div className="flex items-center justify-between">
-                    <div className="text-sm text-muted-foreground">{discovered.length} discovered · {selected.size} selected</div>
-                    <div className="flex gap-2">
-                      <Button variant="outline" size="sm" onClick={() => setSelected(new Set(discovered.filter((d) => !d.alreadyImported).map((d) => d.upstreamId)))}>Select All (new)</Button>
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 flex-1">
+                      <div className="relative flex-1">
+                        <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
+                        <Input className="pl-8" placeholder="Search models…" value={discoverSearch} onChange={(e) => setDiscoverSearch(e.target.value)} />
+                        {discoverSearch && (
+                          <button className="absolute right-2 top-2.5 text-muted-foreground hover:text-foreground" onClick={() => setDiscoverSearch('')}><X className="h-4 w-4" /></button>
+                        )}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm text-muted-foreground">{filteredDiscovered.length} / {discovered.length} · {selected.size} selected</span>
+                      <Button variant="outline" size="sm" onClick={() => setSelected(new Set(filteredDiscovered.filter((d) => !d.alreadyImported).map((d) => d.upstreamId)))}>Select All (new)</Button>
                       <Button variant="outline" size="sm" onClick={() => setSelected(new Set())}>Clear</Button>
                     </div>
                   </div>
                   <div className="max-h-80 space-y-1 overflow-auto rounded border p-2">
-                    {discovered.map((d) => (
-                      <label key={d.upstreamId} className="flex items-center gap-2 rounded p-1 text-sm hover:bg-accent">
-                        <Checkbox
-                          checked={selected.has(d.upstreamId)}
-                          onCheckedChange={(c) => {
-                            const next = new Set(selected);
-                            if (c) next.add(d.upstreamId); else next.delete(d.upstreamId);
-                            setSelected(next);
-                          }}
-                        />
-                        <span className="font-mono text-xs">{d.upstreamId}</span>
-                        {d.alreadyImported && <Badge variant="secondary">imported</Badge>}
-                      </label>
-                    ))}
+                    {filteredDiscovered.length === 0 && discovered.length > 0 ? (
+                      <div className="text-center text-sm text-muted-foreground py-4">No models match your search.</div>
+                    ) : (
+                      filteredDiscovered.map((d) => (
+                        <label key={d.upstreamId} className="flex items-center gap-2 rounded p-1 text-sm hover:bg-accent">
+                          <Checkbox
+                            checked={selected.has(d.upstreamId)}
+                            onCheckedChange={(c) => {
+                              const next = new Set(selected);
+                              if (c) next.add(d.upstreamId); else next.delete(d.upstreamId);
+                              setSelected(next);
+                            }}
+                          />
+                          <span className="font-mono text-xs">{d.upstreamId}</span>
+                          {d.alreadyImported && <Badge variant="secondary">imported</Badge>}
+                        </label>
+                      ))
+                    )}
                   </div>
                 </div>
               )}
@@ -166,7 +220,14 @@ export function Models() {
                   <TableCell>{m.upstreamAvailable ? <Badge variant="success">up</Badge> : <Badge variant="destructive">down</Badge>}</TableCell>
                   <TableCell>{m.enabled ? 'Yes' : 'No'}</TableCell>
                   <TableCell className="text-right">
-                    <Button size="sm" variant="outline" onClick={() => toggle(m.id, !m.enabled)}>{m.enabled ? 'Disable' : 'Enable'}</Button>
+                    <div className="flex items-center justify-end gap-1">
+                      <Button size="sm" variant="outline" onClick={() => void testModel(m.id)} disabled={testingId !== null}>
+                        {testingId === m.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <FlaskConical className="h-3.5 w-3.5" />} Test
+                      </Button>
+                      <Button size="sm" variant="destructive" onClick={() => setDeleteTarget(m)} disabled={testingId !== null}>
+                        <Trash2 className="h-3.5 w-3.5" /> Xoá
+                      </Button>
+                    </div>
                   </TableCell>
                 </TableRow>
               ))}
@@ -174,6 +235,76 @@ export function Models() {
           </Table>
         </CardContent>
       </Card>
+
+      {/* Delete confirmation modal */}
+      <Dialog open={!!deleteTarget} onOpenChange={(o) => { if (!o) setDeleteTarget(null); }}>
+        <DialogContent className="max-w-md">
+          <DialogHeader><DialogTitle>Xoá model</DialogTitle></DialogHeader>
+          <div className="space-y-2 text-sm">
+            <p>Bạn có chắc muốn xoá model <span className="font-mono">{deleteTarget?.publicModelId}</span>?</p>
+            <p className="text-muted-foreground">Model đang được dùng trong combo sẽ bị soft-disable (vô hiệu hoá) thay vì xoá hẳn, để giữ lịch sử và tham chiếu combo.</p>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setDeleteTarget(null)}>Huỷ</Button>
+            <Button variant="destructive" onClick={handleDelete}>Xoá</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Test result modal */}
+      <Dialog open={testOpen} onOpenChange={setTestOpen}>
+        <DialogContent className="max-w-2xl">
+          <DialogHeader><DialogTitle>Kết quả test model</DialogTitle></DialogHeader>
+          {!testResult ? (
+            <div className="flex items-center gap-2 text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" /> Đang test…</div>
+          ) : testResult.error ? (
+            <div className="space-y-2 text-sm">
+              <Badge variant="destructive">Thất bại</Badge>
+              <p className="text-destructive">{testResult.error}</p>
+            </div>
+          ) : testResult.result && (
+            <div className="space-y-3 text-sm">
+              <div className="flex flex-wrap items-center gap-3">
+                <Badge variant={testResult.result.success ? 'success' : 'destructive'}>{testResult.result.success ? 'Thành công' : 'Thất bại'}</Badge>
+                <div>
+                  <div className="text-xs text-muted-foreground">Thời gian phản hồi</div>
+                  <div className="font-mono">{testResult.result.latencyMs} ms</div>
+                </div>
+                <div>
+                  <div className="text-xs text-muted-foreground">TTFT</div>
+                  <div className="font-mono">{testResult.result.ttftMs != null ? `${testResult.result.ttftMs} ms` : '—'}</div>
+                </div>
+                <div>
+                  <div className="text-xs text-muted-foreground">Tokens (in / out)</div>
+                  <div className="font-mono">{testResult.result.usage.input} / {testResult.result.usage.output}</div>
+                </div>
+              </div>
+              <div>
+                <div className="text-xs text-muted-foreground mb-1">Phản hồi của model</div>
+                <div className="max-h-60 overflow-auto whitespace-pre-wrap rounded border bg-muted p-3 text-xs">{testResult.result.text || '(trống)'}</div>
+              </div>
+              {testResult.result.attempts.length > 0 && (
+                <div>
+                  <div className="text-xs text-muted-foreground mb-1">Attempts</div>
+                  <div className="space-y-1">
+                    {testResult.result.attempts.map((a, i) => (
+                      <div key={i} className="flex items-center gap-2 rounded border p-2 text-xs">
+                        <Badge variant={a.success ? 'success' : 'destructive'}>{a.success ? 'OK' : 'FAIL'}</Badge>
+                        <span className="font-mono">{a.providerName} / {a.modelId}</span>
+                        <span className="text-muted-foreground">{a.latencyMs} ms</span>
+                        {a.failureReason && <span className="text-destructive">{a.failureReason}</span>}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setTestOpen(false)}>Đóng</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

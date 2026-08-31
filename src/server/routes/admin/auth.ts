@@ -120,16 +120,21 @@ export async function registerAuthRoutes(app: FastifyInstance): Promise<void> {
 
 async function verifyTotp(account: typeof schema.adminAccount.$inferSelect, code: string): Promise<boolean> {
   if (!account.totpSecretEncrypted || !account.totpSecretNonce) return false;
-  // Lazy-load to avoid breaking things if crypto module not yet ready
+  // speakeasy v2 exports at top level (no `authenticator` namespace). Normalize once here.
   const { decryptSecret } = await import('../../auth/crypto');
-  const speakeasy = await import('speakeasy');
-  const payload = { ciphertext: account.totpSecretEncrypted, nonce: account.totpSecretNonce, version: 1 };
+  const sp = await loadSpeakeasy();
   try {
-    const secret = decryptSecret({ ciphertext: payload.ciphertext, nonce: payload.nonce, version: 1 });
-    return (speakeasy as unknown as { authenticator: { verify: (o: { token: string; secret: string; window?: number }) => boolean } }).authenticator.verify({ token: code, secret, window: 1 });
+    const secret = decryptSecret({ ciphertext: account.totpSecretEncrypted, nonce: account.totpSecretNonce, version: 1 });
+    return sp.totp.verify({ token: code, secret, encoding: 'base32', window: 1 });
   } catch {
     return false;
   }
+}
+
+// Same helper as settings.ts to normalize speakeasy v2 imports
+async function loadSpeakeasy(): Promise<{ totp: { verify: (o: { secret: string; encoding: string; token: string; window?: number }) => boolean } }> {
+  const m = await import('speakeasy');
+  return (m as { default?: unknown }).default as never ?? (m as never);
 }
 
 import { sql } from 'drizzle-orm';

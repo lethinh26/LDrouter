@@ -4,6 +4,25 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.6.8] - 2026-08-31
+
+### Added
+
+- **Model test endpoint** (`POST /api/admin/models/:id/test`): Run a non-streaming request against a model with prompt "Bạn là model gì?", returns TTFT, total latency, token usage, and provider attempts.
+- **Model delete action**: Replace enable/disable toggle with explicit Delete button + confirmation modal and Test button showing results.
+- **Combo edit functionality**: New edit dialog (via `/api/admin/combos/:id`) and PATCH handler for modifying combo metadata/members.
+- **Searchable member picker**: Dropdown in create/edit combo dialogs now filters models by public ID or display name.
+- **API key actions**: Split Revoke into Disable/Enable toggle + Delete button; persist secret visibility for each key row.
+- **Dynamic sidebar version**: Footer displays real app version fetched from server instead of hardcoded `v0.1.0`.
+
+### Fixed
+
+- **TOTP speakeasy v2 compatibility**: Fixed API migration — removed deprecated `authenticator` namespace, replaced with direct v2 exports (`generateSecret`, `totp.verify({encoding:'base32'})`, `otpauthURL`). Eliminates "Gateway error" when enabling TOTP. Also fixed login flow verification to use same pattern.
+
+### Changed
+
+- **Language**: UI labels updated to Vietnamese where appropriate ("Xoá", "Sửa").
+
 ## [1.6.7] - 2026-08-30
 
 ### Fixed

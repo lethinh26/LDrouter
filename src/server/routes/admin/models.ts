@@ -7,6 +7,8 @@ import { requireAdminAuth } from '../../auth/middleware';
 import { recordAudit } from '../../db/repositories/audit';
 import { uuid } from '../../auth/ids';
 import { GatewayError } from '../../errors';
+import type { GatewayContext, GatewayRequest } from '../../gateway/runner';
+import type { CanonicalRequest } from '../../routing/capabilities';
 
 const ImportModelsBody = z.object({
   providerId: z.string(),
@@ -157,6 +159,59 @@ export async function registerModelRoutes(app: FastifyInstance): Promise<void> {
     db.delete(schema.models).where(eq(schema.models.id, id)).run();
     recordAudit({ action: 'model.delete', success: true, targetType: 'model', targetId: id, targetName: m.publicModelId, ip: req.ip });
     return { ok: true };
+  });
+
+  // Test endpoint: send a real request through the gateway pipeline to verify the model works
+  app.post('/api/admin/models/:id/test', async (req) => {
+    const { id } = req.params as { id: string };
+    const db = getDb();
+    const m = db.select().from(schema.models).where(eq(schema.models.id, id)).get();
+    if (!m) throw new GatewayError('invalid_request_error', 'Model not found', { status: 404 });
+    if (!m.enabled) throw new GatewayError('invalid_request_error', 'Model is disabled', { status: 400 });
+    if (!m.upstreamAvailable) throw new GatewayError('invalid_request_error', 'Model is not available upstream', { status: 400 });
+    const provider = db.select().from(schema.providers).where(eq(schema.providers.id, m.providerId)).get();
+    if (!provider || !provider.enabled) throw new GatewayError('invalid_request_error', 'Provider is disabled', { status: 400 });
+
+    const { GatewayRunner } = await import('../../gateway/runner');
+    const runner = new GatewayRunner();
+    const canonicalReq: CanonicalRequest = {
+      model: m.publicModelId,
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'Bạn là model gì?' }] }],
+      stream: false,
+      maxOutputTokens: 256,
+      temperature: 0.7,
+    };
+    const ctx: GatewayContext = {
+      requestId: `test-${uuid()}`,
+      clientIp: req.ip,
+      protocol: 'openai',
+      endpoint: 'chat/completions',
+      requestedModel: m.publicModelId,
+      key: null,
+      reply: { raw: {} } as never, // Fake reply object; non-streaming won't use it
+    };
+    const gatewayReq: GatewayRequest = {
+      canonical: canonicalReq,
+      protocol: 'openai',
+      endpoint: 'chat/completions',
+    };
+    const outcome = await runner.execute(gatewayReq, ctx);
+    recordAudit({ action: 'model.test', success: outcome.success, targetType: 'model', targetId: id, targetName: m.publicModelId, ip: req.ip });
+    return {
+      success: outcome.success,
+      text: outcome.text ?? '',
+      latencyMs: outcome.latencyMs,
+      ttftMs: outcome.ttftMs ?? null,
+      usage: outcome.usage,
+      attempts: outcome.attempts.map((a) => ({
+        providerName: a.providerName,
+        modelId: a.modelId,
+        latencyMs: a.latencyMs,
+        ttftMs: a.ttftMs,
+        success: a.success,
+        failureReason: a.failureReason,
+      })),
+    };
   });
 }
 

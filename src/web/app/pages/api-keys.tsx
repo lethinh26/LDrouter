@@ -1,4 +1,4 @@
-// API keys page: create / list / revoke.
+// API keys page: create / list / delete / enable/disable.
 import { useEffect, useState } from 'react';
 import { PageHeader } from '../../components/ui/skeleton';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '../../components/ui/card';
@@ -12,7 +12,7 @@ import { Switch } from '../../components/ui/switch';
 import { Checkbox } from '../../components/ui/checkbox';
 import { api } from '../../lib/api';
 import { toast } from 'sonner';
-import { Plus, Copy, Eye } from 'lucide-react';
+import { Plus, Copy, Eye, Trash2, Ban, CheckCircle2 } from 'lucide-react';
 
 interface KeyRow { id: string; name: string; keyPrefix: string; enabled: boolean; expiresAt: string | null; lastUsedAt: string | null; allowAllModels: boolean; modelScopeCount: number; rpmLimit: number | null; tpmLimit: number | null; concurrencyLimit: number | null; secret: string | null; }
 interface Model { id: string; publicModelId: string; }
@@ -57,10 +57,21 @@ export function ApiKeys() {
     } catch (e) { toast.error((e as Error).message); }
   };
 
-  const revoke = async (id: string) => {
-    if (!window.confirm('Revoke this API key?')) return;
-    await api.post(`/api/admin/api-keys/${id}/revoke`);
-    toast.success('Revoked'); void reload();
+  const toggle = async (id: string, enabled: boolean) => {
+    try {
+      await api.patch('/api/admin/api-keys', { id, enabled: !enabled });
+      toast.success(enabled ? 'Key disabled' : 'Key enabled');
+      void reload();
+    } catch (e) { toast.error((e as Error).message); }
+  };
+
+  const del = async (id: string) => {
+    if (!window.confirm('Delete this API key? This cannot be undone.')) return;
+    try {
+      await api.del(`/api/admin/api-keys/${id}`);
+      toast.success('Key deleted');
+      void reload();
+    } catch (e) { toast.error((e as Error).message); }
   };
 
   return (
@@ -138,7 +149,11 @@ export function ApiKeys() {
                           </Button>
                         </>
                       )}
-                      <Button size="sm" variant="outline" onClick={() => revoke(k.id)}>Revoke</Button>
+                      <Button size="sm" variant="outline" onClick={() => toggle(k.id, k.enabled)}>
+                        {k.enabled ? <Ban className="mr-1 h-3.5 w-3.5" /> : <CheckCircle2 className="mr-1 h-3.5 w-3.5" />}
+                        {k.enabled ? 'Disable' : 'Enable'}
+                      </Button>
+                      <Button size="sm" variant="destructive" onClick={() => del(k.id)}><Trash2 className="h-3.5 w-3.5" /></Button>
                     </div>
                   </TableCell>
                 </TableRow>

@@ -34,6 +34,19 @@ const TotpEnableBegin = z.object({});
 void TotpEnableBegin;
 const TotpEnableVerify = z.object({ code: z.string().regex(/^\d{6}$/) });
 
+// speakeasy v2 exports at top level (no `authenticator` namespace). Under ESM
+// interop the module may arrive as { default: {...} }. Normalize once here so
+// every TOTP site uses the v2 API: generateSecret(), totp.verify({secret,
+// encoding:'base32', token, window}), otpauthURL({secret, label, issuer}).
+async function loadSpeakeasy(): Promise<{
+  generateSecret: (o: { name: string; length: number }) => { base32: string; ascii: string };
+  totp: { verify: (o: { secret: string; encoding: string; token: string; window?: number }) => boolean };
+  otpauthURL: (o: { secret: string; label: string; issuer?: string }) => string;
+}> {
+  const m = await import('speakeasy');
+  return (m as { default?: unknown }).default as never ?? (m as never);
+}
+
 export async function registerSettingsRoutes(app: FastifyInstance): Promise<void> {
   app.addHook('preHandler', requireAdminAuth);
 
@@ -77,8 +90,8 @@ export async function registerSettingsRoutes(app: FastifyInstance): Promise<void
     }
     if (account.totpEnabled && body.totp) {
       const secret = decryptSecret({ ciphertext: account.totpSecretEncrypted!, nonce: account.totpSecretNonce!, version: 1 });
-      const speakeasy = await import('speakeasy');
-      if (!(speakeasy as unknown as { authenticator: { verify: (o: { token: string; secret: string; window?: number }) => boolean } }).authenticator.verify({ token: body.totp, secret, window: 1 })) {
+      const sp = await loadSpeakeasy();
+      if (!sp.totp.verify({ token: body.totp, secret, encoding: 'base32', window: 1 })) {
         recordAudit({ action: 'admin.password_change', success: false, ip: req.ip, metadata: { reason: 'bad_totp' } });
         throw new GatewayError('authentication_error', 'Invalid TOTP', { status: 401 });
       }
@@ -94,14 +107,13 @@ export async function registerSettingsRoutes(app: FastifyInstance): Promise<void
   // TOTP setup
   app.post('/api/admin/account/totp/begin', async (req) => {
     if (!isMasterKeyConfigured()) throw new GatewayError('gateway_error', 'Master key required to enable TOTP', { status: 503 });
-    const speakeasy = await import('speakeasy');
+    const sp = await loadSpeakeasy();
     const qrcode = (await import('qrcode')) as unknown as { toDataURL: (t: string) => Promise<string> };
-    const auth = (speakeasy as unknown as { authenticator: { generateSecret: (o: { name: string; length: number }) => { base32: string }; keyuri: (label: string, issuer: string, secret: string) => string } }).authenticator;
-    const secret = auth.generateSecret({ name: 'LateDev Router', length: 20 });
+    const secret = sp.generateSecret({ name: 'LateDev Router', length: 20 });
     const enc = encryptSecret(secret.base32);
     const db = getDb();
     db.update(schema.adminAccount).set({ totpSecretEncrypted: enc.ciphertext, totpSecretNonce: enc.nonce, updatedAt: new Date().toISOString() }).where(eq(schema.adminAccount.id, req.adminAccount!.id)).run();
-    const otpauth = auth.keyuri('admin', 'LateDev Router', secret.base32);
+    const otpauth = sp.otpauthURL({ secret: secret.ascii, label: 'admin', issuer: 'LateDev Router' });
     const qr = await qrcode.toDataURL(otpauth);
     recordAudit({ action: 'totp.begin', success: true, ip: req.ip });
     return { secret: secret.base32, otpauth, qr };
@@ -111,10 +123,9 @@ export async function registerSettingsRoutes(app: FastifyInstance): Promise<void
     const body = TotpEnableVerify.parse(req.body);
     const account = req.adminAccount!;
     if (!account.totpSecretEncrypted) throw new GatewayError('invalid_request_error', 'Begin TOTP setup first', { status: 400 });
-    const speakeasy = await import('speakeasy');
-    const auth = (speakeasy as unknown as { authenticator: { verify: (o: { token: string; secret: string; window?: number }) => boolean } }).authenticator;
+    const sp = await loadSpeakeasy();
     const secret = decryptSecret({ ciphertext: account.totpSecretEncrypted, nonce: account.totpSecretNonce!, version: 1 });
-    if (!auth.verify({ token: body.code, secret, window: 1 })) {
+    if (!sp.totp.verify({ token: body.code, secret, encoding: 'base32', window: 1 })) {
       recordAudit({ action: 'totp.verify', success: false, ip: req.ip });
       throw new GatewayError('invalid_request_error', 'Invalid code', { status: 400 });
     }
@@ -145,9 +156,8 @@ export async function registerSettingsRoutes(app: FastifyInstance): Promise<void
     }
     if (account.totpEnabled && body.totp) {
       const secret = decryptSecret({ ciphertext: account.totpSecretEncrypted!, nonce: account.totpSecretNonce!, version: 1 });
-      const speakeasy = await import('speakeasy');
-      const auth = (speakeasy as unknown as { authenticator: { verify: (o: { token: string; secret: string; window?: number }) => boolean } }).authenticator;
-      if (!auth.verify({ token: body.totp, secret, window: 1 })) {
+      const sp = await loadSpeakeasy();
+      if (!sp.totp.verify({ token: body.totp, secret, encoding: 'base32', window: 1 })) {
         recordAudit({ action: 'totp.disable', success: false, ip: req.ip, metadata: { reason: 'bad_totp' } });
         throw new GatewayError('authentication_error', 'Invalid TOTP', { status: 401 });
       }
@@ -165,10 +175,9 @@ export async function registerSettingsRoutes(app: FastifyInstance): Promise<void
     if (!account.totpEnabled) throw new GatewayError('invalid_request_error', 'TOTP not enabled', { status: 400 });
     const ok = await argon2.verify(account.passwordHash, body.password);
     if (!ok) throw new GatewayError('authentication_error', 'Invalid password', { status: 401 });
-    const speakeasy = await import('speakeasy');
-    const auth = (speakeasy as unknown as { authenticator: { verify: (o: { token: string; secret: string; window?: number }) => boolean } }).authenticator;
+    const sp = await loadSpeakeasy();
     const secret = decryptSecret({ ciphertext: account.totpSecretEncrypted!, nonce: account.totpSecretNonce!, version: 1 });
-    if (!auth.verify({ token: body.totp, secret, window: 1 })) throw new GatewayError('authentication_error', 'Invalid TOTP', { status: 401 });
+    if (!sp.totp.verify({ token: body.totp, secret, encoding: 'base32', window: 1 })) throw new GatewayError('authentication_error', 'Invalid TOTP', { status: 401 });
     const { generateRecoveryCodes } = await import('../../auth/recovery');
     const db = getDb();
     db.delete(schema.adminRecoveryCodes).where(eq(schema.adminRecoveryCodes.adminId, account.id)).run();
