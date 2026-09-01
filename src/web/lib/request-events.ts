@@ -37,6 +37,11 @@ export function useRequestNotifications(): { items: RequestNotificationItem[]; d
   const esRef = useRef<EventSource | null>(null);
   const timersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
   const lastSeenRef = useRef<number>(Date.now()); // epoch ms, sent as `since` on (re)connect
+  // IDs already surfaced as a notification. The SSE stream replays the last 20
+  // rows after `since` on every (re)connect, so without this set a reconnect
+  // would re-show replayed rows as "new" — the ghost notification (card +
+  // sound) with no actual new request behind it.
+  const seenIdsRef = useRef<Set<string>>(new Set());
   const prefs = useNotificationPrefs();
   const soundRef = useRef(prefs.sound); // tracks each render so the SSE effect stays stable
   soundRef.current = prefs.sound;
@@ -72,6 +77,8 @@ export function useRequestNotifications(): { items: RequestNotificationItem[]; d
           const data = JSON.parse((ev as MessageEvent).data as string) as RequestNotificationItem;
           const seenMs = new Date(data.createdAt).getTime();
           if (Number.isFinite(seenMs)) lastSeenRef.current = Math.max(lastSeenRef.current, seenMs);
+          if (seenIdsRef.current.has(data.id)) return; // replay duplicate — already alerted
+          seenIdsRef.current.add(data.id);
           setItems((prev) => {
             if (prev.some((i) => i.id === data.id)) return prev;
             return [data, ...prev].slice(0, MAX_ITEMS);
