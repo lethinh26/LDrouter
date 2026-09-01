@@ -51,7 +51,7 @@ const DEFAULT_SECRET_KEYS = [
 const SECRET_KEY_REGEX = /(authorization|api[-_]?key|api[-_]?secret|password|passwd|secret|token|cookie|master[-_]?key|totp|recovery|private[-_]?key|session)/i;
 
 const PLAINTEXT_PATTERNS: RegExp[] = [
-  /\bld-[A-Za-z0-9_-]{20,}\b/g, // gateway api keys
+  /\bld-[A-Za-z0-9_-]{20,}\b/g, // auto-generated gateway api keys (custom keys are covered by the Bearer/x-api-key patterns below)
   /(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi,
   /sk-[A-Za-z0-9_-]{12,}/g, // OpenAI-style
   /anthropic[_-]?[A-Za-z0-9_-]{20,}/gi,

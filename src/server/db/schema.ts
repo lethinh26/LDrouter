@@ -238,7 +238,8 @@ export const modelAliases = sqliteTable(
 );
 
 // ============================================================================
-// API keys (gateway keys with ld- prefix)
+// API keys (gateway keys; auto-generated ones start with ld-, but custom
+// values without prefix are now supported)
 // ============================================================================
 
 export const apiKeys = sqliteTable(

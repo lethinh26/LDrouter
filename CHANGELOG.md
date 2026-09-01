@@ -4,6 +4,12 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.11.1] - 2026-09-02
+
+### Fixed
+
+- **Custom API keys without an `ld-` prefix now authenticate**: the API-key creation form accepts any custom key value, but gateway authentication rejected every key not starting with `ld-` (401 "Invalid API key format"), making custom keys unusable. Authentication now accepts any stored secret verbatim — auto-generated keys still use the `ld-<base64url(32 bytes)>` format.
+
 ## [1.11.0] - 2026-09-01
 
 ### Added

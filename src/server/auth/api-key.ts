@@ -51,9 +51,8 @@ export function authenticateGatewayKey(req: { headers: Record<string, string | s
   if (bearer) candidate = bearer;
   else if (anthropic) candidate = anthropic;
   if (!candidate) return null;
-  if (!candidate.startsWith('ld-')) {
-    throw new GatewayError('authentication_error', 'Invalid API key format', { status: 401 });
-  }
+  // Custom keys are stored verbatim (no prefix requirement); auto-generated
+  // keys start with ld-, but authentication must accept any stored secret.
   const digest = sha256Hex(candidate);
   const db = getDb();
   const row = db.select().from(schema.apiKeys).where(eq(schema.apiKeys.keyDigest, digest)).get();

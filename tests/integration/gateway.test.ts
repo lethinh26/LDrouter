@@ -320,6 +320,52 @@ describe('gateway smoke', () => {
     expect(res.status).toBe(401);
   });
 
+  it('custom key WITHOUT ld- prefix authenticates successfully', async () => {
+    const customSecret = 'my-custom-key-without-prefix-123456';
+    const createRes = await fetch(`${baseUrl}/api/admin/api-keys`, {
+      method: 'POST', headers: { 'content-type': 'application/json', cookie: csrfCookies },
+      body: JSON.stringify({ name: 'custom-no-prefix', allowAllModels: true, secret: customSecret }),
+    });
+    expect(createRes.status).toBe(200);
+    const created = await createRes.json() as { secret: string };
+    expect(created.secret).toBe(customSecret);
+    const res = await fetch(`${baseUrl}/v1/models`, {
+      headers: { authorization: `Bearer ${customSecret}` },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json() as { data: Array<{ id: string }> };
+    expect(body.data.map((m) => m.id)).toContain('mock/gpt-mock');
+  });
+
+  it('custom key WITHOUT ld- prefix works via x-api-key header (Anthropic style)', async () => {
+    const res = await fetch(`${baseUrl}/v1/models`, {
+      headers: { 'x-api-key': 'my-custom-key-without-prefix-123456' },
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it('custom key WITHOUT ld- prefix can call chat completions', async () => {
+    const { reset, pushHandler } = (await import('./_mock-control.js'));
+    reset();
+    pushHandler((_req: unknown, res: { statusCode: number; setHeader: (k: string, v: string) => void; end: (s: string) => void }, body: string) => {
+      const parsed = JSON.parse(body);
+      expect(parsed.model).toBe('gpt-mock');
+      res.statusCode = 200;
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({
+        id: 'cmpl-custom', object: 'chat.completion', created: 0, model: 'gpt-mock',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      }));
+    });
+    const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer my-custom-key-without-prefix-123456' },
+      body: JSON.stringify({ model: 'mock/gpt-mock', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    expect(res.status).toBe(200);
+  });
+
   it('chat completions: non-streaming success', async () => {
     const { reset, pushHandler } = (await import('./_mock-control.js'));
     reset();
