@@ -25,6 +25,10 @@ export const appSettings = sqliteTable('app_settings', {
   // Admin UI notification preferences (v1.8.0). Default true: notifications on, sound on.
   notificationsEnabled: integer('notifications_enabled', { mode: 'boolean' }).notNull().default(true),
   notificationSoundEnabled: integer('notification_sound_enabled', { mode: 'boolean' }).notNull().default(true),
+  // Admin site IP access control (v1.11.0): newline-delimited CIDR lists.
+  // null = feature disabled.
+  adminIpAllow: text('admin_ip_allow'),
+  adminIpBlock: text('admin_ip_block'),
   updatedAt: text('updated_at').notNull().default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ','now'))`),
 });
 

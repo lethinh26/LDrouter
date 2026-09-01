@@ -12,6 +12,8 @@ import { uuid } from '../../auth/ids';
 import { isMasterKeyConfigured, encryptSecret, decryptSecret } from '../../auth/crypto';
 import { GatewayError } from '../../errors';
 import { runRetentionCleanup } from '../../maintenance/retention';
+import { parseCidr, ipMatchesAny } from '../../util/cidr';
+import { resolveClientIp } from '../../util/client-ip';
 
 const UpdateBody = z.object({
   retentionDays: z.number().int().min(1).max(3650).optional(),
@@ -23,6 +25,8 @@ const UpdateBody = z.object({
   gatewayCacheMaxSizeMb: z.number().int().min(1).max(10240).optional(),
   notificationsEnabled: z.boolean().optional(),
   notificationSoundEnabled: z.boolean().optional(),
+  adminIpAllow: z.string().max(4096).optional().nullable(),
+  adminIpBlock: z.string().max(4096).optional().nullable(),
 });
 
 const PasswordChange = z.object({
@@ -59,9 +63,33 @@ export async function registerSettingsRoutes(app: FastifyInstance): Promise<void
 
   app.patch('/api/admin/settings', async (req) => {
     const body = UpdateBody.parse(req.body);
+    let addedIp: string | null = null;
+    // Validate + normalize the admin IP access lists.
+    if (body.adminIpAllow !== undefined) {
+      const lines = (body.adminIpAllow ?? '').split(/\r?\n/).map((l) => l.trim()).filter(Boolean).slice(0, 100);
+      for (const l of lines) {
+        try { parseCidr(l); } catch { throw new GatewayError('invalid_request_error', `Invalid entry in IP allow list: "${l}"`, { status: 400 }); }
+      }
+      // Lockout guard: when a non-empty allow list is configured, the caller's
+      // own IP must be covered — otherwise saving would lock the admin out of
+      // their own site (the gate is enforced on the next request).
+      const callerIp = resolveClientIp(req);
+      if (lines.length > 0 && !ipMatchesAny(callerIp, lines)) {
+        lines.push(callerIp);
+        addedIp = callerIp;
+      }
+      body.adminIpAllow = lines.length ? lines.join('\n') : null;
+    }
+    if (body.adminIpBlock !== undefined) {
+      const lines = (body.adminIpBlock ?? '').split(/\r?\n/).map((l) => l.trim()).filter(Boolean).slice(0, 100);
+      for (const l of lines) {
+        try { parseCidr(l); } catch { throw new GatewayError('invalid_request_error', `Invalid entry in IP block list: "${l}"`, { status: 400 }); }
+      }
+      body.adminIpBlock = lines.length ? lines.join('\n') : null;
+    }
     updateSettings(body);
-    recordAudit({ action: 'settings.update', success: true, ip: req.ip, metadata: body as Record<string, unknown> });
-    return { ok: true };
+    recordAudit({ action: 'settings.update', success: true, ip: req.ip, metadata: { fields: Object.keys(body), addedIp } });
+    return { ok: true, addedIp };
   });
 
   app.post('/api/admin/settings/cleanup', async (req) => {

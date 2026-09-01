@@ -14,11 +14,14 @@ import { api } from '../../lib/api';
 import { toast } from 'sonner';
 import { CheckCircle2, Download, Loader2, Bell, Volume2 } from 'lucide-react';
 import { useNotificationPrefs, saveNotificationPrefs, loadNotificationPrefs } from '../../lib/notification-settings';
+import { Textarea } from '../../components/ui/textarea';
 
 interface Settings {
   setupComplete: boolean; retentionDays: number; contentLogMode: string; dbSizeLimitMb: number;
   trustProxyHops: number; gatewayCacheEnabled: boolean; gatewayCacheDefaultTtlSeconds: number;
   gatewayCacheMaxSizeMb: number; masterKeyConfigured: boolean; masterKeyVersion: number;
+  notificationsEnabled: boolean; notificationSoundEnabled: boolean;
+  adminIpAllow: string | null; adminIpBlock: string | null;
 }
 
 interface SysInfo { appVersion: string; dataDir: string; masterKeyConfigured: boolean; masterKeyVersion: number; environment: string; }
@@ -36,6 +39,10 @@ export function Settings() {
   const [s, setS] = useState<Settings | null>(null);
   const [sys, setSys] = useState<SysInfo | null>(null);
   const [passwords, setPasswords] = useState({ current: '', next: '' });
+  // IP access control draft state (saved only via the Save button — every
+  // keystroke would otherwise fire a PATCH and fail CIDR validation).
+  const [ipAllowDraft, setIpAllowDraft] = useState('');
+  const [ipBlockDraft, setIpBlockDraft] = useState('');
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
   const [updateBusy, setUpdateBusy] = useState(false);
   const [updatePhase, setUpdatePhase] = useState<'idle' | 'checking' | 'installing' | 'restarting' | 'error'>('idle');
@@ -92,6 +99,8 @@ export function Settings() {
   const reload = async () => {
     const r = await api.get<{ settings: Settings }>('/api/admin/settings');
     setS(r.settings);
+    setIpAllowDraft(r.settings.adminIpAllow ?? '');
+    setIpBlockDraft(r.settings.adminIpBlock ?? '');
     const si = await api.get<SysInfo>('/api/admin/settings/system');
     setSys(si);
     // Check TOTP status by fetching /api/admin/me
@@ -160,6 +169,7 @@ export function Settings() {
       <Tabs defaultValue={defaultTab}>
         <TabsList>
           <TabsTrigger value="logging">Logging</TabsTrigger>
+          <TabsTrigger value="access">Access Control</TabsTrigger>
           <TabsTrigger value="security">Security</TabsTrigger>
           <TabsTrigger value="backup">Backup</TabsTrigger>
           <TabsTrigger value="system">System</TabsTrigger>
@@ -191,6 +201,49 @@ export function Settings() {
               </div>
               <div className="flex items-center gap-2 pt-2">
                 <Button onClick={async () => { const r = await api.post<{ deletedRequests: number }>('/api/admin/settings/cleanup'); toast.success(`Deleted ${r.deletedRequests} old requests`); }}>Run cleanup now</Button>
+              </div>
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        <TabsContent value="access">
+          <Card>
+            <CardHeader><CardTitle className="text-base">IP access control</CardTitle><CardDescription>Allowlist / Blocklist for this admin website (not model traffic)</CardDescription></CardHeader>
+            <CardContent className="space-y-4">
+              <div className="space-y-2">
+                <Label>Allow only these IPs</Label>
+                <Textarea
+                  placeholder="192.168.1.0/24&#10;10.0.0.1"
+                  value={ipAllowDraft}
+                  onChange={(e) => setIpAllowDraft(e.target.value)}
+                />
+                <p className="text-xs text-muted-foreground">Newlines-delimited CIDR ranges (IPv4 only). Leave empty = no allow restrictions. When you save a non-empty list, your current IP is auto-added to prevent lockout.</p>
+              </div>
+              <div className="space-y-2">
+                <Label>Block these IPs</Label>
+                <Textarea
+                  placeholder="192.168.1.100"
+                  value={ipBlockDraft}
+                  onChange={(e) => setIpBlockDraft(e.target.value)}
+                />
+                <p className="text-xs text-muted-foreground">Newlines-delimited CIDR ranges (IPv4 only). Blocked IPs are rejected with &quot;Không có quyền truy cập&quot; before any login page.</p>
+              </div>
+              <Button onClick={() => {
+                const patch: Record<string, unknown> = {};
+                if (ipAllowDraft !== (s?.adminIpAllow ?? '')) patch.adminIpAllow = ipAllowDraft || null;
+                if (ipBlockDraft !== (s?.adminIpBlock ?? '')) patch.adminIpBlock = ipBlockDraft || null;
+                void api.patch<{ ok: boolean; addedIp?: string }>('/api/admin/settings', patch)
+                  .then((r) => {
+                    toast.success(`Saved` + (r.addedIp ? ` — added your IP: ${r.addedIp}` : ''));
+                    reload();
+                    setIpAllowDraft('');
+                    setIpBlockDraft('');
+                  })
+                  .catch((e) => toast.error((e as Error).message));
+              }}>Save access control</Button>
+              <div className="rounded bg-amber-50 border border-amber-200 p-3 dark:bg-amber-950/20 dark:border-amber-800">
+                <p className="text-sm font-medium text-amber-900 dark:text-amber-200">⚠️ If you enable an allow list, you cannot access the gateway unless your IP matches.</p>
+                <p className="text-xs text-amber-800 dark:text-amber-300">The server automatically adds your current IP when you save — but if you configure it from a different machine, that machine will be locked out immediately.</p>
               </div>
             </CardContent>
           </Card>

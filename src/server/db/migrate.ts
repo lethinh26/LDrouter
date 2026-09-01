@@ -110,6 +110,8 @@ function buildInitialSchemaSql(): string {
       master_key_configured INTEGER NOT NULL DEFAULT 0,
       notifications_enabled INTEGER NOT NULL DEFAULT 1,
       notification_sound_enabled INTEGER NOT NULL DEFAULT 1,
+      admin_ip_allow TEXT,
+      admin_ip_block TEXT,
       updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
     );
 

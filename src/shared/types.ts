@@ -52,6 +52,9 @@ export interface AppSettings {
   // v1.8.0 — admin UI notification preferences
   notificationsEnabled: boolean;
   notificationSoundEnabled: boolean;
+  // v1.11.0 — admin site IP access control (newlines delimited CIDRs)
+  adminIpAllow: string | null;
+  adminIpBlock: string | null;
 }
 
 export interface AdminSessionInfo {

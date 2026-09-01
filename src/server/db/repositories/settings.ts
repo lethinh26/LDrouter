@@ -22,6 +22,8 @@ function rowToSettings(row: typeof schema.appSettings.$inferSelect): AppSettings
     masterKeyVersion: row.masterKeyVersion,
     notificationsEnabled: row.notificationsEnabled,
     notificationSoundEnabled: row.notificationSoundEnabled,
+    adminIpAllow: row.adminIpAllow,
+    adminIpBlock: row.adminIpBlock,
   };
 }
 
@@ -54,6 +56,8 @@ export function updateSettings(patch: Partial<Omit<AppSettings, 'schemaVersion' 
   if (patch.masterKeyConfigured !== undefined) update.masterKeyConfigured = patch.masterKeyConfigured;
   if (patch.notificationsEnabled !== undefined) update.notificationsEnabled = patch.notificationsEnabled;
   if (patch.notificationSoundEnabled !== undefined) update.notificationSoundEnabled = patch.notificationSoundEnabled;
+  if (patch.adminIpAllow !== undefined) update.adminIpAllow = patch.adminIpAllow;
+  if (patch.adminIpBlock !== undefined) update.adminIpBlock = patch.adminIpBlock;
   db.update(schema.appSettings).set(update).where(eq(schema.appSettings.id, 1)).run();
   return getSettings();
 }
