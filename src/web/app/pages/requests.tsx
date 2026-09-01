@@ -18,6 +18,8 @@ interface RequestRow {
   outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number; reasoningTokens: number;
   totalTokens: number; attemptsCount: number; errorType: string | null; errorMessage: string | null;
   apiKeyName: string | null; clientIp: string; gatewayCacheHit: boolean;
+  requestPayload?: string | null;
+  responsePayload?: string | null;
 }
 
 type Filters = { success: string; protocol: string; streaming: string; model: string };
@@ -199,6 +201,18 @@ export function Requests() {
                 <div className="rounded border border-destructive/40 bg-destructive/10 p-2">
                   <div className="text-xs text-muted-foreground">Error</div>
                   <div className="font-mono text-xs">{detail.request.errorType}: {detail.request.errorMessage}</div>
+                </div>
+              )}
+              {detail.request.requestPayload && (
+                <div>
+                  <div className="text-xs text-muted-foreground">Request content</div>
+                  <pre className="max-h-60 overflow-auto rounded bg-muted p-2 font-mono text-xs whitespace-pre-wrap">{detail.request.requestPayload}</pre>
+                </div>
+              )}
+              {detail.request.responsePayload && (
+                <div>
+                  <div className="text-xs text-muted-foreground">Response content</div>
+                  <pre className="max-h-60 overflow-auto rounded bg-muted p-2 font-mono text-xs whitespace-pre-wrap">{detail.request.responsePayload}</pre>
                 </div>
               )}
               {detail.attempts.length > 0 && (

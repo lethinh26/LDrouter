@@ -4,6 +4,12 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.9.1] - 2026-09-01
+
+### Fixed
+
+- **Request-content logging now visible**: Settings → Logging "Request-content logging" was saving payloads to the database (`prompt` / `prompt_and_response` modes) but the admin UI never displayed them, making the setting appear broken. The request detail dialog on `/requests` now shows "Request content" and "Response content" sections (sanitized, scrollable) whenever payloads were logged. Added integration test covering all four `contentLogMode` values end-to-end.
+
 ## [1.9.0] - 2026-09-01
 
 ### Added

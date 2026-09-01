@@ -202,6 +202,69 @@ describe('gateway smoke', () => {
     expect(body.providers[0]).toHaveProperty('modelCount');
   });
 
+  it('contentLogMode controls whether request/response payloads are persisted', async () => {
+    const { reset, pushHandler } = (await import('./_mock-control.js'));
+    const setMode = async (mode: string) => {
+      const res = await fetch(`${baseUrl}/api/admin/settings`, {
+        method: 'PATCH', headers: { 'content-type': 'application/json', cookie: csrfCookies },
+        body: JSON.stringify({ contentLogMode: mode }),
+      });
+      expect(res.status).toBe(200);
+    };
+    const chat = async (marker: string) => {
+      reset();
+      pushHandler((_req: unknown, res: { statusCode: number; setHeader: (k: string, v: string) => void; end: (s: string) => void }) => {
+        res.statusCode = 200;
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({
+          id: 'cmpl-c', object: 'chat.completion', created: 0, model: 'gpt-mock',
+          choices: [{ index: 0, message: { role: 'assistant', content: `echo-${marker}` }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        }));
+      });
+      const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey!.secret}` },
+        body: JSON.stringify({ model: 'mock/gpt-mock', messages: [{ role: 'user', content: marker }] }),
+      });
+      expect(res.status).toBe(200);
+    };
+    // The newest request row is ours: tests in this file run sequentially.
+    const detailOfLatest = async () => {
+      const list = await fetch(`${baseUrl}/api/admin/requests?limit=1`, { headers: { cookie: csrfCookies } });
+      expect(list.status).toBe(200);
+      const rows = (await list.json()).requests as Array<{ id: string }>;
+      expect(rows.length).toBeGreaterThan(0);
+      const d = await fetch(`${baseUrl}/api/admin/requests/${rows[0]!.id}`, { headers: { cookie: csrfCookies } });
+      expect(d.status).toBe(200);
+      return await d.json();
+    };
+
+    // 1) prompt mode: request payload saved (with prompt text), response NOT saved.
+    await setMode('prompt');
+    await chat('marker-prompt-mode');
+    const promptDetail = await detailOfLatest();
+    expect(promptDetail.request.requestPayload).toContain('marker-prompt-mode');
+    expect(promptDetail.request.responsePayload).toBeNull();
+
+    // 2) prompt_and_response mode: both saved.
+    await setMode('prompt_and_response');
+    await chat('marker-full-mode');
+    const fullDetail = await detailOfLatest();
+    expect(fullDetail.request.requestPayload).toContain('marker-full-mode');
+    expect(fullDetail.request.responsePayload).toContain('echo-marker-full-mode');
+
+    // 3) metadata mode (default): neither saved.
+    await setMode('metadata');
+    await chat('marker-metadata-mode');
+    const metaDetail = await detailOfLatest();
+    expect(metaDetail.request.requestPayload).toBeNull();
+    expect(metaDetail.request.responsePayload).toBeNull();
+
+    // restore default
+    await setMode('metadata');
+  });
+
   it('GET /api/admin/update/check never 500s (registry unreachable or unpublished package)', async () => {
     const res = await fetch(`${baseUrl}/api/admin/update/check?force=1`, { headers: { cookie: csrfCookies } });
     expect(res.status).toBe(200);
