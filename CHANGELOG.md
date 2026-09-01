@@ -4,6 +4,19 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.10.1] - 2026-09-01
+
+### Fixed
+
+- **Restore now reloads the database hot — no gateway restart needed**: `POST /api/admin/backup/restore` closes the in-process SQLite connection, swaps the file, reopens it in the same process, validates schema, and re-seeds the admin session — the admin stays logged in and sees the restored data immediately. Previously the admin had to restart the gateway after every restore.
+- **Restore no longer loses data on restart**: the restore previously renamed over `data.sqlite` while the app's stale `-wal`/`-shm` sidecars were left behind; on restart SQLite could replay the old WAL over the restored snapshot, making the gateway appear empty (setup screen). The restore now fully closes the old connection before swapping, so the stale sidecars never survive.
+- **Automatic rollback**: if the reopened restored database fails validation (e.g. schema mismatch), the gateway automatically rolls back to the pre-restore snapshot instead of staying broken.
+- **Restore snapshot leak closed**: the pre-restore snapshot connection is now always closed.
+
+### Changed
+
+- Settings → Backup & restore now auto-reloads the admin UI after a successful restore (restore toast: "Restored. Reloading…").
+
 ## [1.10.0] - 2026-09-01
 
 ### Added

@@ -324,8 +324,11 @@ export function Settings() {
                           method: 'POST', body: file, credentials: 'include', headers: { 'content-type': 'application/json' },
                         });
                         if (!res.ok) throw new Error((await res.json())?.error?.message ?? 'Restore failed');
-                        toast.success('Restored. Please restart the gateway.');
+                        toast.success('Restored. Reloading…');
                         setPendingRestoreFile(null);
+                        // Full reload: flush all cached React state so the
+                        // refreshed UI reads from the restored database.
+                        setTimeout(() => location.reload(), 600);
                       } catch (e) { toast.error((e as Error).message); }
                     }}>Restore</AlertDialogAction>
                   </AlertDialogFooter>
