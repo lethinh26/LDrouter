@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.10.0] - 2026-09-01
+
+### Added
+
+- **Real streaming model test**: clicking Test on a model now streams the upstream response token-by-token into the test dialog (`POST /api/admin/models/:id/test-stream` SSE endpoint, newline-delimited). Previously the dialog waited ~1s with no feedback before showing a static result; now content appears live as the model generates, with a blinking cursor, live TTFT/elapsed counter, and a final `test_meta` event with full latency/token/attempt stats. The old non-streaming `POST .../test` endpoint remains for backwards compatibility.
+
+### Fixed
+
+- **Test dialog no loading state**: the model test modal previously opened instantly but showed nothing for the ~1s the request took, looking like a hang. It now shows an immediate streaming view with progress as soon as the modal opens.
+
 ## [1.9.1] - 2026-09-01
 
 ### Fixed

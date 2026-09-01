@@ -265,6 +265,43 @@ describe('gateway smoke', () => {
     await setMode('metadata');
   });
 
+  it('POST /api/admin/models/:id/test-stream streams SSE tokens and delivers test_meta', async () => {
+    const { reset, pushHandler } = (await import('./_mock-control.js'));
+    const db = (await import('../../src/server/db/index')).getDb();
+    const sch = await import('../../src/server/db/schema');
+    const model = db.select().from(sch.models).all().find((m) => m.publicModelId === 'mock/gpt-mock')!;
+    reset();
+    // Mock upstream returns an SSE stream with 2 content chunks, then usage
+    pushHandler((_req, res) => {
+      res.statusCode = 200;
+      res.setHeader('content-type', 'text/event-stream');
+      res.write('data: {"choices":[{"index":0,"delta":{"content":"Xin"},"finish_reason":null}]}\n\n');
+      setTimeout(() => {
+        res.write('data: {"choices":[{"index":0,"delta":{"content":" chao"},"finish_reason":null}]}\n\n');
+        setTimeout(() => {
+          res.write('data: {"choices":[{"index":0,"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}\n\n');
+          res.write('data: [DONE]\n\n');
+          res.end();
+        }, 10);
+      }, 10);
+    });
+    // Read the SSE stream from the test-stream endpoint
+    const res = await globalThis.fetch(`${baseUrl}/api/admin/models/${model.id}/test-stream`, {
+      method: 'POST',
+      headers: { cookie: csrfCookies },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('text/event-stream');
+    const text = await res.text();
+    // Must contain content deltas
+    expect(text).toContain('"content":"Xin"');
+    expect(text).toContain('"content":" chao"');
+    // Must end with test_meta carrying success + usage
+    expect(text).toContain('event: test_meta');
+    expect(text).toContain('"success":true');
+    expect(text).toContain('"usage"');
+  });
+
   it('GET /api/admin/update/check never 500s (registry unreachable or unpublished package)', async () => {
     const res = await fetch(`${baseUrl}/api/admin/update/check?force=1`, { headers: { cookie: csrfCookies } });
     expect(res.status).toBe(200);

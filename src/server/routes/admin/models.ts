@@ -161,7 +161,94 @@ export async function registerModelRoutes(app: FastifyInstance): Promise<void> {
     return { ok: true };
   });
 
-  // Test endpoint: send a real request through the gateway pipeline to verify the model works
+  // Streaming test endpoint: streams SSE tokens to the client in real time.
+  app.post('/api/admin/models/:id/test-stream', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const db = getDb();
+    const m = db.select().from(schema.models).where(eq(schema.models.id, id)).get();
+    if (!m) throw new GatewayError('invalid_request_error', 'Model not found', { status: 404 });
+    if (!m.enabled) throw new GatewayError('invalid_request_error', 'Model is disabled', { status: 400 });
+    if (!m.upstreamAvailable) throw new GatewayError('invalid_request_error', 'Model is not available upstream', { status: 400 });
+    const provider = db.select().from(schema.providers).where(eq(schema.providers.id, m.providerId)).get();
+    if (!provider || !provider.enabled) throw new GatewayError('invalid_request_error', 'Provider is disabled', { status: 400 });
+
+    // Hijack reply so runner streams SSE directly to the client.
+    reply.hijack();
+    const res = reply.raw;
+    const SSE_HEADERS = {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+    };
+    let headWritten = false;
+    const writeHeadOnce = () => {
+      if (headWritten) return;
+      headWritten = true;
+      res.writeHead(200, SSE_HEADERS);
+    };
+    const send = (event: string, data: unknown) => {
+      writeHeadOnce();
+      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    };
+
+    // The runner calls reply.raw.end() as soon as the upstream completes.
+    // Defer that so we can append our own test_meta event before the
+    // real end(). Writes are forwarded live, so tokens still stream.
+    const fakeRaw = {
+      writeHead: () => writeHeadOnce(),
+      write: (chunk: string | Buffer) => res.write(chunk),
+      end: () => { /* deferred: real end happens in our finally */ },
+    } as never;
+
+    const { GatewayRunner } = await import('../../gateway/runner');
+    const runner = new GatewayRunner();
+    const canonicalReq: CanonicalRequest = {
+      model: m.publicModelId,
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'Bạn là model gì?' }] }],
+      stream: true,
+      maxOutputTokens: 256,
+      temperature: 0.7,
+    };
+    const requestId = `test-${uuid()}`;
+    const ctx: GatewayContext = {
+      requestId,
+      clientIp: req.ip,
+      protocol: 'openai',
+      endpoint: 'chat/completions',
+      requestedModel: m.publicModelId,
+      key: null,
+      reply: { raw: fakeRaw } as never,
+    };
+    const gatewayReq: GatewayRequest = {
+      canonical: canonicalReq,
+      protocol: 'openai',
+      endpoint: 'chat/completions',
+    };
+    try {
+      const outcome = await runner.execute(gatewayReq, ctx);
+      // Runner already wrote [DONE]. Append our own test_meta event so the
+      // client knows the test finished with full stats.
+      send('test_meta', {
+        success: outcome.success,
+        latencyMs: outcome.latencyMs,
+        ttftMs: outcome.ttftMs ?? null,
+        usage: outcome.usage,
+        attempts: outcome.attempts.map((a) => ({
+          providerName: a.providerName,
+          modelId: a.modelId,
+          latencyMs: a.latencyMs,
+          success: a.success,
+          failureReason: a.failureReason,
+        })),
+      });
+    } catch (e) {
+      send('test_error', { message: (e as Error).message });
+    } finally {
+      res.end();
+    }
+  });
+
+  // Non-streaming test endpoint (kept for backwards compatibility)
   app.post('/api/admin/models/:id/test', async (req) => {
     const { id } = req.params as { id: string };
     const db = getDb();

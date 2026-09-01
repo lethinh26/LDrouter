@@ -28,6 +28,11 @@ interface TestResult {
   usage: { input: number; output: number; cacheRead: number; cacheWrite: number; reasoning: number; total: number };
   attempts: Array<{ providerName: string; modelId: string; latencyMs: number; ttftMs: number | null; success: boolean; failureReason: string | null }>;
 }
+interface TestProgress { ttftMs?: number; elapsedMs?: number; }
+type TestState =
+  | { phase: 'streaming'; startedAt: number; text: string; progress: TestProgress }
+  | { phase: 'error'; model: string; error: string }
+  | { phase: 'done'; model: string; result: TestResult; text: string };
 
 export function Models() {
   const [rows, setRows] = useState<ModelRow[]>([]);
@@ -42,7 +47,7 @@ export function Models() {
   const [discoverSearch, setDiscoverSearch] = useState('');
   const [testingId, setTestingId] = useState<string | null>(null);
   const [testOpen, setTestOpen] = useState(false);
-  const [testResult, setTestResult] = useState<{ model: string; result: TestResult | null; error: string | null } | null>(null);
+  const [testResult, setTestResult] = useState<TestState | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<ModelRow | null>(null);
 
   const reload = async () => {
@@ -104,12 +109,95 @@ export function Models() {
   const testModel = async (id: string) => {
     setTestingId(id);
     setTestOpen(true);
-    setTestResult({ model: id, result: null, error: null });
+    const startedAt = Date.now();
+    setTestResult({ phase: 'streaming', startedAt, text: '', progress: {} });
+
     try {
-      const r = await api.post<TestResult>(`/api/admin/models/${id}/test`);
-      setTestResult({ model: id, result: r, error: null });
+      // Fetch SSE stream from the test-stream endpoint.
+      // NB: `fetch` is shadowed by the local "Fetch models" helper, so use
+      // globalThis.fetch to reach the browser's fetch.
+      const res = await globalThis.fetch(`/api/admin/models/${id}/test-stream`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        credentials: 'include',
+      });
+      if (!res.ok) {
+        const errText = await res.text().catch(() => '');
+        setTestResult({ phase: 'error', model: id, error: `HTTP ${res.status}: ${errText}` });
+        return;
+      }
+      const reader = res.body?.getReader();
+      if (!reader) { setTestResult({ phase: 'error', model: id, error: 'No response body' }); return; }
+
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let accumulatedText = '';
+      let done = false;
+
+      while (!done) {
+        const { value, done: streamDone } = await reader.read();
+        done = streamDone;
+        if (value) buffer += decoder.decode(value, { stream: true });
+
+        // Parse SSE events from buffer
+        let idx: number;
+        while ((idx = buffer.indexOf('\n\n')) >= 0) {
+          const rawEvent = buffer.slice(0, idx);
+          buffer = buffer.slice(idx + 2);
+          const lines = rawEvent.split('\n');
+          let event = '';
+          let data = '';
+          for (const line of lines) {
+            if (line.startsWith('event: ')) event = line.slice(7);
+            else if (line.startsWith('data: ')) data = line.slice(6);
+          }
+          if (!data) continue;
+
+          // SSE from runner: data chunks (OpenAI format)
+          if (event === '' || event === 'message') {
+            try {
+              const parsed = JSON.parse(data);
+              const choice = parsed.choices?.[0];
+              if (choice?.delta?.content) {
+                accumulatedText += choice.delta.content;
+              }
+              // Track TTFT from first chunk
+              setTestResult((prev) => {
+                if (!prev || prev.phase !== 'streaming') return prev;
+                const elapsed = Date.now() - startedAt;
+                const ttft = prev.progress.ttftMs ?? elapsed;
+                return { ...prev, text: accumulatedText, progress: { ttftMs: ttft, elapsedMs: elapsed } };
+              });
+            } catch { /* ignore parse errors */ }
+          }
+
+          // test_meta: final stats
+          if (event === 'test_meta') {
+            try {
+              const meta = JSON.parse(data) as TestResult;
+              setTestResult({ phase: 'done', model: id, result: meta, text: accumulatedText });
+            } catch { /* ignore */ }
+          }
+
+          // test_error
+          if (event === 'test_error') {
+            try {
+              const err = JSON.parse(data) as { message: string };
+              setTestResult({ phase: 'error', model: id, error: err.message });
+            } catch { /* ignore */ }
+          }
+        }
+      }
+
+      // Stream ended without test_meta — treat as error
+      setTestResult((prev) => {
+        if (!prev || prev.phase === 'streaming') {
+          return { phase: 'error', model: id, error: 'Stream ended unexpectedly' };
+        }
+        return prev;
+      });
     } catch (e) {
-      setTestResult({ model: id, result: null, error: (e as Error).message });
+      setTestResult({ phase: 'error', model: id, error: (e as Error).message });
     } finally {
       setTestingId(null);
     }
@@ -255,14 +343,24 @@ export function Models() {
       <Dialog open={testOpen} onOpenChange={setTestOpen}>
         <DialogContent className="max-w-2xl">
           <DialogHeader><DialogTitle>Kết quả test model</DialogTitle></DialogHeader>
-          {!testResult ? (
-            <div className="flex items-center gap-2 text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" /> Đang test…</div>
-          ) : testResult.error ? (
-            <div className="space-y-2 text-sm">
-              <Badge variant="destructive">Thất bại</Badge>
-              <p className="text-destructive">{testResult.error}</p>
+
+          {/* Streaming in progress */}
+          {testResult && testResult.phase === 'streaming' && (
+            <div className="space-y-3 text-sm">
+              <div className="flex items-center gap-2 text-muted-foreground">
+                <Loader2 className="h-4 w-4 animate-spin" /> Đang stream…
+                <span className="font-mono text-xs text-muted-foreground/60">TTFT {testResult.progress.ttftMs != null ? `${testResult.progress.ttftMs} ms` : '…'}</span>
+                <span className="font-mono text-xs text-muted-foreground/60">· {testResult.progress.elapsedMs != null ? `${testResult.progress.elapsedMs} ms` : '…'}</span>
+              </div>
+              <div>
+                <div className="text-xs text-muted-foreground mb-1">Phản hồi (streaming)</div>
+                <div className="max-h-60 overflow-auto whitespace-pre-wrap rounded border bg-muted p-3 font-mono text-xs">{testResult.text || <span className="text-muted-foreground/60 animate-pulse">waiting for first token…</span>}{testResult.phase === 'streaming' && <span className="ml-0.5 inline-block h-3.5 w-1.5 animate-pulse bg-primary/70" />}</div>
+              </div>
             </div>
-          ) : testResult.result && (
+          )}
+
+          {/* Completed result */}
+          {testResult && testResult.phase === 'done' && (
             <div className="space-y-3 text-sm">
               <div className="flex flex-wrap items-center gap-3">
                 <Badge variant={testResult.result.success ? 'success' : 'destructive'}>{testResult.result.success ? 'Thành công' : 'Thất bại'}</Badge>
@@ -281,7 +379,7 @@ export function Models() {
               </div>
               <div>
                 <div className="text-xs text-muted-foreground mb-1">Phản hồi của model</div>
-                <div className="max-h-60 overflow-auto whitespace-pre-wrap rounded border bg-muted p-3 text-xs">{testResult.result.text || '(trống)'}</div>
+                <div className="max-h-60 overflow-auto whitespace-pre-wrap rounded border bg-muted p-3 font-mono text-xs">{testResult.text || testResult.result.text || '(trống)'}</div>
               </div>
               {testResult.result.attempts.length > 0 && (
                 <div>
@@ -300,6 +398,15 @@ export function Models() {
               )}
             </div>
           )}
+
+          {/* Error state */}
+          {testResult && testResult.phase === 'error' && (
+            <div className="space-y-2 text-sm">
+              <Badge variant="destructive">Thất bại</Badge>
+              <p className="text-destructive">{testResult.error}</p>
+            </div>
+          )}
+
           <DialogFooter>
             <Button variant="outline" onClick={() => setTestOpen(false)}>Đóng</Button>
           </DialogFooter>
