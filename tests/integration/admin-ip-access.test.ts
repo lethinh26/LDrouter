@@ -25,7 +25,7 @@ beforeAll(async () => {
   // For test purposes: expose the client IP via a simple endpoint that bypasses the gate.
   // This lets us dynamically adapt test expectations to whether the system resolves
   // loopback as IPv4 (127.0.0.1) or IPv6 (::1).
-  app.addHook('onRequest', async (req, reply) => {
+  app.addHook('onRequest', async (req, _reply) => {
     const url = req.url.split('?')[0] ?? req.url;
     if (url.startsWith('/_debug/client-ip')) {
       const ip = (req.socket?.remoteAddress || 'unknown');

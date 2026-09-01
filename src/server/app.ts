@@ -20,6 +20,7 @@ import { isMasterKeyConfigured } from './auth/crypto';
 import { registerAdminRoutes } from './routes/admin';
 import { registerGatewayRoutes } from './routes/gateway';
 import { registerHealthRoutes } from './routes/health';
+import { registerAdminIpGate } from './security/admin-ip-gate';
 import { metricsRegistry } from './metrics/registry';
 type App = FastifyInstance;
 
@@ -87,6 +88,10 @@ export async function buildApp(opts: AppOptions = {}): Promise<App> {
     const e: GatewayError = new GatewayError('gateway_error', 'Internal gateway error', { safe: false, cause: err });
     reply.code(500).send(isAnthropic ? toAnthropicError(e, requestId) : toOpenAIError(e, requestId));
   });
+
+  // Admin-site IP access control (Settings → Access Control). Root scope so it
+  // covers the static UI, login/setup, and all admin APIs; /health stays open.
+  registerAdminIpGate(app);
 
   // Static admin UI (if built). The not-found handler is registered once:
   // with a built UI it serves the SPA index.html for non-API paths; without it,
