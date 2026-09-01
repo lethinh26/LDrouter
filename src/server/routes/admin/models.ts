@@ -282,7 +282,15 @@ export async function registerModelRoutes(app: FastifyInstance): Promise<void> {
       protocol: 'openai',
       endpoint: 'chat/completions',
     };
-    const outcome = await runner.execute(gatewayReq, ctx);
+    let outcome: Awaited<ReturnType<typeof runner.execute>>;
+    try {
+      outcome = await runner.execute(gatewayReq, ctx);
+    } catch (e) {
+      // Never let a raw non-GatewayError (e.g. MasterKeyError from credential
+      // decryption) escape into the global handler as an opaque "Gateway error".
+      if (e instanceof GatewayError) throw e;
+      throw new GatewayError('gateway_error', (e as Error).message, { cause: e });
+    }
     recordAudit({ action: 'model.test', success: outcome.success, targetType: 'model', targetId: id, targetName: m.publicModelId, ip: req.ip });
     return {
       success: outcome.success,

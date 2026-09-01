@@ -24,15 +24,31 @@ export interface UpstreamResult {
 }
 
 export function providerToUpstreamConfig(p: Provider): UpstreamConfig {
-  return {
-    type: p.type,
-    baseUrl: p.baseUrl,
-    apiKey: decryptSecret({ ciphertext: p.encryptedApiKey, nonce: p.apiKeyNonce, version: p.apiKeyVersion }),
-    customHeaders: decryptCustomHeaders(
+  let apiKey: string;
+  let customHeaders: Record<string, string>;
+  try {
+    apiKey = decryptSecret({ ciphertext: p.encryptedApiKey, nonce: p.apiKeyNonce, version: p.apiKeyVersion });
+  } catch {
+    // The stored credential cannot be decrypted with the current master key
+    // (e.g. LATEDEV_MASTER_KEY changed, or the DB was restored from another
+    // instance). This must surface as a readable error — not an uncaught
+    // MasterKeyError that Fastify wraps into an opaque 500 "Gateway error".
+    throw new GatewayError('authentication_error', 'Provider credentials cannot be decrypted (master key mismatch). Re-save the provider API key.', { status: 500 });
+  }
+  try {
+    customHeaders = decryptCustomHeaders(
       p.customHeadersEncrypted && p.customHeadersNonce
         ? { ciphertext: p.customHeadersEncrypted, nonce: p.customHeadersNonce, version: 1 }
         : null
-    ),
+    );
+  } catch {
+    throw new GatewayError('authentication_error', 'Provider custom headers cannot be decrypted (master key mismatch). Re-save the provider.', { status: 500 });
+  }
+  return {
+    type: p.type,
+    baseUrl: p.baseUrl,
+    apiKey,
+    customHeaders,
     connectTimeoutMs: p.connectTimeoutMs,
     firstTokenTimeoutMs: p.firstTokenTimeoutMs,
     streamIdleTimeoutMs: p.streamIdleTimeoutMs,

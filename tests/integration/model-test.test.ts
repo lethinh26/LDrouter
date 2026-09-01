@@ -136,6 +136,39 @@ describe('model test endpoint', () => {
     expect(r.attempts[0]!.failureReason).toBeTruthy();
   });
 
+  it('returns a readable error when provider credentials are undecryptable (master key mismatch)', async () => {
+    // Simulate a provider row restored from another instance: its ciphertext
+    // fails AES-GCM auth under the running master key. Before the fix this
+    // threw an uncaught MasterKeyError that surfaced as an opaque 500
+    // "Gateway error" envelope.
+    const { uuid } = await import('../../src/server/auth/ids');
+    const db = (await import('../../src/server/db/index')).getDb();
+    const schema = await import('../../src/server/db/schema');
+    const badProviderId = uuid();
+    db.insert(schema.providers).values({
+      id: badProviderId, name: 'bad', slug: 'bad', type: 'openai',
+      baseUrl: 'http://127.0.0.1:9',
+      encryptedApiKey: Buffer.from('not-a-valid-ciphertext-under-any-key').toString('base64'),
+      apiKeyNonce: Buffer.from('0123456789ab').toString('base64'), apiKeyVersion: 1,
+      enabled: true,
+    }).run();
+    const badModelId = uuid();
+    db.insert(schema.models).values({
+      id: badModelId, providerId: badProviderId, upstreamModelId: 'bad-model',
+      publicModelId: 'bad/bad-model', displayName: 'Bad', enabled: true, upstreamAvailable: true,
+      capabilitiesJson: '{}',
+    }).run();
+
+    const res = await fetch(`${baseUrl}/api/admin/models/${badModelId}/test`, {
+      method: 'POST', headers: { 'content-type': 'application/json', cookie: cookies }, body: '{}',
+    });
+    expect(res.status).toBe(500);
+    const r = await res.json() as { error: { message: string; type: string } };
+    // The message must be the actionable one, not the opaque "Gateway error".
+    expect(r.error.type).toBe('authentication_error');
+    expect(r.error.message).toContain('cannot be decrypted');
+  });
+
   it('sends the default Vietnamese test prompt', async () => {
     const { pushHandler } = await import('./_mock-control.js');
     let seenBody = '';
