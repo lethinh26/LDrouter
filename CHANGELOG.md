@@ -4,6 +4,19 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.11.0] - 2026-09-01
+
+### Added
+
+- **Admin-site IP access control** (Settings → Access Control tab): Allow/Block IP lists (CIDR, one per line) now restrict access to the entire admin website — login, setup, and static UI included. Non-matching IPs get a plain 403 "Không có quyền truy cập". Model traffic (`/v1/*`) and `/health` are never affected. Lockout guard: saving a non-empty allow list auto-adds your current IP so you can't lock yourself out.
+- **Live route lighting on /statistics**: while a request is being served — from the first token (TTFT) until completion — the Request → Gateway → Provider line lights up in the brand primary color with a soft pulsing glow; the completion pulse dot still flashes when the request finishes. Powered by a new live-only `request_started` SSE event.
+- **API key editing**: the API keys page now has an Edit (✏️) button per key — name, expiry, RPM/TPM/concurrency limits, and model scope are editable via the existing dialog; the key secret itself is never changed on edit.
+
+### Fixed
+
+- **Ghost notifications**: reconnects (after the 5-minute stream cycle or a network drop) replayed recent requests over SSE, which re-triggered the notification card + sound even though no new request existed. The notification hook now dedupes by request ID across reconnects.
+- **Model Test no longer returns an opaque 500 "Gateway error"** when the provider credential can't be decrypted (master-key mismatch, e.g. after restoring a backup from another instance): it now returns a readable `authentication_error` telling you to re-save the provider API key; the non-streaming test route also wraps unexpected runner errors instead of leaking them.
+
 ## [1.10.2] - 2026-09-01
 
 ### Fixed
