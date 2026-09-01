@@ -12,7 +12,7 @@ import { Switch } from '../../components/ui/switch';
 import { Checkbox } from '../../components/ui/checkbox';
 import { api } from '../../lib/api';
 import { toast } from 'sonner';
-import { Plus, Copy, Eye, Trash2, Ban, CheckCircle2 } from 'lucide-react';
+import { Plus, Copy, Eye, Trash2, Ban, CheckCircle2, Pencil } from 'lucide-react';
 
 interface KeyRow { id: string; name: string; keyPrefix: string; enabled: boolean; expiresAt: string | null; lastUsedAt: string | null; allowAllModels: boolean; modelScopeCount: number; rpmLimit: number | null; tpmLimit: number | null; concurrencyLimit: number | null; secret: string | null; }
 interface Model { id: string; publicModelId: string; }
@@ -24,6 +24,7 @@ export function ApiKeys() {
   const [models, setModels] = useState<Model[]>([]);
   const [combos, setCombos] = useState<Combo[]>([]);
   const [open, setOpen] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
   const [reveal, setReveal] = useState<{ secret: string; name: string } | null>(null);
   const [revealRow, setRevealRow] = useState<{ secret: string; name: string } | null>(null);
   const [form, setForm] = useState({ name: '', expiresAt: '', allowAll: true, permissions: [] as Perm[], rpmLimit: '', tpmLimit: '', concurrency: '', customSecret: '' });
@@ -40,6 +41,24 @@ export function ApiKeys() {
 
   const submit = async () => {
     try {
+      if (editingId) {
+        await api.patch('/api/admin/api-keys', {
+          id: editingId,
+          name: form.name,
+          expiresAt: form.expiresAt || null,
+          allowAllModels: form.allowAll,
+          permissions: form.allowAll ? [] : form.permissions,
+          rpmLimit: form.rpmLimit ? Number(form.rpmLimit) : null,
+          tpmLimit: form.tpmLimit ? Number(form.tpmLimit) : null,
+          maxConcurrent: form.concurrency ? Number(form.concurrency) : null,
+        });
+        setOpen(false);
+        setEditingId(null);
+        setForm({ name: '', expiresAt: '', allowAll: true, permissions: [], rpmLimit: '', tpmLimit: '', concurrency: '', customSecret: '' });
+        toast.success('Key updated');
+        void reload();
+        return;
+      }
       const r = await api.post<{ secret: string; name: string }>('/api/admin/api-keys', {
         name: form.name,
         expiresAt: form.expiresAt || null,
@@ -55,6 +74,31 @@ export function ApiKeys() {
       setForm({ name: '', expiresAt: '', allowAll: true, permissions: [], rpmLimit: '', tpmLimit: '', concurrency: '', customSecret: '' });
       void reload();
     } catch (e) { toast.error((e as Error).message); }
+  };
+
+  const openEdit = async (k: KeyRow) => {
+    try {
+      const detail = await api.get<{ apiKey: { permissions: Perm[] } }>(`/api/admin/api-keys/${k.id}`);
+      const perms = (detail.apiKey.permissions ?? []).filter((p) => p.targetKind === 'model' || p.targetKind === 'combo');
+      setEditingId(k.id);
+      setForm({
+        name: k.name,
+        expiresAt: k.expiresAt ? k.expiresAt.slice(0, 16) : '',
+        allowAll: k.allowAllModels,
+        permissions: perms,
+        rpmLimit: k.rpmLimit != null ? String(k.rpmLimit) : '',
+        tpmLimit: k.tpmLimit != null ? String(k.tpmLimit) : '',
+        concurrency: k.concurrencyLimit != null ? String(k.concurrencyLimit) : '',
+        customSecret: '', // the secret is never changed on edit
+      });
+      setOpen(true);
+    } catch (e) { toast.error((e as Error).message); }
+  };
+
+  const cancelEdit = () => {
+    setOpen(false);
+    setEditingId(null);
+    setForm({ name: '', expiresAt: '', allowAll: true, permissions: [], rpmLimit: '', tpmLimit: '', concurrency: '', customSecret: '' });
   };
 
   const toggle = async (id: string, enabled: boolean) => {
@@ -77,10 +121,10 @@ export function ApiKeys() {
   return (
     <div>
       <PageHeader title="API Keys" description="Gateway bearer keys for client applications" actions={
-        <Dialog open={open} onOpenChange={setOpen}>
+        <Dialog open={open} onOpenChange={(o) => { if (!o) cancelEdit(); else setOpen(true); }}>
           <DialogTrigger asChild><Button><Plus className="mr-1 h-4 w-4" /> New key</Button></DialogTrigger>
           <DialogContent className="max-w-2xl">
-            <DialogHeader><DialogTitle>New API key</DialogTitle></DialogHeader>
+            <DialogHeader><DialogTitle>{editingId ? 'Edit API key' : 'New API key'}</DialogTitle></DialogHeader>
             <div className="space-y-3">
               <div><Label>Name</Label><Input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></div>
               <div><Label>Expires (optional)</Label><Input type="datetime-local" value={form.expiresAt} onChange={(e) => setForm({ ...form, expiresAt: e.target.value })} /></div>
@@ -89,7 +133,9 @@ export function ApiKeys() {
                 <div><Label>TPM limit</Label><Input value={form.tpmLimit} onChange={(e) => setForm({ ...form, tpmLimit: e.target.value })} type="number" /></div>
                 <div><Label>Concurrency</Label><Input value={form.concurrency} onChange={(e) => setForm({ ...form, concurrency: e.target.value })} type="number" /></div>
               </div>
-              <div><Label>Key value (optional)</Label><Input value={form.customSecret} onChange={(e) => setForm({ ...form, customSecret: e.target.value })} placeholder="Leave empty to auto-generate ld-…" /><p className="text-xs text-muted-foreground">If provided, this exact value is stored as the key. Otherwise a random ld-… key is generated.</p></div>
+              {!editingId && (
+                <div><Label>Key value (optional)</Label><Input value={form.customSecret} onChange={(e) => setForm({ ...form, customSecret: e.target.value })} placeholder="Leave empty to auto-generate ld-…" /><p className="text-xs text-muted-foreground">If provided, this exact value is stored as the key. Otherwise a random ld-… key is generated.</p></div>
+              )}
               <div className="flex items-center gap-2"><Switch checked={form.allowAll} onCheckedChange={(v) => setForm({ ...form, allowAll: v })} /><Label>Allow all current and future models</Label></div>
               {!form.allowAll && (
                 <div>
@@ -115,8 +161,8 @@ export function ApiKeys() {
               )}
             </div>
             <DialogFooter>
-              <Button variant="outline" onClick={() => setOpen(false)}>Cancel</Button>
-              <Button disabled={!form.name} onClick={submit}>Create</Button>
+              <Button variant="outline" onClick={cancelEdit}>Cancel</Button>
+              <Button disabled={!form.name} onClick={submit}>{editingId ? 'Save changes' : 'Create'}</Button>
             </DialogFooter>
           </DialogContent>
         </Dialog>
@@ -149,6 +195,9 @@ export function ApiKeys() {
                           </Button>
                         </>
                       )}
+                      <Button size="sm" variant="ghost" title="Edit" onClick={() => void openEdit(k)}>
+                        <Pencil className="h-3.5 w-3.5" />
+                      </Button>
                       <Button size="sm" variant="outline" onClick={() => toggle(k.id, k.enabled)}>
                         {k.enabled ? <Ban className="mr-1 h-3.5 w-3.5" /> : <CheckCircle2 className="mr-1 h-3.5 w-3.5" />}
                         {k.enabled ? 'Disable' : 'Enable'}
