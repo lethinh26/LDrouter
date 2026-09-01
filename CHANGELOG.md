@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.10.2] - 2026-09-01
+
+### Fixed
+
+- **API keys page no longer crashes after restoring a backup from another instance**: the key list/detail endpoints decrypt every stored key secret; a key encrypted with a different master key (restore from a different machine) threw an AES-GCM auth error that took down the whole request as a generic "Gateway error". Undecryptable keys now yield `secret: null` and the rest of the list still loads.
+- **Creating an API key with an already-used custom secret** now returns a clear `409` ("An API key with this exact secret already exists…") instead of a raw SQLite `UNIQUE constraint failed` surfacing as a generic "Gateway error".
+
 ## [1.10.1] - 2026-09-01
 
 ### Fixed

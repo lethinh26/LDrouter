@@ -10,6 +10,18 @@ import { generateApiKeySecret, sha256Hex, uuid } from '../../auth/ids';
 import { encryptSecret, decryptSecret } from '../../auth/crypto';
 import { GatewayError } from '../../errors';
 
+/** Decrypt an API key secret, tolerating keys that were encrypted with a
+ *  different master key (e.g. after restoring a backup from another
+ *  instance). A failed decrypt yields `null` instead of crashing the whole
+ *  key list/detail request. */
+function safeDecrypt(payload: { ciphertext: string; nonce: string; version: number }): string | null {
+  try {
+    return decryptSecret(payload);
+  } catch {
+    return null;
+  }
+}
+
 const PermEntry = z.object({ targetKind: z.enum(['model', 'combo', 'alias']), targetId: z.string() });
 const IPRule = z.object({ mode: z.enum(['allow', 'deny']), cidr: z.string().min(1).max(64) });
 
@@ -53,7 +65,7 @@ export async function registerApiKeyRoutes(app: FastifyInstance): Promise<void> 
         tpmLimit: k.tpmLimit,
         concurrencyLimit: k.maxConcurrent,
         secret: k.keySecretEncrypted && k.keySecretNonce
-          ? decryptSecret({ ciphertext: k.keySecretEncrypted, nonce: k.keySecretNonce, version: k.keySecretVersion ?? 1 })
+          ? safeDecrypt({ ciphertext: k.keySecretEncrypted, nonce: k.keySecretNonce, version: k.keySecretVersion ?? 1 })
           : null,
       })),
     };
@@ -84,7 +96,7 @@ export async function registerApiKeyRoutes(app: FastifyInstance): Promise<void> 
         maxOutputTokensPerRequest: k.maxOutputTokensPerRequest,
         cacheOverrideEnabled: k.cacheOverrideEnabled,
         secret: k.keySecretEncrypted && k.keySecretNonce
-          ? decryptSecret({ ciphertext: k.keySecretEncrypted, nonce: k.keySecretNonce, version: k.keySecretVersion ?? 1 })
+          ? safeDecrypt({ ciphertext: k.keySecretEncrypted, nonce: k.keySecretNonce, version: k.keySecretVersion ?? 1 })
           : null,
       },
     };
@@ -100,6 +112,13 @@ export async function registerApiKeyRoutes(app: FastifyInstance): Promise<void> 
     const id = uuid();
     const keyPrefix = secret.slice(0, 11);
     const keyDigest = sha256Hex(secret);
+    // Reject a duplicate key before inserting: the digest is UNIQUE, and a
+    // raw SqliteError (not a GatewayError) would otherwise surface as a
+    // generic "Gateway error" 500 to the admin.
+    const existing = db.select().from(schema.apiKeys).where(eq(schema.apiKeys.keyDigest, keyDigest)).get();
+    if (existing) {
+      throw new GatewayError('invalid_request_error', `An API key with this exact secret already exists ("${existing.name}"). Choose a different key value.`, { status: 409 });
+    }
     const enc = encryptSecret(secret);
     db.insert(schema.apiKeys).values({
       id,

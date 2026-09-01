@@ -85,4 +85,44 @@ describe('re-readable API key secrets', () => {
     const legacy = list.apiKeys.find((k) => k.name === 'legacy');
     expect(legacy?.secret).toBeNull();
   });
+
+  it('list survives a key encrypted with a different master key (restore from another instance)', async () => {
+    const { uuid, generateApiKeySecret, sha256Hex } = await import('../../src/server/auth/ids');
+    const { getDb, schema } = await import('../../src/server/db/index');
+    const otherSecret = generateApiKeySecret();
+    // Simulate a key row restored from another instance: its ciphertext was
+    // produced with a master key the running gateway does not know, so AES-GCM
+    // auth fails ("Unsupported state or unable to authenticate data").
+    const invalid = Buffer.from('not-a-valid-ciphertext-under-any-key').toString('base64');
+    getDb().insert(schema.apiKeys).values({
+      id: uuid(), name: 'other-instance', keyPrefix: otherSecret.slice(0, 11),
+      keyDigest: sha256Hex(otherSecret), enabled: true, allowAllModels: true,
+      keySecretEncrypted: invalid, keySecretNonce: Buffer.from('0123456789ab').toString('base64'), keySecretVersion: 1,
+    }).run();
+
+    // The list must NOT crash: the undecryptable row yields secret: null and
+    // the healthy rows still resolve.
+    const listRes = await fetch(`${baseUrl}/api/admin/api-keys`, { headers: { cookie: cookies } });
+    expect(listRes.status).toBe(200);
+    const list = await listRes.json() as { apiKeys: Array<{ id: string; secret: string | null; name: string }> };
+    const other = list.apiKeys.find((k) => k.name === 'other-instance');
+    expect(other?.secret).toBeNull();
+    const custom = list.apiKeys.find((k) => k.name === 'custom-key');
+    expect(custom?.secret).toBeTruthy();
+  });
+
+  it('creating a key with an already-used secret returns a readable 409', async () => {
+    const createRes = await fetch(`${baseUrl}/api/admin/api-keys`, {
+      method: 'POST', headers: { 'content-type': 'application/json', cookie: cookies },
+      body: JSON.stringify({ name: 'dup', allowAllModels: true, secret: 'ld-same-secret-1234567890' }),
+    });
+    expect(createRes.status).toBe(200);
+    const secondRes = await fetch(`${baseUrl}/api/admin/api-keys`, {
+      method: 'POST', headers: { 'content-type': 'application/json', cookie: cookies },
+      body: JSON.stringify({ name: 'dup2', allowAllModels: true, secret: 'ld-same-secret-1234567890' }),
+    });
+    expect(secondRes.status).toBe(409);
+    const body = await secondRes.json() as { error: { message: string } };
+    expect(body.error.message).toContain('already exists');
+  });
 });
