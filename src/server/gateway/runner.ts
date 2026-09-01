@@ -19,7 +19,7 @@ import { getSettings } from '../db/repositories/settings';
 import { buildCacheKey, lookupCache, storeCache, cacheAllowed } from '../caching/store';
 import { metrics } from '../metrics/registry';
 import type { FastifyReply } from 'fastify';
-import { emitRequestLogged } from './events';
+import { emitRequestLogged, emitRequestStarted } from './events';
 
 export interface GatewayContext {
   requestId: string;
@@ -250,6 +250,11 @@ export class GatewayRunner {
           const out = await this.runOneAttempt(req, ctx, candidate, provider.name, cfg, required, (isStreamStarted) => {
             attempt.streamStarted = isStreamStarted;
             attempt.ttftMs = Date.now() - attemptStart;
+          }, (ttftMs) => {
+            // Live signal for the monitoring dashboard: the request is now
+            // being served by this provider (lit up from TTFT until the
+            // completion event fires on persist).
+            emitRequestStarted(ctx.requestId, provider.id, candidate.modelId, ctx.requestedModel, ttftMs);
           });
           attempt.statusCode = (out as { statusCode?: number | null }).statusCode ?? null;
           attempt.success = true;
@@ -403,10 +408,11 @@ export class GatewayRunner {
     providerName: string,
     cfg: ReturnType<typeof providerToUpstreamConfig>,
     required: RequiredCapabilities,
-    onStreamStart: (started: boolean) => void
+    onStreamStart: (started: boolean) => void,
+    onFirstToken: (ttftMs: number) => void
   ): Promise<{ statusCode: number; ttftMs: number | null; upstreamRequestId: string | null; usage: UsageSummary; result: { text: string; toolCalls: Array<{ id: string; name: string; input: unknown }>; finishReason: string | null } }> {
     if (req.canonical.stream) {
-      return this.runStreamingAttempt(req, ctx, candidate, cfg, onStreamStart);
+      return this.runStreamingAttempt(req, ctx, candidate, cfg, onStreamStart, onFirstToken);
     }
     return this.runNonStreamingAttempt(req, candidate, cfg);
   }
@@ -456,7 +462,8 @@ export class GatewayRunner {
     ctx: GatewayContext,
     candidate: CandidateModel,
     cfg: ReturnType<typeof providerToUpstreamConfig>,
-    onStreamStart: (started: boolean) => void
+    onStreamStart: (started: boolean) => void,
+    onFirstToken: (ttftMs: number) => void
   ): Promise<{ statusCode: number; ttftMs: number | null; upstreamRequestId: string | null; usage: UsageSummary; result: { text: string; toolCalls: Array<{ id: string; name: string; input: unknown }>; finishReason: string | null } }> {
     const upstreamModel = candidate.publicModelId.split('/').slice(1).join('/');
     const encoder = req.protocol === 'openai' ? openaiStreamEncoder : anthropicStreamEncoder;
@@ -479,6 +486,7 @@ export class GatewayRunner {
     };
 
     let streamStarted = false;
+    const streamStartTs = Date.now();
     let textBuf = '';
     const toolBuf: Array<{ id: string; name: string; input: unknown }> = [];
     let finishReason: string | null = null;
@@ -526,6 +534,7 @@ export class GatewayRunner {
       if (isFirst) {
         streamStarted = true;
         onStreamStart(true);
+        onFirstToken(Date.now() - streamStartTs);
       }
       const encoded = encoder(chunk.data, chunk.event);
       if (!headWritten) writeHead();

@@ -1,13 +1,16 @@
 // Routing flow visualization: Incoming Traffic → AI Gateway → Providers.
 // Curved SVG paths with animated pulse dots along each active route.
+// While a request is being served (TTFT → completion), the Request→Gateway
+// and Gateway→Provider lines light up in the primary color and blink.
 import { Card, CardHeader, CardTitle, CardContent } from '../ui/card';
-import type { RoutingProviderShape, Pulse } from '../../lib/use-live-stats';
+import type { RoutingProviderShape, Pulse, ActiveRoute } from '../../lib/use-live-stats';
 
 interface RoutingFlowProps {
   liveRequests: number;
   successRate: number;
   providers: RoutingProviderShape[];
   pulses: Pulse[];
+  activeRoutes: ActiveRoute[];
 }
 
 const SVG_W = 1000;
@@ -31,10 +34,13 @@ function curvedPath(fromX: number, fromY: number, toX: number, toY: number) {
   return `M${fromX},${fromY} C${cpx1},${fromY} ${cpx2},${toY} ${toX},${toY}`;
 }
 
-export function RoutingFlow({ liveRequests, successRate, providers, pulses }: RoutingFlowProps) {
+export function RoutingFlow({ liveRequests, successRate, providers, pulses, activeRoutes }: RoutingFlowProps) {
   const gatewayY = SVG_H / 2;
   const incomingY = gatewayY;
   const totalTraffic = Math.max(1, providers.reduce((a, p) => a + p.requests, 0));
+  // Providers currently serving a request (lit from TTFT until completion).
+  const activeProviderIds = new Set(activeRoutes.map((a) => a.providerId));
+  const anyActive = activeProviderIds.size > 0;
 
   return (
     <Card>
@@ -66,21 +72,43 @@ export function RoutingFlow({ liveRequests, successRate, providers, pulses }: Ro
               const py = 60 + idx * PROVIDER_SPACING;
               const pct = p.requests / totalTraffic;
               const strokeW = Math.max(1.5, Math.min(6, 2 + pct * 8));
+              const active = activeProviderIds.has(p.id);
               return (
-                <path
-                  key={p.id}
-                  d={curvedPath(GATEWAY_X, gatewayY, PROVIDER_START_X - 20, py)}
-                  fill="none"
-                  stroke="hsl(var(--border))"
-                  strokeWidth={strokeW}
-                  strokeLinecap="round"
-                  opacity={0.6}
-                />
+                <g key={p.id}>
+                  {/* Soft glow under an active route */}
+                  {active && (
+                    <path
+                      d={curvedPath(GATEWAY_X, gatewayY, PROVIDER_START_X - 20, py)}
+                      fill="none"
+                      stroke="hsl(var(--primary) / 0.25)"
+                      strokeWidth={strokeW + 6}
+                      strokeLinecap="round"
+                    />
+                  )}
+                  <path
+                    d={curvedPath(GATEWAY_X, gatewayY, PROVIDER_START_X - 20, py)}
+                    fill="none"
+                    stroke={active ? 'hsl(var(--primary))' : 'hsl(var(--border))'}
+                    strokeWidth={active ? strokeW + 1 : strokeW}
+                    strokeLinecap="round"
+                    opacity={active ? 0.95 : 0.6}
+                    className={active ? 'route-active' : undefined}
+                  />
+                </g>
               );
             })}
 
-            {/* Incoming path */}
-            <path d={curvedPath(INCOMING_X + 30, incomingY, GATEWAY_X - 30, gatewayY)} fill="none" stroke="hsl(var(--border))" strokeWidth={3} strokeLinecap="round" strokeDasharray="6 3" opacity={0.5} />
+            {/* Incoming path — lights up whenever any request is being served */}
+            <path
+              d={curvedPath(INCOMING_X + 30, incomingY, GATEWAY_X - 30, gatewayY)}
+              fill="none"
+              stroke={anyActive ? 'hsl(var(--primary))' : 'hsl(var(--border))'}
+              strokeWidth={3}
+              strokeLinecap="round"
+              strokeDasharray="6 3"
+              opacity={anyActive ? 0.9 : 0.5}
+              className={anyActive ? 'route-active' : undefined}
+            />
 
             {/* ── Pulse dots along each route ── */}
             {pulses.map((pulse) => {

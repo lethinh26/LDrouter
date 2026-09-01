@@ -15,7 +15,7 @@ import { Activity, CheckCircle2, Cpu, Database, Clock, Gauge, Route, TrendingUp 
 
 export function Statistics() {
   const [preset, setPreset] = useState<Preset>('7d');
-  const { snapshot, live, recent, providers, pulses, loading, error } = useLiveStats(preset);
+  const { snapshot, live, recent, providers, pulses, activeRoutes, loading, error } = useLiveStats(preset);
 
   if (loading) return <div className="text-muted-foreground">Loading…</div>;
   if (error || !snapshot) return <div className="text-destructive">Failed to load statistics: {error ?? 'unknown error'}</div>;
@@ -59,7 +59,7 @@ export function Statistics() {
 
       {/* Routing flow */}
       <div className="mt-6">
-        <RoutingFlow liveRequests={s.totalRequests} successRate={s.successRate} providers={providers} pulses={pulses} />
+        <RoutingFlow liveRequests={s.totalRequests} successRate={s.successRate} providers={providers} pulses={pulses} activeRoutes={activeRoutes} />
       </div>
 
       {/* Recent Requests + Top Models + Top API Keys */}

@@ -63,6 +63,16 @@
   }
 }
 
+/* Route-active animation — lights from TTFT until completion */
+@keyframes route-active-pulse {
+  0% { opacity: 0.35; }
+  50% { opacity: 1; }
+  100% { opacity: 0.35; }
+}
+.route-active {
+  animation: route-active-pulse 1.4s ease-in-out infinite;
+}
+
 /* Scrollbar */
 ::-webkit-scrollbar {
   width: 8px;

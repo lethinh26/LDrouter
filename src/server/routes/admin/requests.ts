@@ -5,7 +5,7 @@ import { and, desc, eq, gte, like, lte, sql } from 'drizzle-orm';
 import { getDb, schema } from '../../db/index';
 import { requireAdminAuth } from '../../auth/middleware';
 import { redactJsonString } from '../../security/redact';
-import { onRequestLogged, offRequestLogged } from '../../gateway/events';
+import { onRequestLogged, offRequestLogged, onRequestStarted, offRequestStarted } from '../../gateway/events';
 import type { RequestLogSummary, AttemptLog } from '../../../shared/types';
 
 type RequestRow = typeof schema.requests.$inferSelect;
@@ -153,6 +153,16 @@ export async function registerRequestRoutes(app: FastifyInstance): Promise<void>
     };
     onRequestLogged(handleRequestLogged);
 
+    // A request is being served (first token reached): live-only — not part of
+    // history replay. The monitoring dashboard uses this to light the route
+    // from TTFT until the completion (`request`) event arrives.
+    const handleRequestStarted = (data: { requestId: string; providerId: string | null; modelId: string; requestedModel: string; ttftMs: number }): void => {
+      if (closed || !data.providerId) return;
+      const provider = maps.providerMap.get(data.providerId);
+      send(`event: request_started\ndata: ${JSON.stringify({ requestId: data.requestId, providerId: data.providerId, providerName: provider?.name ?? null, modelId: data.modelId, requestedModel: data.requestedModel, ttftMs: data.ttftMs, createdAt: new Date().toISOString() })}\n\n`);
+    };
+    onRequestStarted(handleRequestStarted);
+
     // Keepalive ping every 25s.
     const keepAlive = setInterval(() => send(': ping\n\n'), 25_000);
     // Auto-close after 5 min; the client reconnects with its last seen timestamp.
@@ -166,6 +176,7 @@ export async function registerRequestRoutes(app: FastifyInstance): Promise<void>
       clearInterval(keepAlive);
       clearTimeout(autoClose);
       offRequestLogged(handleRequestLogged);
+      offRequestStarted(handleRequestStarted);
     };
     // Listen on the *response*: req.raw (IncomingMessage) emits 'close' as soon as the
     // request message is consumed (immediately for a GET), which would tear down the

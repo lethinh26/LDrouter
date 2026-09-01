@@ -30,6 +30,8 @@ export interface LiveRequestShape {
 
 export interface Pulse { id: string; providerId: string; success: boolean }
 
+export interface ActiveRoute { id: string; providerId: string; startedAt: number; ttftMs: number }
+
 export interface StatsSnapshot {
   range: { from: string; to: string; bucket: string };
   summary: StatsSummaryShape;
@@ -45,6 +47,8 @@ const RECONNECT_MS = 3000;
 const PULSE_MS = 1600; // animation duration
 const MAX_RECENT = 10;
 const MAX_PROVIDER_PULSES = 3;
+const MAX_ACTIVE_ROUTES = 12;
+const ACTIVE_ROUTE_TIMEOUT_MS = 10 * 60_000; // safety: drop routes whose completion event never arrived
 
 export interface UseLiveStatsResult {
   snapshot: StatsSnapshot | null;
@@ -52,6 +56,7 @@ export interface UseLiveStatsResult {
   recent: LiveRequestShape[];
   providers: RoutingProviderShape[];
   pulses: Pulse[];
+  activeRoutes: ActiveRoute[]; // provider IDs currently being served (TTFT -> completion)
   loading: boolean;
   error: string | null;
 }
@@ -78,6 +83,7 @@ export function useLiveStats(preset: Preset): UseLiveStatsResult {
   const [recent, setRecent] = useState<LiveRequestShape[]>([]);
   const [providers, setProviders] = useState<RoutingProviderShape[]>([]);
   const [pulses, setPulses] = useState<Pulse[]>([]);
+  const [activeRoutes, setActiveRoutes] = useState<ActiveRoute[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -88,6 +94,7 @@ export function useLiveStats(preset: Preset): UseLiveStatsResult {
   const sinceRef = useRef<number>(Date.now());
   const pulseIdRef = useRef(0);
   const pulsesRef = useRef<Pulse[]>([]);
+  const activeRoutesRef = useRef<ActiveRoute[]>([]);
 
   // ── Snapshot fetch (on mount + preset change) ─────────────────────────────
   useEffect(() => {
@@ -159,6 +166,25 @@ export function useLiveStats(preset: Preset): UseLiveStatsResult {
             }, PULSE_MS);
             timers.add(t);
           }
+          // Completion: the request that lit the route has finished.
+          if (activeRoutesRef.current.some((a) => a.id === row.id)) {
+            activeRoutesRef.current = activeRoutesRef.current.filter((a) => a.id !== row.id);
+            setActiveRoutes(activeRoutesRef.current);
+          }
+        } catch { /* malformed event — ignore */ }
+      });
+      // Live-only: the gateway is serving a request (from TTFT). Lights the
+      // provider route until the completion `request` event arrives.
+      es.addEventListener('request_started', (ev) => {
+        if (cancelled) return;
+        try {
+          const row = JSON.parse((ev as MessageEvent).data as string) as { requestId: string; providerId: string | null; ttftMs: number };
+          if (!row.providerId || row.providerId === '') return;
+          activeRoutesRef.current = [
+            ...activeRoutesRef.current.filter((a) => a.id !== row.requestId).slice(-(MAX_ACTIVE_ROUTES - 1)),
+            { id: row.requestId, providerId: row.providerId, startedAt: Date.now(), ttftMs: row.ttftMs ?? 0 },
+          ];
+          setActiveRoutes(activeRoutesRef.current);
         } catch { /* malformed event — ignore */ }
       });
       es.onerror = () => {
@@ -170,11 +196,21 @@ export function useLiveStats(preset: Preset): UseLiveStatsResult {
 
     connect();
 
+    // Safety sweep: drop active routes whose completion event never arrived
+    // (lost connection mid-request), so lights never stay stuck on.
+    const sweep = setInterval(() => {
+      const cutoff = Date.now() - ACTIVE_ROUTE_TIMEOUT_MS;
+      if (!activeRoutesRef.current.some((a) => a.startedAt < cutoff)) return;
+      activeRoutesRef.current = activeRoutesRef.current.filter((a) => a.startedAt >= cutoff);
+      setActiveRoutes(activeRoutesRef.current);
+    }, 30_000);
+
     return () => {
       cancelled = true;
       es?.close();
       for (const t of timers) clearTimeout(t);
       timers.clear();
+      clearInterval(sweep);
     };
   }, []);
 
@@ -201,6 +237,7 @@ export function useLiveStats(preset: Preset): UseLiveStatsResult {
     recent,
     providers,
     pulses,
+    activeRoutes,
     loading,
     error,
   };
