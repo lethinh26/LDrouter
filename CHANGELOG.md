@@ -4,6 +4,12 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.11.8] - 2026-09-03
+
+### Fixed
+
+- **ESLint flat config updated**: added debug scripts to ignore list in `eslint.config.mjs` (flat config replaces `.eslintignore` in ESLint v9+).
+
 ## [1.11.7] - 2026-09-03
 
 ### Fixed
@@ -14,7 +20,7 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
-- **Debug scripts excluded from linting**: added `.eslintignore` for utility scripts that use Node.js globals intentionally.
+- **Debug scripts excluded from linting**: initially used `.eslintignore`, then migrated to ESLint flat config proper syntax.
 
 ## [1.11.3] - 2026-09-03
 
