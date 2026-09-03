@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.11.7] - 2026-09-03
+
+### Fixed
+
+- **API routes no longer return HTML on errors**: fixed route registration order so gateway routes (`/v1/*`) are registered BEFORE static file middleware, preventing API validation errors from serving SPA index.html instead of JSON error responses.
+
+## [1.11.6] - 2026-09-03
+
+### Fixed
+
+- **Debug scripts excluded from linting**: added `.eslintignore` for utility scripts that use Node.js globals intentionally.
+
 ## [1.11.3] - 2026-09-03
 
 ### Fixed
