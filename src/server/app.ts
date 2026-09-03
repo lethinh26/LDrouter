@@ -93,11 +93,22 @@ export async function buildApp(opts: AppOptions = {}): Promise<App> {
   // covers the static UI, login/setup, and all admin APIs; /health stays open.
   registerAdminIpGate(app);
 
-  // Static admin UI (if built). The not-found handler is registered once:
-  // with a built UI it serves the SPA index.html for non-API paths; without it,
-  // every miss returns a JSON 404 in the requesting protocol's shape.
+  // Operational routes (always available)
+  await registerHealthRoutes(app);
+
+  // Admin + gateway routes MUST be registered BEFORE static files to avoid
+  // 404s falling through to SPA index.html or static assets being served instead
+  await registerAdminRoutes(app);
+  await registerGatewayRoutes(app);
+
+  // Static admin UI mounted AFTER routes so it only handles SPA not-found cases.
+  // This prevents conflicts with /v1/* API routes and /api/* endpoints.
   const webDist = path.resolve(__dirname, '../web');
   const hasWeb = fs.existsSync(webDist);
+
+  if (hasWeb) {
+    await app.register(staticPlugin, { root: webDist, prefix: '/', decorateReply: false });
+  }
 
   app.setNotFoundHandler((req, reply) => {
     if (req.url.startsWith('/api') || req.url.startsWith('/v1') || req.url.startsWith('/health') || req.url.startsWith('/ready') || req.url.startsWith('/metrics') || !hasWeb) {
@@ -107,18 +118,6 @@ export async function buildApp(opts: AppOptions = {}): Promise<App> {
     }
     reply.type('text/html').send(fs.readFileSync(path.join(webDist, 'index.html')));
   });
-
-  // Serve admin website static UI. Mounted BEFORE routes so not-found handler serves SPA index.html.
-  if (hasWeb) {
-    await app.register(staticPlugin, { root: webDist, prefix: '/', decorateReply: false });
-  }
-
-  // Operational routes (always available)
-  await registerHealthRoutes(app);
-
-  // Admin + gateway routes
-  await registerAdminRoutes(app);
-  await registerGatewayRoutes(app);
 
   // On startup: ensure settings row + detect master key status
   app.addHook('onReady', async () => {
