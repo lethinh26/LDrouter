@@ -4,6 +4,12 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.11.9] - 2026-09-04
+
+### Fixed
+
+- **API routes now return proper JSON errors**: fixed `setNotFoundHandler` logic to ensure `/v1/*` routes always return JSON error responses instead of falling through to HTML SPA index. Route order confirmed: health → admin/gateway → static files.
+
 ## [1.11.8] - 2026-09-03
 
 ### Fixed
