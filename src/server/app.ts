@@ -108,6 +108,7 @@ export async function buildApp(opts: AppOptions = {}): Promise<App> {
     reply.type('text/html').send(fs.readFileSync(path.join(webDist, 'index.html')));
   });
 
+  // Serve admin website static UI. Mounted BEFORE routes so not-found handler serves SPA index.html.
   if (hasWeb) {
     await app.register(staticPlugin, { root: webDist, prefix: '/', decorateReply: false });
   }
