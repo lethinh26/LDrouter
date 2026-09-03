@@ -122,7 +122,7 @@ export async function buildApp(opts: AppOptions = {}): Promise<App> {
       return;
     }
     // No web assets - return error for all remaining paths
-    const err = new GatewayError('not_found', 'Not found', { status: 404 });
+    const err = new GatewayError('invalid_request_error', 'Not found', { status: 404 });
     reply.code(404).send(toOpenAIError(err, req.id as string));
   });
 
