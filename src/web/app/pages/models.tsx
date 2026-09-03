@@ -120,6 +120,7 @@ export function Models() {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         credentials: 'include',
+        body: '{}', // Must send empty object to satisfy Fastify's JSON parser
       });
       if (!res.ok) {
         const errText = await res.text().catch(() => '');
