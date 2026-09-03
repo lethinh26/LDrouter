@@ -2,7 +2,7 @@
 
 ## 1. Check API Keys in Database (requires sqlite3)
 ```bash
-docker exec latedev-router /bin/sh -c 'apk add sqlite3 > /dev/null 2>&1; \
+docker exec ldrouter /bin/sh -c 'apk add sqlite3 > /dev/null 2>&1; \
 sqlite3 /data/data.sqlite "SELECT COUNT(*) FROM apiKeys;"'
 
 # If result is 0, you need to create API keys via admin UI
@@ -11,14 +11,14 @@ sqlite3 /data/data.sqlite "SELECT COUNT(*) FROM apiKeys;"'
 ## 2. Full Database Diagnosis
 ```bash
 # Copy script into container and run
-docker cp scripts/diagnose-api-key.sh latedev-router:/tmp/
-docker exec latedev-router sh /tmp/diagnose-api-key.sh
+docker cp scripts/diagnose-api-key.sh ldrouter:/tmp/
+docker exec ldrouter sh /tmp/diagnose-api-key.sh
 ```
 
 ## 3. Verify Volume Mounts
 ```bash
 # From HOST machine (not inside container):
-docker inspect latedev-router | grep -A 5 '"Source":'
+docker inspect ldrouter | grep -A 5 '"Source":'
 ```
 
 Expected output should show volume mounted to `/data`:
@@ -29,7 +29,7 @@ Expected output should show volume mounted to `/data`:
 
 ## 4. Check Container Logs for Recent Activity
 ```bash
-docker logs latedev-router --tail 50
+docker logs ldrouter --tail 50
 ```
 
 Look for:
@@ -55,14 +55,14 @@ If database shows 0 API keys:
 ## 7. Check if Data Persists Across Restarts
 ```bash
 # Record current key count
-KEYS_BEFORE=$(docker exec latedev-router sh -c 'sqlite3 /data/data.sqlite "SELECT COUNT(*) FROM apiKeys;"')
+KEYS_BEFORE=$(docker exec ldrouter sh -c 'sqlite3 /data/data.sqlite "SELECT COUNT(*) FROM apiKeys;"')
 echo "Before restart: $KEYS_BEFORE"
 
 # Restart container
 docker compose restart
 
 # Check after restart
-KEYS_AFTER=$(docker exec latedev-router sh -c 'sqlite3 /data/data.sqlite "SELECT COUNT(*) FROM apiKeys;"')
+KEYS_AFTER=$(docker exec ldrouter sh -c 'sqlite3 /data/data.sqlite "SELECT COUNT(*) FROM apiKeys;"')
 echo "After restart: $KEYS_AFTER"
 
 if [ "$KEYS_BEFORE" = "$KEYS_AFTER" ]; then
@@ -84,7 +84,7 @@ Try this fix:
 docker compose down
 
 # Remove ALL volumes (WARNING: deletes data!)
-docker volume rm latedev-router_latedev-router-data
+docker volume rm ldrouter_ldrouter-data
 
 # Fresh start
 docker compose up -d

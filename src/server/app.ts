@@ -111,12 +111,19 @@ export async function buildApp(opts: AppOptions = {}): Promise<App> {
   }
 
   app.setNotFoundHandler((req, reply) => {
-    if (req.url.startsWith('/api') || req.url.startsWith('/v1') || req.url.startsWith('/health') || req.url.startsWith('/ready') || req.url.startsWith('/metrics') || !hasWeb) {
+    if (req.url.startsWith('/api') || req.url.startsWith('/v1') || req.url.startsWith('/health') || req.url.startsWith('/ready') || req.url.startsWith('/metrics')) {
       const e = new GatewayError('invalid_request_error', 'Route not found', { status: 404 });
       reply.code(404).send(toOpenAIError(e, req.id as string));
       return;
     }
-    reply.type('text/html').send(fs.readFileSync(path.join(webDist, 'index.html')));
+    // Serve SPA index.html only for non-API paths when web is available
+    if (hasWeb) {
+      reply.type('text/html').send(fs.readFileSync(path.join(webDist, 'index.html')));
+      return;
+    }
+    // No web assets - return error for all remaining paths
+    const err = new GatewayError('not_found', 'Not found', { status: 404 });
+    reply.code(404).send(toOpenAIError(err, req.id as string));
   });
 
   // On startup: ensure settings row + detect master key status
