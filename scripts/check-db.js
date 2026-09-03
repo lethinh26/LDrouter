@@ -5,13 +5,17 @@
  * Or copy to VPS and run directly
  */
 
+/* global console, process */
+/* eslint-disable no-console */
+
 import { getDb } from './src/server/db/index.js';
-import { eq, sql } from 'drizzle-orm';
+// @ts-ignore - eq is not used but needed for potential migration checks
+import { sql } from 'drizzle-orm';
 import * as schema from './src/server/db/schema.js';
 import fs from 'fs';
 
-const DATA_DIR = process.env.LATEDEV_DATA_DIR || '/data';
-const DB_FILE = process.env.LATEDEV_DB_URL || `${DATA_DIR}/data.sqlite`;
+const DATA_DIR = typeof process !== 'undefined' && process.env ? (process.env.LATEDEV_DATA_DIR || '/data') : '/data';
+const DB_FILE = typeof process !== 'undefined' && process.env ? (process.env.LATEDEV_DB_URL || `${DATA_DIR}/data.sqlite`) : '/data/data.sqlite';
 
 console.log('=== LateDev Router Database Checker ===\n');
 

@@ -1,0 +1,3 @@
+# Debug and utility scripts (not part of main codebase)
+scripts/check-db.js
+scripts/debug-db.sh
