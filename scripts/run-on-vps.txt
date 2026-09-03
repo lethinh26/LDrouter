@@ -1,0 +1,96 @@
+# Quick Commands to Run on Your VPS
+
+## 1. Check API Keys in Database (requires sqlite3)
+```bash
+docker exec latedev-router /bin/sh -c 'apk add sqlite3 > /dev/null 2>&1; \
+sqlite3 /data/data.sqlite "SELECT COUNT(*) FROM apiKeys;"'
+
+# If result is 0, you need to create API keys via admin UI
+```
+
+## 2. Full Database Diagnosis
+```bash
+# Copy script into container and run
+docker cp scripts/diagnose-api-key.sh latedev-router:/tmp/
+docker exec latedev-router sh /tmp/diagnose-api-key.sh
+```
+
+## 3. Verify Volume Mounts
+```bash
+# From HOST machine (not inside container):
+docker inspect latedev-router | grep -A 5 '"Source":'
+```
+
+Expected output should show volume mounted to `/data`:
+```json
+"Source": "/your/host/path",
+"Destination": "/data",
+```
+
+## 4. Check Container Logs for Recent Activity
+```bash
+docker logs latedev-router --tail 50
+```
+
+Look for:
+- "ready" message
+- Migration errors
+- API key creation events
+
+## 5. Test API Key Directly
+```bash
+# Replace <YOUR_API_KEY> with actual key from admin UI
+curl -H "Authorization: Bearer <YOUR_API_KEY>" \
+  http://localhost:8787/v1/models
+```
+
+## 6. Recreate API Key if Needed
+If database shows 0 API keys:
+1. Open admin UI: http://your-vps-ip:8787/admin
+2. Go to Settings → API Keys
+3. Create new key (auto-generated)
+4. **COPY THE KEY IMMEDIATELY** (shown only once!)
+5. Test again
+
+## 7. Check if Data Persists Across Restarts
+```bash
+# Record current key count
+KEYS_BEFORE=$(docker exec latedev-router sh -c 'sqlite3 /data/data.sqlite "SELECT COUNT(*) FROM apiKeys;"')
+echo "Before restart: $KEYS_BEFORE"
+
+# Restart container
+docker compose restart
+
+# Check after restart
+KEYS_AFTER=$(docker exec latedev-router sh -c 'sqlite3 /data/data.sqlite "SELECT COUNT(*) FROM apiKeys;"')
+echo "After restart: $KEYS_AFTER"
+
+if [ "$KEYS_BEFORE" = "$KEYS_AFTER" ]; then
+    echo "✓ Data persists correctly"
+else
+    echo "❌ DATA LOSS DETECTED!"
+    echo "Your volume mount may be misconfigured"
+fi
+```
+
+## Most Likely Issue:
+Based on your logs showing `"Invalid API key"` for NEW keys:
+- **Database schema migration didn't complete** on v1.11.8 update
+- **OR** SQLite WAL files from old version corrupted new DB
+
+Try this fix:
+```bash
+# Stop all containers
+docker compose down
+
+# Remove ALL volumes (WARNING: deletes data!)
+docker volume rm latedev-router_latedev-router-data
+
+# Fresh start
+docker compose up -d
+
+# Create new API keys via admin UI
+# Then verify they persist across restarts
+```
+
+This is destructive but will confirm if it's a database corruption issue.
