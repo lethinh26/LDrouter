@@ -224,8 +224,9 @@ export async function registerModelRoutes(app: FastifyInstance): Promise<void> {
       protocol: 'openai',
       endpoint: 'chat/completions',
     };
+    let outcome: Awaited<ReturnType<typeof runner.execute>>;
     try {
-      const outcome = await runner.execute(gatewayReq, ctx);
+      outcome = await runner.execute(gatewayReq, ctx);
       // Runner already wrote [DONE]. Append our own test_meta event so the
       // client knows the test finished with full stats.
       send('test_meta', {
@@ -242,6 +243,9 @@ export async function registerModelRoutes(app: FastifyInstance): Promise<void> {
         })),
       });
     } catch (e) {
+      // Never let a raw non-GatewayError (e.g. MasterKeyError from credential
+      // decryption) escape into the global handler as an opaque "Gateway error".
+      if (e instanceof GatewayError) throw e;
       send('test_error', { message: (e as Error).message });
     } finally {
       res.end();

@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.11.3] - 2026-09-03
+
+### Fixed
+
+- **Model Test streaming endpoint no longer returns an opaque 500 "Gateway error"**: when the provider credential can't be decrypted (master-key mismatch after backup restore), it now returns a readable `authentication_error` prompting to re-save the provider API key.
+- **Docker container restart no longer causes data loss**: added `docker-entrypoint.sh` that removes stale SQLite WAL/SHM files on startup and performs a checkpoint to ensure all data is persisted to the main database file before starting the gateway.
+
 ## [1.11.2] - 2026-09-02
 
 ### Fixed
