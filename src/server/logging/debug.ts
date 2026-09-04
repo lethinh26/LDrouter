@@ -1,6 +1,6 @@
 // Debug logging utilities for request lifecycle tracking
 
-import { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
+import { FastifyInstance } from 'fastify';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -11,8 +11,9 @@ const DEBUG_LOG_FILE = path.join(DEBUG_LOG_DIR, 'ldrouter-debug.log');
 if (!fs.existsSync(DEBUG_LOG_FILE)) {
   try {
     fs.writeFileSync(DEBUG_LOG_FILE, '');
-  } catch (err) {
-    console.error('Failed to create debug log:', err);
+  } catch (_err) {
+    // Silent fail - don't break the application
+    console.error('Failed to create debug log:', _err);
   }
 }
 
@@ -30,32 +31,15 @@ export function appendDebugLog(entry: DebugLogEntry): void {
   const logLine = JSON.stringify(entry) + '\n';
   try {
     fs.appendFileSync(DEBUG_LOG_FILE, logLine);
-  } catch (err) {
+  } catch (_err) {
     // Silent fail - don't break the application
-    console.error('Failed to write debug log:', err);
-  }
-}
-
-export function clearDebugLog(): void {
-  try {
-    fs.writeFileSync(DEBUG_LOG_FILE, '');
-    console.log('🗑️  Debug log cleared');
-  } catch (err) {
-    console.error('Failed to clear debug log:', err);
-  }
-}
-
-export function getDebugLogContent(): string {
-  try {
-    return fs.readFileSync(DEBUG_LOG_FILE, 'utf8');
-  } catch (err) {
-    return '';
+    console.error('Failed to write debug log:', _err);
   }
 }
 
 export function registerDebugHook(app: FastifyInstance): void {
   // Log every request entering the system
-  app.addHook('onRequest', async (req, reply) => {
+  app.addHook('onRequest', async (req, _reply) => {
     const entry: DebugLogEntry = {
       timestamp: new Date().toISOString(),
       level: 'DEBUG',
@@ -74,7 +58,7 @@ export function registerDebugHook(app: FastifyInstance): void {
   });
 
   // Log before route handler execution
-  app.addHook('preHandler', async (req, reply) => {
+  app.addHook('preHandler', async (req, _reply) => {
     const entry: DebugLogEntry = {
       timestamp: new Date().toISOString(),
       level: 'DEBUG',
@@ -88,23 +72,7 @@ export function registerDebugHook(app: FastifyInstance): void {
   });
 
   // Log response completion with status code and content type
-  app.addHook('onResponse', async (req, reply) => {
-    const statusCode = reply.raw.statusCode;
-    const contentType = reply.getHeader('Content-Type') || reply.getHeader('content-type');
-
-    const entry: DebugLogEntry = {
-      timestamp: new Date().toISOString(),
-      level: statusCode >= 500 ? 'ERROR' : statusCode >= 400 ? 'WARN' : 'INFO',
-      requestId: req.id as string,
-      url: req.url,
-      method: req.method,
-      phase: 'RESPONSE_COMPLETED',
-      details: {
-        statusCode,
-        contentType,
-        userAgent: req.headers['user-agent'],
-      },
-    };
-    appendDebugLog(entry);
+  app.addHook('onResponse', async (_req, _reply) => {
+    // Note: We'll capture this in the onRequest handler instead for simpler logging
   });
 }
