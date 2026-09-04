@@ -120,6 +120,12 @@ export async function registerApiKeyRoutes(app: FastifyInstance): Promise<void> 
       throw new GatewayError('invalid_request_error', `An API key with this exact secret already exists ("${existing.name}"). Choose a different key value.`, { status: 409 });
     }
     const enc = encryptSecret(secret);
+
+    // DEBUG: Log what we're about to insert
+    console.log(`📝 CREATE API KEY - Name: ${body.name}, Prefix: ${keyPrefix}`);
+    console.log(`📝 CREATE API KEY - Secret (full): ${secret}`);
+    console.log(`📝 CREATE API KEY - Digest: ${keyDigest}`);
+
     db.insert(schema.apiKeys).values({
       id,
       name: body.name,
@@ -139,6 +145,13 @@ export async function registerApiKeyRoutes(app: FastifyInstance): Promise<void> 
       maxOutputTokensPerRequest: body.maxOutputTokensPerRequest ?? null,
       cacheOverrideEnabled: body.cacheOverrideEnabled ?? null,
     }).run();
+
+    // DEBUG: Verify it was actually inserted
+    const verify = db.select().from(schema.apiKeys).where(eq(schema.apiKeys.id, id)).get();
+    console.log(`✅ INSERT VERIFICATION: ${verify ? 'SUCCESS' : 'FAILED'} - Key exists in DB? ${!!verify}`);
+    if (!verify) {
+      console.error('❌ DATABASE INSERT FAILED - Key should exist but query returned null');
+    }
     if (body.permissions) {
       for (const p of body.permissions) {
         db.insert(schema.apiKeyModelPermissions).values({ id: uuid(), apiKeyId: id, targetKind: p.targetKind, targetId: p.targetId }).run();

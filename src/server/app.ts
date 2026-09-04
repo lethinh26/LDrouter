@@ -96,6 +96,10 @@ export async function buildApp(opts: AppOptions = {}): Promise<App> {
   // Operational routes (always available)
   await registerHealthRoutes(app);
 
+  // Debug logging for request lifecycle (before routes)
+  const { registerDebugHook } = await import('./logging/debug');
+  registerDebugHook(app);
+
   // Admin + gateway routes MUST be registered BEFORE static files to avoid
   // 404s falling through to SPA index.html or static assets being served instead
   await registerAdminRoutes(app);

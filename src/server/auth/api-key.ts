@@ -51,12 +51,27 @@ export function authenticateGatewayKey(req: { headers: Record<string, string | s
   if (bearer) candidate = bearer;
   else if (anthropic) candidate = anthropic;
   if (!candidate) return null;
+
+  // DEBUG: Log what we're trying to authenticate
+  console.log(`🔑 API KEY AUTH - Candidate extracted: ${candidate.slice(0, 8)}...${candidate.slice(-4)}`);
+
   // Custom keys are stored verbatim (no prefix requirement); auto-generated
   // keys start with ld-, but authentication must accept any stored secret.
   const digest = sha256Hex(candidate);
+  console.log(`🔑 API KEY AUTH - SHA256 Digest: ${digest.slice(0, 16)}...`);
+
   const db = getDb();
+
+  // DEBUG: Check total keys in database
+  const allKeys = db.select().from(schema.apiKeys).all();
+  console.log(`📊 TOTAL KEYS IN DB: ${allKeys.length}`);
+  console.log(`📋 ALL KEYS:`, allKeys.map(k => ({ id: k.id.slice(0, 8), name: k.name, keyPrefix: k.keyPrefix, digestPreview: k.keyDigest?.slice(0, 16) + '...' })));
+
   const row = db.select().from(schema.apiKeys).where(eq(schema.apiKeys.keyDigest, digest)).get();
+  console.log(`❓ QUERY RESULT: Found match? ${!!row}`);
+
   if (!row) {
+    console.error(`❌ INVALID API KEY - No matching digest found for: ${digest.slice(0, 32)}...`);
     throw new GatewayError('authentication_error', 'Invalid API key', { status: 401 });
   }
   return {
