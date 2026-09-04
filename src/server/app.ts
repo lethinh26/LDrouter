@@ -130,7 +130,20 @@ export async function buildApp(opts: AppOptions = {}): Promise<App> {
     reply.code(404).send(toOpenAIError(err, req.id as string));
   });
 
-  // On startup: ensure settings row + detect master key status
+  // Process-level crash prevention
+process.on('uncaughtException', () => {
+  const log = getLogger();
+  log.error({ err: {} }, 'uncaught exception');
+  // Don't exit immediately - let Fastify error handler process
+  setTimeout(() => process.exit(1), 1000);
+});
+
+process.on('unhandledRejection', (_reason) => {
+  const log = getLogger();
+  log.error({ reason: '' }, 'unhandled rejection');
+});
+
+// On startup: ensure settings row + detect master key status
   app.addHook('onReady', async () => {
     const s = getSettings();
     if (!s.masterKeyConfigured && isMasterKeyConfigured()) {

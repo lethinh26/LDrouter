@@ -20,10 +20,17 @@ const ChatBody = z.object({
   temperature: z.number().optional(),
   top_p: z.number().optional(),
   max_tokens: z.number().int().min(1).optional(),
+  max_completion_tokens: z.number().int().min(1).optional(),
   stop: z.union([z.array(z.string()), z.string()]).optional(),
   response_format: z.any().optional(),
   reasoning_effort: z.enum(['low', 'medium', 'high']).optional(),
-});
+  // Accept additional Claude Code fields without failing
+  parallel_tool_calls: z.any().optional(),
+  stream_options: z.any().optional(),
+  metadata: z.any().optional(),
+  seed: z.number().int().optional(),
+  service_tier: z.any().optional(),
+}).passthrough(); // Allow unknown fields to pass through (forward to upstream)
 
 const ResponsesBody = z.object({
   model: z.string().min(1),

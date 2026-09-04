@@ -175,18 +175,33 @@ export function canonicalToOpenAIRequest(req: CanonicalRequest, targetModel: str
 
 export function openAIResponseToCanonical(res: OpenAIChatResponse, requestedModel: string): { model: string; text: string; toolCalls: Array<{ id: string; name: string; input: unknown }>; finishReason: string | null; usage: { input: number; output: number; cacheRead: number; cacheWrite: number; reasoning: number; total: number } } {
   const choice = res.choices[0];
+  if (!choice || !choice.message) {
+    // Handle empty or malformed response
+    return {
+      model: requestedModel,
+      text: '',
+      toolCalls: [],
+      finishReason: null,
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, total: 0 },
+    };
+  }
+
   return {
     model: requestedModel,
-    text: choice?.message?.content ?? '',
-    toolCalls: (choice?.message?.tool_calls ?? []).map((tc) => ({ id: tc.id, name: tc.function.name, input: safeJson(tc.function.arguments) })),
+    text: typeof choice.message.content === 'string' ? choice.message.content : '',
+    toolCalls: ((choice.message.tool_calls ?? []) as Array<{ id?: string; type?: string; function?: { name?: string; arguments?: string } }>).map((tc) => ({
+      id: typeof tc.id === 'string' ? tc.id : `toolu-${Math.random().toString(36).slice(2)}`,
+      name: typeof tc.function?.name === 'string' ? tc.function.name : 'unknown',
+      input: safeJson(typeof tc.function?.arguments === 'string' ? tc.function.arguments : '{}'),
+    })),
     finishReason: choice?.finish_reason ?? null,
     usage: {
-      input: res.usage?.prompt_tokens ?? 0,
-      output: res.usage?.completion_tokens ?? 0,
-      cacheRead: res.usage?.prompt_tokens_details?.cached_tokens ?? 0,
+      input: typeof res.usage?.prompt_tokens === 'number' ? res.usage.prompt_tokens : 0,
+      output: typeof res.usage?.completion_tokens === 'number' ? res.usage.completion_tokens : 0,
+      cacheRead: typeof res.usage?.prompt_tokens_details?.cached_tokens === 'number' ? res.usage.prompt_tokens_details.cached_tokens : 0,
       cacheWrite: 0,
-      reasoning: res.usage?.completion_tokens_details?.reasoning_tokens ?? 0,
-      total: res.usage?.total_tokens ?? 0,
+      reasoning: typeof res.usage?.completion_tokens_details?.reasoning_tokens === 'number' ? res.usage.completion_tokens_details.reasoning_tokens : 0,
+      total: typeof res.usage?.total_tokens === 'number' ? res.usage.total_tokens : 0,
     },
   };
 }

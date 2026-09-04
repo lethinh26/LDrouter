@@ -85,13 +85,21 @@ export interface ModelCapabilitiesInput {
   reasoning?: boolean;
 }
 
+/**
+ * Check if a model meets required capabilities.
+ * IMPORTANT: Treat undefined as "unknown" rather than "unsupported".
+ * For generic OpenAI-compatible providers where capabilities weren't explicitly imported,
+ * undefined means we don't know, so we should assume it's potentially supported.
+ * Explicit false means "known unsupported".
+ */
 export function modelMeets(caps: ModelCapabilitiesInput, req: RequiredCapabilities): boolean {
-  if (req.streaming && !caps.streaming) return false;
-  if (req.tools && !caps.tools) return false;
-  if (req.structuredOutput && !caps.structured_output) return false;
-  if (req.imageInput && !caps.image_input) return false;
-  if (req.audioInput && !caps.audio_input) return false;
-  if (req.reasoning && !caps.reasoning) return false;
-  if (req.responses && !caps.responses) return false;
+  // Only reject if capability is explicitly false, not if unknown (undefined)
+  if (req.streaming && caps.streaming === false) return false;
+  if (req.tools && caps.tools === false) return false;
+  if (req.structuredOutput && caps.structured_output === false) return false;
+  if (req.imageInput && caps.image_input === false) return false;
+  if (req.audioInput && caps.audio_input === false) return false;
+  if (req.reasoning && caps.reasoning === false) return false;
+  if (req.responses && caps.responses === false) return false;
   return true;
 }

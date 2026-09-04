@@ -493,7 +493,6 @@ export class GatewayRunner {
     const usage: UsageSummary = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, total: 0 };
 
     const chunkHandler = (chunk: { data: string; event?: string }, isFirst: boolean) => {
-      // Track usage/finish (protocol-agnostic; runs even on the first chunk).
       try {
         const obj = JSON.parse(chunk.data);
         if (cfg.type === 'openai') {
@@ -501,7 +500,15 @@ export class GatewayRunner {
           if (choice?.delta?.content) textBuf += choice.delta.content;
           if (choice?.delta?.tool_calls) {
             for (const tc of choice.delta.tool_calls) {
-              if (tc.function?.name) toolBuf.push({ id: tc.id ?? '', name: tc.function.name, input: {} });
+              const id = typeof tc.id === 'string' ? tc.id : `toolu-${Math.random().toString(36).slice(2)}`;
+              const name = typeof tc.function?.name === 'string' ? tc.function.name : 'unknown';
+              let input = {};
+              if (typeof tc.function?.arguments === 'string') {
+                try { input = JSON.parse(tc.function.arguments); } catch { /* ignore */ }
+              } else if (typeof tc.function?.arguments === 'object') {
+                input = tc.function.arguments;
+              }
+              toolBuf.push({ id, name, input });
             }
           }
           if (choice?.finish_reason) finishReason = choice.finish_reason;
@@ -826,8 +833,40 @@ function estimateTokens(s: string): number {
   return Math.ceil(s.length / 4);
 }
 
+/**
+ * Safely parse capabilities JSON. Returns minimal default if parsing fails.
+ * CRITICAL: Must return a complete default object with all capability fields,
+ * otherwise undefined values will cause modelMeets() to fail incorrectly.
+ */
 function safeJson(s: string): Record<string, unknown> {
-  try { return JSON.parse(s); } catch { return {}; }
+  try {
+    const parsed = JSON.parse(s);
+    // Ensure all required fields exist, using true as default for "unknown"
+    const result: Record<string, unknown> = {
+      chat: true,
+      streaming: true,
+      tools: true,
+      structured_output: true,
+      image_input: true,
+      audio_input: true,
+      reasoning: true,
+      responses: true,
+      ...parsed,
+    };
+    return result;
+  } catch (e) {
+    // Fallback to defaults if completely unparseable
+    return {
+      chat: true,
+      streaming: true,
+      tools: true,
+      structured_output: true,
+      image_input: true,
+      audio_input: true,
+      reasoning: true,
+      responses: true,
+    };
+  }
 }
 
 function safeJsonParse(s: string): unknown {

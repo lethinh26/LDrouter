@@ -21,7 +21,8 @@ const MessagesBody = z.object({
   tools: z.array(z.any()).optional(),
   tool_choice: z.any().optional(),
   thinking: z.object({ type: z.literal('enabled'), budget_tokens: z.number().int().min(1) }).optional(),
-});
+  // Accept additional fields
+}).passthrough();
 
 const CountTokensBody = MessagesBody.omit({ stream: true });
 
