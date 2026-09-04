@@ -164,7 +164,7 @@ describe('Safe JSON parsing', () => {
         ...parsed,
       };
       return result;
-    } catch (e) {
+    } catch {
       return {
         chat: true,
         streaming: true,

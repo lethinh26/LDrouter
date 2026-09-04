@@ -4,6 +4,24 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.11.16] - 2026-09-04
+
+### Fixed
+
+- **Claude Code compatibility**: Added Zod `.passthrough()` to gateway routes to accept extra fields (`parallel_tool_calls`, `max_completion_tokens`, `stream_options`, `metadata`, etc.)
+- **Combo model capability rejection**: Changed capability comparison from `!caps.field` to `caps.field === false` so models with undefined capabilities are treated as "potentially supported" instead of rejected
+- **Cloudflare 502 errors**: Added robust error handling in streaming chunk handler, safe JSON defaults for capabilities parsing, process-level uncaught exception handlers
+- **Response parser safety**: Added null/undefined checks in OpenAI response canonical conversion to prevent crashes on malformed upstream responses
+
+### Testing
+
+- Added unit tests for Claude Code compatibility (`tests/unit/claude-code-compatibility.test.ts`) - 9 tests covering Zod passthrough, capability handling, and safe JSON parsing
+
+### Documentation
+
+- Full root cause analysis documented in `DEBUG-COMPATIBILITY-ROOT-CAUSE.md`
+- Deployment guide in `DEPLOYMENT-READY.md`
+
 ## [1.11.9] - 2026-09-04
 
 ### Fixed

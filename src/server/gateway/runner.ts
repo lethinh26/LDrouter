@@ -854,7 +854,7 @@ function safeJson(s: string): Record<string, unknown> {
       ...parsed,
     };
     return result;
-  } catch (e) {
+  } catch {
     // Fallback to defaults if completely unparseable
     return {
       chat: true,
