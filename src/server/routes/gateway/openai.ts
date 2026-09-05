@@ -10,6 +10,7 @@ import { openAIToCanonical, openAIModelList, type OpenAIChatRequest } from '../.
 import { GatewayError, toOpenAIError } from '../../errors';
 import { GatewayRunner, type GatewayContext } from '../../gateway/runner';
 import { uuid } from '../../auth/ids';
+import { lifecycle, debugHttp, debugBody, getDebugFlags, summarizeBody, summarizeMessages, summarizeTools, summarizeHeaders, sanitizeJson, truncate } from '../../logging/debug';
 
 const ChatBody = z.object({
   model: z.string().min(1),
@@ -58,12 +59,18 @@ export async function registerOpenAIRoutes(app: FastifyInstance): Promise<void> 
   });
 
   app.post('/v1/chat/completions', async (req, reply) => {
+    const requestId = (req.id as string) || uuid();
+    lifecycle(requestId, 'INCOMING', [
+      `POST ${req.url}`,
+      ...summarizeHeaders(req.headers as Record<string, unknown>),
+    ]);
     const key = authenticateGatewayHeaders(req);
     const body = ChatBody.parse(req.body);
+    logIncomingChatBody(requestId, body);
     const req1: OpenAIChatRequest = body as never;
     const canonical = openAIToCanonical(req1);
     const ctx: GatewayContext = {
-      requestId: (req.id as string) || uuid(),
+      requestId,
       clientIp: resolveClientIp(req),
       protocol: 'openai',
       endpoint: 'chat/completions',
@@ -95,9 +102,11 @@ export async function registerOpenAIRoutes(app: FastifyInstance): Promise<void> 
       }
       if (!outcome.success) {
         const g = new GatewayError((outcome.errorType as never) ?? 'gateway_error', outcome.errorMessage ?? 'Gateway error', { status: outcome.httpStatus });
+        lifecycle(requestId, 'DONE', [`status=${outcome.httpStatus} durationMs=${outcome.latencyMs} error=true type=${g.type}`]);
         reply.code(outcome.httpStatus).send(toOpenAIError(g, ctx.requestId));
         return;
       }
+      lifecycle(requestId, 'DONE', [`status=200 durationMs=${outcome.latencyMs} finishReason=${outcome.finishReason ?? 'null'}`]);
       reply.header('x-request-id', ctx.requestId);
       reply.send({
         id: `chatcmpl-${ctx.requestId}`,
@@ -135,9 +144,19 @@ export async function registerOpenAIRoutes(app: FastifyInstance): Promise<void> 
   });
 
   app.post('/v1/responses', async (req, reply) => {
+    const requestId = (req.id as string) || uuid();
+    lifecycle(requestId, 'INCOMING', [
+      `POST ${req.url}`,
+      ...summarizeHeaders(req.headers as Record<string, unknown>),
+    ]);
     const key = authenticateGatewayHeaders(req);
     // v1 subset: accept Responses-style input, flatten to chat-completions messages.
     const body = ResponsesBody.parse(req.body);
+    debugHttp(requestId, 'BODY SUMMARY', [
+      `model=${body.model}`,
+      `stream=${body.stream ?? 'undefined'}`,
+      `inputType=${Array.isArray(body.input) ? `array(${body.input.length})` : typeof body.input}`,
+    ]);
     const flat = responsesInputToChat(body.input);
     const chatBody: OpenAIChatRequest = {
       model: body.model,
@@ -147,7 +166,7 @@ export async function registerOpenAIRoutes(app: FastifyInstance): Promise<void> 
     };
     const canonical = openAIToCanonical(chatBody);
     const ctx: GatewayContext = {
-      requestId: (req.id as string) || uuid(),
+      requestId,
       clientIp: resolveClientIp(req),
       protocol: 'openai',
       endpoint: 'responses',
@@ -202,6 +221,23 @@ export async function registerOpenAIRoutes(app: FastifyInstance): Promise<void> 
       throw e;
     }
   });
+}
+
+// docs/13 §4–§7: incoming chat body structure logging. Summary always
+// available under DEBUG_HTTP; full sanitized body under DEBUG_HTTP_BODY.
+function logIncomingChatBody(requestId: string, body: Record<string, unknown>): void {
+  debugHttp(requestId, 'BODY SUMMARY', summarizeBody(body));
+  debugHttp(requestId, 'MESSAGES', summarizeMessages(body));
+  if (body['tools'] !== undefined) debugHttp(requestId, 'TOOLS', summarizeTools(body));
+  if (getDebugFlags().httpBody) {
+    const json = sanitizeJson(body);
+    const bodySize = json.length;
+    const LIMIT = 512 * 1024; // generous debug-only cap (docs/13 §5)
+    debugBody(requestId, 'INCOMING BODY', [
+      `bodySize=${bodySize} bytes bodyTruncated=${bodySize > LIMIT}`,
+      bodySize > LIMIT ? truncate(json, LIMIT) : json,
+    ]);
+  }
 }
 
 // The routable surface visible to a gateway key: physical models + enabled

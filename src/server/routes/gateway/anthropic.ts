@@ -8,6 +8,7 @@ import { anthropicToCanonical, type AnthropicRequest } from '../../protocols/ant
 import { GatewayError, toAnthropicError } from '../../errors';
 import { GatewayRunner, type GatewayContext } from '../../gateway/runner';
 import { uuid } from '../../auth/ids';
+import { lifecycle, debugHttp, debugBody, getDebugFlags, summarizeMessages, summarizeTools, summarizeHeaders, sanitizeJson, truncate } from '../../logging/debug';
 
 const MessagesBody = z.object({
   model: z.string().min(1),
@@ -34,15 +35,21 @@ export async function registerAnthropicRoutes(app: FastifyInstance): Promise<voi
   });
 
   app.post('/v1/messages', async (req, reply) => {
+    const requestId = (req.id as string) || uuid();
+    lifecycle(requestId, 'INCOMING', [
+      `POST ${req.url}`,
+      ...summarizeHeaders(req.headers as Record<string, unknown>),
+    ]);
     const key = authenticateGatewayHeaders(req);
     const body = MessagesBody.parse(req.body);
+    logIncomingMessagesBody(requestId, body);
     const ar: AnthropicRequest = body as never;
     if (!ar.max_tokens) {
       throw new GatewayError('invalid_request_error', 'max_tokens is required', { status: 400 });
     }
     const canonical = anthropicToCanonical(ar);
     const ctx: GatewayContext = {
-      requestId: (req.id as string) || uuid(),
+      requestId,
       clientIp: resolveClientIp(req),
       protocol: 'anthropic',
       endpoint: 'messages',
@@ -67,9 +74,11 @@ export async function registerAnthropicRoutes(app: FastifyInstance): Promise<voi
       }
       if (!outcome.success) {
         const g = new GatewayError((outcome.errorType as never) ?? 'gateway_error', outcome.errorMessage ?? 'Gateway error', { status: outcome.httpStatus });
+        lifecycle(requestId, 'DONE', [`status=${outcome.httpStatus} durationMs=${outcome.latencyMs} error=true type=${g.type}`]);
         reply.code(outcome.httpStatus).send(toAnthropicError(g, ctx.requestId));
         return;
       }
+      lifecycle(requestId, 'DONE', [`status=200 durationMs=${outcome.latencyMs} finishReason=${outcome.finishReason ?? 'null'}`]);
       reply.header('x-request-id', ctx.requestId);
       reply.send({
         id: `msg_${ctx.requestId}`,
@@ -107,6 +116,34 @@ export async function registerAnthropicRoutes(app: FastifyInstance): Promise<voi
     reply.header('x-request-id', req.id as string);
     reply.send({ input_tokens: inputTokens });
   });
+}
+
+// docs/13 §4–§7: incoming /v1/messages body structure logging.
+function logIncomingMessagesBody(requestId: string, body: Record<string, unknown>): void {
+  debugHttp(requestId, 'BODY SUMMARY', [
+    `model=${JSON.stringify(body['model'])}`,
+    `stream=${JSON.stringify(body['stream'])}`,
+    `max_tokens=${JSON.stringify(body['max_tokens'])}`,
+    `temperature=${JSON.stringify(body['temperature'])}`,
+    `top_p=${JSON.stringify(body['top_p'])}`,
+    `thinking=${JSON.stringify(body['thinking'])}`,
+    `tool_choice=${JSON.stringify(body['tool_choice'])}`,
+    `systemType=${Array.isArray(body['system']) ? `array(${(body['system'] as unknown[]).length})` : typeof body['system']}`,
+    `bodyKeys=[${Object.keys(body).map((k) => JSON.stringify(k)).join(', ')}]`,
+    `messages=${Array.isArray(body['messages']) ? (body['messages'] as unknown[]).length : 'undefined'}`,
+    `tools=${Array.isArray(body['tools']) ? (body['tools'] as unknown[]).length : 'undefined'}`,
+  ]);
+  debugHttp(requestId, 'MESSAGES', summarizeMessages(body));
+  if (body['tools'] !== undefined) debugHttp(requestId, 'TOOLS', summarizeTools(body));
+  if (getDebugFlags().httpBody) {
+    const json = sanitizeJson(body);
+    const bodySize = json.length;
+    const LIMIT = 512 * 1024; // generous debug-only cap (docs/13 §5)
+    debugBody(requestId, 'INCOMING BODY', [
+      `bodySize=${bodySize} bytes bodyTruncated=${bodySize > LIMIT}`,
+      bodySize > LIMIT ? truncate(json, LIMIT) : json,
+    ]);
+  }
 }
 
 function authenticateGatewayHeaders(req: { headers: Record<string, string | string[] | undefined> }): AuthenticatedKey {

@@ -12,6 +12,8 @@ const EnvSchema = z.object({
   LATEDEV_MASTER_KEY: z.string().optional(),
   LATEDEV_TRUST_PROXY: z.coerce.number().int().min(0).max(8).default(0),
   LATEDEV_LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal']).default('info'),
+  // Alias used by docs/13 debug tooling: LOG_LEVEL=debug enables lifecycle lines.
+  LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal']).optional(),
   LATEDEV_DB_URL: z.string().optional(),
   NODE_ENV: z.enum(['development', 'production', 'test']).default('production'),
 });
@@ -75,7 +77,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, argv: string[] 
     dbFile,
     masterKey: parsed.LATEDEV_MASTER_KEY ?? readMasterKeyFile(dataDir),
     trustProxyHops: parsed.LATEDEV_TRUST_PROXY,
-    logLevel: parsed.LATEDEV_LOG_LEVEL,
+    logLevel: parsed.LOG_LEVEL ?? parsed.LATEDEV_LOG_LEVEL,
     env: parsed.NODE_ENV,
     isContainer,
     appVersion: getAppVersion(),

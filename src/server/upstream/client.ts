@@ -4,6 +4,7 @@ import type { Provider } from '../db/schema';
 import { decryptSecret, decryptCustomHeaders } from '../auth/crypto';
 import { GatewayError } from '../errors';
 import { buildHeaders, stripSlash } from '../providers/index';
+import { debugUpstream, errorLine, formatError, truncate } from '../logging/debug';
 
 export interface UpstreamConfig {
   type: 'openai' | 'anthropic';
@@ -70,7 +71,7 @@ export interface StreamChunk {
   isLast: boolean;
 }
 
-export async function callUpstreamNonStreaming(cfg: UpstreamConfig, url: string, payload: unknown): Promise<UpstreamCall> {
+export async function callUpstreamNonStreaming(cfg: UpstreamConfig, url: string, payload: unknown, requestId = '-'): Promise<UpstreamCall> {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), cfg.totalTimeoutMs);
   const start = Date.now();
@@ -83,6 +84,7 @@ export async function callUpstreamNonStreaming(cfg: UpstreamConfig, url: string,
     });
     const text = await res.text();
     const ttft = Date.now() - start;
+    logUpstreamResponse(requestId, res.status, res.statusText, res.headers, ttft, text);
     return {
       status: res.status,
       ok: res.ok,
@@ -93,6 +95,7 @@ export async function callUpstreamNonStreaming(cfg: UpstreamConfig, url: string,
     };
   } catch (e) {
     const err = e as Error;
+    errorLine(requestId, 'UPSTREAM FETCH ERROR', [`url=${url}`, `afterMs=${Date.now() - start}`, ...formatError(e)]);
     if (err.name === 'AbortError') {
       throw new GatewayError('timeout_error', 'Upstream request timed out', { status: 504, cause: e });
     }
@@ -109,6 +112,24 @@ export function extractUpstreamRequestId(headers: Headers | Record<string, strin
   return headers['x-request-id'] ?? headers['request-id'] ?? headers['x-amzn-requestid'] ?? null;
 }
 
+/** docs/13 §14: upstream response summary (sanitized headers) + error body for non-2xx. */
+function logUpstreamResponse(requestId: string, status: number, statusText: string, headers: Headers, durationMs: number, body: string): void {
+  const h = (name: string): string | undefined => headers.get(name) ?? undefined;
+  debugUpstream(requestId, 'UPSTREAM RESPONSE', [
+    `status=${status}`,
+    `statusText=${statusText}`,
+    `content-type=${h('content-type') ?? 'undefined'}`,
+    `content-length=${h('content-length') ?? 'undefined'}`,
+    `transfer-encoding=${h('transfer-encoding') ?? 'undefined'}`,
+    `server=${h('server') ?? 'undefined'}`,
+    `durationToHeadersMs=${durationMs}`,
+    `upstreamRequestId=${extractUpstreamRequestId(headers) ?? 'null'}`,
+  ]);
+  if (status < 200 || status >= 300) {
+    errorLine(requestId, 'UPSTREAM ERROR BODY', [truncate(body, 4000)]);
+  }
+}
+
 /**
  * Call upstream with SSE streaming. Invokes onChunk for each SSE event.
  * Returns a promise resolving when the stream completes or rejects on failure.
@@ -117,7 +138,8 @@ export async function callUpstreamStreaming(
   cfg: UpstreamConfig,
   url: string,
   payload: unknown,
-  onChunk: (event: { data: string; event?: string }, isFirst: boolean) => void
+  onChunk: (event: { data: string; event?: string }, isFirst: boolean) => void,
+  requestId = '-'
 ): Promise<{ headers: Record<string, string>; upstreamRequestId: string | null; ttftMs: number }> {
   const ctl = new AbortController();
   const totalTimer = setTimeout(() => ctl.abort(), cfg.totalTimeoutMs);
@@ -140,8 +162,10 @@ export async function callUpstreamStreaming(
     });
     if (!res.ok || !res.body) {
       const text = await res.text();
+      logUpstreamResponse(requestId, res.status, res.statusText, res.headers, Date.now() - start, text);
       throw new UpstreamHttpError(res.status, text, extractUpstreamRequestId(res.headers));
     }
+    logUpstreamResponse(requestId, res.status, res.statusText, res.headers, Date.now() - start, '');
     // First-token watchdog
     firstTokenTimer = setTimeout(() => ctl.abort(), cfg.firstTokenTimeoutMs);
     resetIdle();
@@ -196,6 +220,12 @@ export async function callUpstreamStreaming(
       throw new GatewayError('upstream_error', `Upstream HTTP ${e.status}: ${e.bodyExcerpt}`, { status: 502, cause: e });
     }
     const err = e as Error;
+    errorLine(requestId, 'UPSTREAM FETCH ERROR', [
+      `url=${url}`,
+      `afterMs=${Date.now() - start}`,
+      `ttftKnown=${ttft !== null}`,
+      ...formatError(e),
+    ]);
     if (err.name === 'AbortError') {
       if (ttft === null && firstTokenTimer) {
         throw new GatewayError('timeout_error', 'Upstream first token timeout', { status: 504, cause: e });

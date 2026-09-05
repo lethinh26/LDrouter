@@ -20,6 +20,7 @@ import { buildCacheKey, lookupCache, storeCache, cacheAllowed } from '../caching
 import { metrics } from '../metrics/registry';
 import type { FastifyReply } from 'fastify';
 import { emitRequestLogged, emitRequestStarted } from './events';
+import { debugHttp, debugBody, debugUpstream, debugStream, errorLine, formatError, getDebugFlags, truncate } from '../logging/debug';
 
 export interface GatewayContext {
   requestId: string;
@@ -100,6 +101,14 @@ export class GatewayRunner {
     const resolved = unwrapAlias(target);
     let comboPlan: ComboPlan | null = null;
     if (resolved.kind === 'combo') comboPlan = loadCombo(resolved.comboId);
+    // docs/13 §9: full resolution chain requested -> alias -> combo/model
+    if (getDebugFlags().http) {
+      const lines = [`requested=${req.canonical.model}`, `type=${resolved.kind}`];
+      if (target.kind === 'alias') lines.push(`viaAlias=${target.alias}`);
+      if (resolved.kind === 'model') lines.push(`providerModelId=${resolved.modelId}`, `publicModelId=${resolved.publicModelId}`);
+      if (resolved.kind === 'combo') lines.push(`comboId=${resolved.comboId}`, `comboPublicId=${resolved.publicModelId}`);
+      debugHttp(ctx.requestId, 'MODEL RESOLVE', lines);
+    }
 
     // --- ACL check ---
     if (ctx.key) {
@@ -143,20 +152,52 @@ export class GatewayRunner {
     try {
       // --- Capability requirements ---
       const required = deriveRequiredCapabilities(req.canonical);
+      debugHttp(ctx.requestId, 'CAPABILITIES REQUIRED', [
+        `tools=${required.tools}`,
+        `stream=${required.streaming}`,
+        `vision=${required.imageInput}`,
+        `reasoning=${required.reasoning}`,
+        `json=${required.structuredOutput}`,
+        `structuredOutput=${required.structuredOutput}`,
+        `parallelToolCalls=undefined(derived-from-request-not-gated)`,
+        `audioInput=${required.audioInput}`,
+      ]);
 
       // --- Determine candidates ---
       let candidates: CandidateModel[] = [];
       let selectionReasons: string[] = [];
       if (resolved.kind === 'model') {
-        candidates = await this.loadModelCandidate(resolved.modelId, required);
+        candidates = await this.loadModelCandidate(resolved.modelId, required, ctx.requestId);
         selectionReasons.push('direct_model');
+        if (candidates.length === 0) {
+          debugHttp(ctx.requestId, 'CAPABILITY REJECT', [
+            `model=${resolved.publicModelId}`,
+            `reason=direct_model_unavailable_or_capability_mismatch`,
+            '(direct model candidates rejected: not found / provider disabled / model disabled / upstream unavailable / circuit open / capability mismatch)',
+          ]);
+        }
       } else if (comboPlan) {
         const all = await this.loadAllModels();
-        const filtered = selectCandidates(comboPlan, all, required);
+        const rejected: Array<{ publicModelId: string; reason: string }> = [];
+        const filtered = selectCandidates(comboPlan, all, required, (c, reason) => {
+          rejected.push({ publicModelId: c.publicModelId, reason });
+          debugHttp(ctx.requestId, 'CAPABILITY REJECT', [`model=${c.publicModelId}`, `reason=${reason}`]);
+        });
+        // docs/13 §10: always report why EACH member was filtered out
+        debugHttp(ctx.requestId, 'CANDIDATE FILTER', [
+          `comboMembers=${comboPlan.members.length}`,
+          `afterFilter=${filtered.length}`,
+          `rejectedCount=${rejected.length}`,
+          ...rejected.map((r) => `rejected: ${r.publicModelId} reason=${r.reason}`),
+        ]);
         if (filtered.length === 0) {
           throw new GatewayError('capability_not_supported', 'No combo member satisfies the request capabilities or availability', { status: 400 });
         }
         candidates = orderCandidates(comboPlan, filtered);
+        debugHttp(ctx.requestId, 'CANDIDATES ORDERED', [
+          `mode=${comboPlan.mode}`,
+          ...candidates.map((c, i) => `candidate[${i}]: providerModelId=${c.modelId} publicModelId=${c.publicModelId}`),
+        ]);
         selectionReasons.push('combo');
       }
 
@@ -210,11 +251,13 @@ export class GatewayRunner {
         finalModelId = candidate.modelId;
         const provider = getDb().select().from(schema.providers).where(eq(schema.providers.id, candidate.providerId)).get();
         if (!provider || !provider.enabled) {
+          debugHttp(ctx.requestId, 'ATTEMPT SKIP', [`attempt=${i + 1} model=${candidate.publicModelId} reason=skipped_disabled_provider`]);
           attempts.push(this.failedAttempt(i + 1, candidate, provider?.name ?? '', 'skipped_disabled_provider', null, null, 0, null, null));
           continue;
         }
         const eff = getEffectiveState(provider.id, provider.cbCooldownSeconds);
         if (eff === 'open' && !halfOpenProbeAllowed(provider.id)) {
+          debugHttp(ctx.requestId, 'ATTEMPT SKIP', [`attempt=${i + 1} model=${candidate.publicModelId} provider=${provider.name} reason=circuit_open`]);
           attempts.push(this.failedAttempt(i + 1, candidate, provider.name, 'circuit_open', null, null, 0, null, null));
           if (comboPlan && shouldFallback(comboPlan, { type: 'connection_error' })) {
             metrics.fallbackCount.inc();
@@ -226,6 +269,19 @@ export class GatewayRunner {
 
         const cfg = providerToUpstreamConfig(provider);
         const attemptStart = Date.now();
+        // docs/13 §11–§12: provider/account + upstream request summary
+        const upstreamModel = candidate.publicModelId.split('/').slice(1).join('/');
+        debugHttp(ctx.requestId, 'ATTEMPT', [
+          `attempt=${i + 1}/${maxAttempts}`,
+          `provider=${provider.name}`,
+          `providerId=${provider.id}`,
+          `model=${candidate.publicModelId}`,
+          `upstreamModel=${upstreamModel}`,
+          `upstreamType=${cfg.type}`,
+          `baseUrl=${cfg.baseUrl}`,
+          `stream=${req.canonical.stream}`,
+          `providerKeyFingerprint=${apiKeyFingerprint(cfg.apiKey)}`,
+        ]);
         const attempt: AttemptOutcome = {
           attemptNumber: i + 1,
           providerId: provider.id,
@@ -280,6 +336,14 @@ export class GatewayRunner {
           break;
         } catch (e) {
           const err = e instanceof GatewayError ? e : new GatewayError('upstream_error', (e as Error).message, { cause: e });
+          debugUpstream(ctx.requestId, 'ATTEMPT ERROR', [
+            `attempt=${i + 1}`,
+            `provider=${provider.name}`,
+            `model=${candidate.publicModelId}`,
+            `type=${err.type}`,
+            `status=${err.status}`,
+            `willFallback=${comboPlan ? shouldFallback(comboPlan, { type: classifyFailure(err), status: err.status }) : false}`,
+          ]);
           const shouldRetry = comboPlan ? shouldFallback(comboPlan, { type: classifyFailure(err), status: err.status }) : false;
           attempt.statusCode = err.status;
           attempt.success = false;
@@ -363,12 +427,16 @@ export class GatewayRunner {
     }
   }
 
-  private async loadModelCandidate(modelId: string, required: RequiredCapabilities): Promise<CandidateModel[]> {
+  private async loadModelCandidate(modelId: string, required: RequiredCapabilities, requestId?: string): Promise<CandidateModel[]> {
     const db = getDb();
+    const reject = (reason: string) => {
+      if (requestId) debugHttp(requestId, 'CAPABILITY REJECT', [`modelId=${modelId}`, `reason=${reason}`]);
+    };
     const m = db.select().from(schema.models).where(eq(schema.models.id, modelId)).get();
-    if (!m) return [];
+    if (!m) { reject('model_not_found'); return []; }
     const p = db.select().from(schema.providers).where(eq(schema.providers.id, m.providerId)).get();
-    if (!p || !p.enabled) return [];
+    if (!p) { reject('provider_not_found'); return []; }
+    if (!p.enabled) { reject('provider_disabled'); return []; }
     const caps = safeJson(m.capabilitiesJson);
     const candidate: CandidateModel = {
       modelId: m.id,
@@ -379,9 +447,18 @@ export class GatewayRunner {
       circuitOpen: isOpen(m.providerId),
       capabilities: caps as never,
     };
-    if (!m.enabled || !m.upstreamAvailable) return [];
-    if (candidate.circuitOpen) return [];
-    if (!modelMeets(caps, required)) return [];
+    if (!m.enabled) { reject('model_disabled'); return []; }
+    if (!m.upstreamAvailable) { reject('upstream_unavailable'); return []; }
+    if (candidate.circuitOpen) { reject('circuit_open'); return []; }
+    if (!modelMeets(caps, required)) { reject('capability_mismatch'); return []; }
+    debugHttp(requestId ?? '-', 'CAPABILITY CANDIDATE', [
+      `model=${m.publicModelId}`,
+      `caps.tools=${(caps as { tools?: boolean }).tools}`,
+      `caps.streaming=${(caps as { streaming?: boolean }).streaming}`,
+      `caps.reasoning=${(caps as { reasoning?: boolean }).reasoning}`,
+      `caps.image_input=${(caps as { image_input?: boolean }).image_input}`,
+      `caps.structured_output=${(caps as { structured_output?: boolean }).structured_output}`,
+    ]);
     return [candidate];
   }
 
@@ -414,22 +491,25 @@ export class GatewayRunner {
     if (req.canonical.stream) {
       return this.runStreamingAttempt(req, ctx, candidate, cfg, onStreamStart, onFirstToken);
     }
-    return this.runNonStreamingAttempt(req, candidate, cfg);
+    return this.runNonStreamingAttempt(req, candidate, cfg, ctx);
   }
 
   private async runNonStreamingAttempt(
     req: GatewayRequest,
     candidate: CandidateModel,
-    cfg: ReturnType<typeof providerToUpstreamConfig>
+    cfg: ReturnType<typeof providerToUpstreamConfig>,
+    ctx: GatewayContext
   ): Promise<{ statusCode: number; ttftMs: number | null; upstreamRequestId: string | null; usage: UsageSummary; result: { text: string; toolCalls: Array<{ id: string; name: string; input: unknown }>; finishReason: string | null } }> {
     const upstreamModel = candidate.publicModelId.split('/').slice(1).join('/');
     let call: UpstreamCall;
     if (cfg.type === 'openai') {
       const payload = canonicalToOpenAIRequest(req.canonical, upstreamModel);
-      call = await callUpstreamNonStreaming(cfg, upstreamUrl(cfg, '/v1/chat/completions'), payload);
+      logUpstreamRequest(ctx.requestId, cfg, upstreamUrl(cfg, '/v1/chat/completions'), payload, req.canonical.stream);
+      call = await callUpstreamNonStreaming(cfg, upstreamUrl(cfg, '/v1/chat/completions'), payload, ctx.requestId);
     } else {
       const payload = canonicalToAnthropicRequest(req.canonical, upstreamModel);
-      call = await callUpstreamNonStreaming(cfg, upstreamUrl(cfg, '/v1/messages'), payload);
+      logUpstreamRequest(ctx.requestId, cfg, upstreamUrl(cfg, '/v1/messages'), payload, req.canonical.stream);
+      call = await callUpstreamNonStreaming(cfg, upstreamUrl(cfg, '/v1/messages'), payload, ctx.requestId);
     }
     if (!call.ok) {
       if (call.status === 429) throw new GatewayError('upstream_rate_limit', `Upstream rate limited (HTTP ${call.status})`, { status: 429, code: 'upstream_http_429' });
@@ -492,7 +572,39 @@ export class GatewayRunner {
     let finishReason: string | null = null;
     const usage: UsageSummary = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, total: 0 };
 
+    // docs/13 §15–§16: stream counters + client disconnect tracking
+    let chunkCount = 0;
+    let bytesReceived = 0;
+    let firstChunkTime: number | null = null;
+    let lastChunkTime: number | null = null;
+    const loggedFirstChunks: string[] = [];
+    let clientDisconnected = false;
+    // Guard: the admin test-stream endpoint passes a minimal `fakeRaw` that has
+    // writeHead/write/end but no `.on` — skip disconnect tracking in that case.
+    if (typeof (pipe as { on?: unknown }).on === 'function') {
+      pipe.on('close', () => {
+        // Distinguish client disconnect from normal end: 'close' fires on the raw
+        // socket when the client (or upstream) side goes away.
+        if (!pipe.writableEnded) {
+          clientDisconnected = true;
+          debugStream(ctx.requestId, 'CLIENT DISCONNECT', [
+            `afterMs=${Date.now() - streamStartTs}`,
+            `streaming=${streamStarted}`,
+            `chunksSoFar=${chunkCount}`,
+          ]);
+        }
+      });
+    }
+
     const chunkHandler = (chunk: { data: string; event?: string }, isFirst: boolean) => {
+      chunkCount++;
+      bytesReceived += chunk.data.length;
+      lastChunkTime = Date.now();
+      if (isFirst) firstChunkTime = Date.now() - streamStartTs;
+      if (loggedFirstChunks.length < 3) {
+        loggedFirstChunks.push(chunk.data);
+        debugStream(ctx.requestId, `STREAM FIRST CHUNK ${loggedFirstChunks.length}`, [truncate(chunk.data, 2000)]);
+      }
       try {
         const obj = JSON.parse(chunk.data);
         if (cfg.type === 'openai') {
@@ -552,11 +664,22 @@ export class GatewayRunner {
     try {
       const url = cfg.type === 'openai' ? upstreamUrl(cfg, '/v1/chat/completions') : upstreamUrl(cfg, '/v1/messages');
       const payload = cfg.type === 'openai' ? canonicalToOpenAIRequest(req.canonical, upstreamModel) : canonicalToAnthropicRequest(req.canonical, upstreamModel);
-      const meta = await callUpstreamStreaming(cfg, url, payload, chunkHandler);
+      logUpstreamRequest(ctx.requestId, cfg, url, payload, true);
+      debugStream(ctx.requestId, 'STREAM START', [`upstreamConnected=true`]);
+      const meta = await callUpstreamStreaming(cfg, url, payload, chunkHandler, ctx.requestId);
       // Upstream completed cleanly: ensure head + terminator are written.
       if (!headWritten) writeHead();
       pipe.write('data: [DONE]\n\n');
       pipe.end();
+      debugStream(ctx.requestId, 'STREAM END', [
+        `chunks=${chunkCount}`,
+        `bytes=${bytesReceived}`,
+        `firstChunkMs=${firstChunkTime ?? 'null'}`,
+        `lastChunkMs=${lastChunkTime ? lastChunkTime - streamStartTs : 'null'}`,
+        `durationMs=${Date.now() - streamStartTs}`,
+        `finishedNormally=true`,
+        `clientDisconnected=${clientDisconnected}`,
+      ]);
       if (!usage.total) usage.total = usage.input + usage.output;
       return {
         statusCode: 200,
@@ -572,8 +695,20 @@ export class GatewayRunner {
         if (!headWritten) writeHead();
         pipe.end();
         const err = e instanceof GatewayError ? e : new GatewayError('upstream_error', (e as Error).message);
+        errorLine(ctx.requestId, 'STREAM ERROR', [
+          `chunksBeforeError=${chunkCount}`,
+          `bytesBeforeError=${bytesReceived}`,
+          `clientDisconnected=${clientDisconnected}`,
+          ...formatErrorPublic(e),
+        ]);
         throw err;
       }
+      errorLine(ctx.requestId, 'STREAM ERROR (before first chunk)', [
+        `chunksBeforeError=${chunkCount}`,
+        `bytesBeforeError=${bytesReceived}`,
+        `clientDisconnected=${clientDisconnected}`,
+        ...formatErrorPublic(e),
+      ]);
       throw e;
     }
   }
@@ -831,6 +966,45 @@ function hasTools(req: CanonicalRequest): boolean {
 
 function estimateTokens(s: string): number {
   return Math.ceil(s.length / 4);
+}
+
+// docs/13 §11: safe provider key fingerprint — never the key itself.
+function apiKeyFingerprint(key: string): string {
+  let h = 5381;
+  for (let i = 0; i < key.length; i++) {
+    h = ((h << 5) + h + key.charCodeAt(i)) >>> 0;
+  }
+  return `fp_${h.toString(16).padStart(8, '0')}…${key.slice(-4).replace(/./g, '*')}${key.length}ch`;
+}
+
+// docs/13 §12: upstream request summary + optional full body
+function logUpstreamRequest(
+  requestId: string,
+  cfg: ReturnType<typeof providerToUpstreamConfig>,
+  url: string,
+  payload: unknown,
+  stream: boolean
+): void {
+  const json = JSON.stringify(payload ?? {});
+  debugUpstream(requestId, 'UPSTREAM REQUEST', [
+    `method=POST`,
+    `url=${url}`,
+    `type=${cfg.type}`,
+    `stream=${stream}`,
+    `contentLength=${json.length}`,
+    `customHeaders=${JSON.stringify(Object.keys(cfg.customHeaders ?? {}))}`,
+  ]);
+  if (getDebugFlags().httpBody) {
+    const LIMIT = 512 * 1024;
+    debugBody(requestId, 'UPSTREAM BODY', [
+      json.length > LIMIT ? `${json.slice(0, LIMIT)}…(+${json.length - LIMIT} chars, truncated)` : json,
+    ]);
+  }
+}
+
+/** Public alias so error formatting from debug.ts is available in this module. */
+function formatErrorPublic(e: unknown): string[] {
+  return formatError(e);
 }
 
 /**

@@ -4,6 +4,21 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.12.0] - 2026-09-05
+
+### Added
+
+- **Request-lifecycle debug logging** (`docs/13-LOGGING.md`): full observability of every request as it passes through the gateway, emitted to stdout/stderr so `docker logs` collects it.
+  - Per-request ID (reuses `x-request-id` or generates one) tagged on every line — `docker logs ldrouter 2>&1 | grep req_xxx` reconstructs the whole lifecycle.
+  - `[INCOMING]` → `[BODY SUMMARY]` → `[MESSAGES]` → `[TOOLS]` → `[MODEL RESOLVE]` → `[CAPABILITIES REQUIRED]` → `[CAPABILITY REJECT]` → `[ATTEMPT]` → `[UPSTREAM REQUEST]` → `[UPSTREAM RESPONSE]` → `[STREAM START/END/ERROR]` → `[DONE]`.
+  - Per-candidate rejection reasons for the `No combo member satisfies...` error (why each member was filtered: `member_disabled`, `model_not_found`, `upstream_unavailable`, `circuit_open`, `tools`, `reasoning`, `streaming`, etc.).
+  - Nested `error.cause` / undici stack capture for `UPSTREAM FETCH ERROR` (no more bare `fetch failed`).
+  - Stream counters (chunks/bytes/first-chunk-ms) and client-disconnect detection.
+  - `[CONFIG]` line at startup printing body limit + active debug flags.
+  - Replaced `uncaughtException`/`unhandledRejection` no-op `{}` handlers with full message/stack/cause logging.
+- **Debug env flags**: `DEBUG_HTTP`, `DEBUG_HTTP_BODY`, `DEBUG_UPSTREAM`, `DEBUG_STREAM`, plus `LOG_LEVEL` alias for `LATEDEV_LOG_LEVEL` (all default off; enable for one-shot reproduction).
+- **Secret redaction**: all debug output routes through the existing `redact.ts` — provider keys are fingerprinted, never logged; `Authorization`/`x-api-key`/cookies always masked.
+
 ## [1.11.16] - 2026-09-04
 
 ### Fixed

@@ -22,6 +22,7 @@ import { registerGatewayRoutes } from './routes/gateway';
 import { registerHealthRoutes } from './routes/health';
 import { registerAdminIpGate } from './security/admin-ip-gate';
 import { metricsRegistry } from './metrics/registry';
+import { fatal, lifecycle, formatError, getDebugFlags, errorLine } from './logging/debug';
 type App = FastifyInstance;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -58,7 +59,7 @@ export async function buildApp(opts: AppOptions = {}): Promise<App> {
     reply.header('x-request-id', req.id as string);
   });
 
-  app.setErrorHandler((err: unknown, req: { id: string | number; headers: Record<string, string | string[] | undefined>; url: string; log: { error: (o: object, m: string) => void; warn: (o: object, m: string) => void } }, reply: { code: (n: number) => { send: (v: unknown) => void }; send: (v: unknown) => void }) => {
+  app.setErrorHandler((err: unknown, req: { id: string | number; headers: Record<string, string | string[] | undefined>; url: string; method: string; routeOptions?: { url?: string }; log: { error: (o: object, m: string) => void; warn: (o: object, m: string) => void } }, reply: { code: (n: number) => { send: (v: unknown) => void }; send: (v: unknown) => void }) => {
     // Zod validation failures surface as 400 with readable field messages;
     // otherwise they fall through to the generic 500 "Gateway error" envelope.
     const normalized = err instanceof ZodError
@@ -75,9 +76,20 @@ export async function buildApp(opts: AppOptions = {}): Promise<App> {
       name: normalized instanceof Error ? normalized.name : undefined,
       message: errMsg,
       stack: normalized instanceof Error ? normalized.stack : undefined,
+      cause: normalized instanceof Error ? (normalized as { cause?: unknown }).cause : undefined,
     };
     if (status >= 500) log.error({ requestId, url: req.url, err: errDetail }, 'request error');
     else log.warn({ requestId, url: req.url, err: { type: (g?.type ?? 'error'), message: errMsg } }, 'request rejected');
+
+    // docs/13 §19: server-side stack with request context (never to client).
+    if (status >= 500) {
+      errorLine(requestId, 'SERVER ERROR', [
+        `route=${req.routeOptions?.url ?? req.url}`,
+        `method=${req.method}`,
+        `statusCode=${status}`,
+        ...formatError(normalized),
+      ]);
+    }
 
     const accept = (req.headers['accept'] ?? '').toString();
     const isAnthropic = accept.includes('application/vnd.anthropic') || req.url.includes('/v1/messages');
@@ -96,9 +108,21 @@ export async function buildApp(opts: AppOptions = {}): Promise<App> {
   // Operational routes (always available)
   await registerHealthRoutes(app);
 
-  // Debug logging for request lifecycle (before routes)
-  const { registerDebugHook } = await import('./logging/debug');
-  registerDebugHook(app);
+  // docs/13 §20: print effective config so operators know body limits and
+  // which debug flags are active for the running process.
+  const dbg = getDebugFlags();
+  lifecycle('-', 'CONFIG', [
+    `host=${cfg.host}`,
+    `port=${cfg.port}`,
+    `dataDir=${cfg.dataDir}`,
+    `logLevel=${cfg.logLevel}`,
+    `trustProxyHops=${cfg.trustProxyHops}`,
+    `bodyLimit=${64 * 1024 * 1024} bytes`,
+    `debugHttp=${dbg.http}`,
+    `debugHttpBody=${dbg.httpBody}`,
+    `debugUpstream=${dbg.upstream}`,
+    `debugStream=${dbg.stream}`,
+  ]);
 
   // Admin + gateway routes MUST be registered BEFORE static files to avoid
   // 404s falling through to SPA index.html or static assets being served instead
@@ -131,16 +155,18 @@ export async function buildApp(opts: AppOptions = {}): Promise<App> {
   });
 
   // Process-level crash prevention
-process.on('uncaughtException', () => {
+process.on('uncaughtException', (err) => {
+  fatal('FATAL', ['uncaughtException', ...formatError(err)]);
   const log = getLogger();
-  log.error({ err: {} }, 'uncaught exception');
+  log.error({ err: { name: err.name, message: err.message, stack: err.stack } }, 'uncaught exception');
   // Don't exit immediately - let Fastify error handler process
   setTimeout(() => process.exit(1), 1000);
 });
 
-process.on('unhandledRejection', (_reason) => {
+process.on('unhandledRejection', (reason) => {
+  fatal('FATAL', ['unhandledRejection', ...formatError(reason)]);
   const log = getLogger();
-  log.error({ reason: '' }, 'unhandled rejection');
+  log.error({ err: { reason: String(reason) } }, 'unhandled rejection');
 });
 
 // On startup: ensure settings row + detect master key status

@@ -23,6 +23,12 @@ services:
       LATEDEV_MASTER_KEY: ${LATEDEV_MASTER_KEY:-}
       LATEDEV_TRUST_PROXY: ${LATEDEV_TRUST_PROXY:-0}
       LATEDEV_LOG_LEVEL: ${LATEDEV_LOG_LEVEL:-info}
+      # Request-lifecycle debug logging (docs/13). Default off; set to true
+      # to reproduce a gateway issue, then follow `docker compose logs -f`.
+      DEBUG_HTTP: ${DEBUG_HTTP:-false}
+      DEBUG_HTTP_BODY: ${DEBUG_HTTP_BODY:-false}
+      DEBUG_UPSTREAM: ${DEBUG_UPSTREAM:-false}
+      DEBUG_STREAM: ${DEBUG_STREAM:-false}
       # Watchtower HTTP API — enables "Update now" from the admin UI.
       LATEDEV_WATCHTOWER_URL: ${LATEDEV_WATCHTOWER_URL:-http://watchtower:8080}
       LATEDEV_WATCHTOWER_TOKEN: ${LATEDEV_WATCHTOWER_TOKEN:-ldrouter-watchtower}
