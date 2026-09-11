@@ -123,8 +123,8 @@ export async function registerApiKeyRoutes(app: FastifyInstance): Promise<void> 
 
     // DEBUG: Log what we're about to insert
     console.log(`📝 CREATE API KEY - Name: ${body.name}, Prefix: ${keyPrefix}`);
-    console.log(`📝 CREATE API KEY - Secret (full): ${secret}`);
-    console.log(`📝 CREATE API KEY - Digest: ${keyDigest}`);
+    console.log('📝 CREATE API KEY - Secret: [REDACTED]');
+    console.log('📝 CREATE API KEY - Digest: [REDACTED]');
 
     db.insert(schema.apiKeys).values({
       id,

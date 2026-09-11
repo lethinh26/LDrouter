@@ -22,7 +22,7 @@ import { registerGatewayRoutes } from './routes/gateway';
 import { registerHealthRoutes } from './routes/health';
 import { registerAdminIpGate } from './security/admin-ip-gate';
 import { metricsRegistry } from './metrics/registry';
-import { fatal, lifecycle, formatError, getDebugFlags, errorLine } from './logging/debug';
+import { fatal, lifecycle, formatError, getDebugFlags, errorLine, requestLogFields, requestLogLevel, requestLogMessage } from './logging/debug';
 type App = FastifyInstance;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -54,9 +54,19 @@ export async function buildApp(opts: AppOptions = {}): Promise<App> {
   });
   await app.register(cors, { origin: false, credentials: true });
 
-  // Per-request logging + error shaping
+  // Every request is logged as structured JSON for Docker. Bodies and headers
+  // are intentionally excluded; sensitive values must never reach logs.
+  app.addHook('onRequest', async (req) => {
+    (req as typeof req & { requestStartedAt?: number }).requestStartedAt = Date.now();
+    log.info({ requestId: req.id, method: req.method, url: req.url }, 'request received');
+  });
   app.addHook('onResponse', async (req, reply) => {
     reply.header('x-request-id', req.id as string);
+    const startedAt = (req as typeof req & { requestStartedAt?: number }).requestStartedAt ?? Date.now();
+    const statusCode = reply.statusCode;
+    const fields = requestLogFields(String(req.id), req.method, req.url, statusCode, Date.now() - startedAt, req.routeOptions?.url);
+    const level = requestLogLevel(statusCode);
+    log[level](fields, requestLogMessage(statusCode));
   });
 
   app.setErrorHandler((err: unknown, req: { id: string | number; headers: Record<string, string | string[] | undefined>; url: string; method: string; routeOptions?: { url?: string }; log: { error: (o: object, m: string) => void; warn: (o: object, m: string) => void } }, reply: { code: (n: number) => { send: (v: unknown) => void }; send: (v: unknown) => void }) => {

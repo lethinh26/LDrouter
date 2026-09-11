@@ -4,6 +4,12 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.14.0] - 2026-09-11
+
+### Added
+
+- **Docker request logging**: every request now emits structured `info` logs when received and a completion log classified as `info` (2xx/3xx), `warn` (4xx), or `error` (5xx), with request ID, method, route, status, and duration. Query strings, headers, bodies, and secrets are excluded.
+
 ## [1.13.1] - 2026-09-11
 
 ### Fixed

@@ -52,8 +52,8 @@ export function authenticateGatewayKey(req: { headers: Record<string, string | s
   else if (anthropic) candidate = anthropic;
   if (!candidate) return null;
 
-  // DEBUG: Log what we're trying to authenticate
-  console.log(`🔑 API KEY AUTH - Candidate extracted: ${candidate.slice(0, 8)}...${candidate.slice(-4)}`);
+  // Never log API-key material, including partial values.
+  console.log('🔑 API KEY AUTH - Candidate received');
 
   // Custom keys are stored verbatim (no prefix requirement); auto-generated
   // keys start with ld-, but authentication must accept any stored secret.

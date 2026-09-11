@@ -23,6 +23,23 @@ export interface DebugFlags {
   stream: boolean;
 }
 
+export function requestLogLevel(statusCode: number): 'info' | 'warn' | 'error' {
+  if (statusCode >= 500) return 'error';
+  if (statusCode >= 400) return 'warn';
+  return 'info';
+}
+
+export function requestLogMessage(statusCode: number): string {
+  if (statusCode >= 500) return 'request completed with server error';
+  if (statusCode >= 400) return 'request completed with client error';
+  return 'request completed';
+}
+
+export function requestLogFields(requestId: string, method: string, url: string, statusCode: number, durationMs: number, route?: string): Record<string, unknown> {
+  const safeUrl = url.split('?')[0] ?? url;
+  return { requestId, method, url: safeUrl, route: route ?? safeUrl, statusCode, durationMs };
+}
+
 function envFlag(name: string): boolean {
   const v = process.env[name];
   return v === '1' || v === 'true' || v === 'yes';
