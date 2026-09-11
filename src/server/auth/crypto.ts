@@ -49,6 +49,10 @@ export function isMasterKeyConfigured(): boolean {
   return Boolean(loadConfig().masterKey);
 }
 
+export function resetMasterKeyCache(): void {
+  cachedKey = null;
+}
+
 export function masterKeyVersion(): number {
   return cachedKeyVersion;
 }

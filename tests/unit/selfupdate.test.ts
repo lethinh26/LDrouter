@@ -1,6 +1,6 @@
 // Unit: self-update version comparison, package-manager detection, status
 // modes, and the shared version resolver.
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { compareUpdate, resolvePackageManager, SelfUpdater } from '@server/selfupdate/index';
 import { getAppVersion } from '@server/version';
 
@@ -72,6 +72,19 @@ describe('SelfUpdater.status modes', () => {
   it('run() refuses when no update is available (offline registry)', async () => {
     const u = new SelfUpdater('this-package-must-not-exist-zz9', '999.0.0', false);
     await expect(u.run()).rejects.toThrow(/No update available|not available/i);
+  });
+});
+
+describe('SelfUpdater.check cache', () => {
+  it('force check bypasses a cached registry result', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response(JSON.stringify({ version: '1.5.0', dist: {} }), { status: 200 }));
+    const u = new SelfUpdater('ldrouter', '1.4.0', false);
+
+    await u.check();
+    await u.check(true);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    fetchMock.mockRestore();
   });
 });
 

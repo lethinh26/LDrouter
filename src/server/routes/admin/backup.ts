@@ -9,11 +9,13 @@ import { getDb, closeDb, openDb, schema } from '../../db/index';
 import { requireAdminAuth } from '../../auth/middleware';
 import { sha256Hex } from '../../auth/ids';
 import { recordAudit } from '../../db/repositories/audit';
-import { loadConfig } from '../../config/index';
+import { loadConfig, setConfigMasterKey } from '../../config/index';
 import { getSettings } from '../../db/repositories/settings';
 import { GatewayError } from '../../errors';
 import { getAppVersion } from '../../version';
 import { eq, sql } from 'drizzle-orm';
+import { decryptBackupMasterKey, encryptBackupMasterKey, type BackupMasterKeyEnvelope } from '../../auth/backup-crypto';
+import { parseMasterKey, resetMasterKeyCache } from '../../auth/crypto';
 
 const BACKUP_VERSION = 1;
 
@@ -26,6 +28,7 @@ interface BackupEnvelope {
   createdAt: string;
   payload: string; // base64 gzipped sqlite
   checksum: string;
+  keyEnvelope?: BackupMasterKeyEnvelope;
 }
 
 /** Reopen the in-process SQLite connection on the (possibly just-replaced)
@@ -68,9 +71,16 @@ function assertDatabaseUsable(expectedSchemaVersion: number): void {
 }
 
 export async function registerBackupRoutes(app: FastifyInstance): Promise<void> {
-  app.addHook('preHandler', requireAdminAuth);
+  app.addHook('preHandler', async (req, reply) => {
+    if (req.url === '/api/admin/backup/restore' && !getSettings().setupComplete) return;
+    return requireAdminAuth(req, reply);
+  });
 
   app.post('/api/admin/backup/create', async (req, reply) => {
+    const passphrase = (req.body as { passphrase?: string } | undefined)?.passphrase ?? '';
+    if (!/^\d{6}$/.test(passphrase)) {
+      throw new GatewayError('invalid_request_error', 'Backup passphrase must contain exactly six digits', { status: 400 });
+    }
     const cfg = loadConfig();
     const temp = path.join(cfg.dataDir, `.backup-${Date.now()}.sqlite`);
     const Database = (await import('better-sqlite3')).default;
@@ -85,6 +95,7 @@ export async function registerBackupRoutes(app: FastifyInstance): Promise<void> 
     const compressed = zlib.gzipSync(buf, { level: 6 });
     const checksum = crypto.createHash('sha256').update(compressed).digest('hex');
     const settings = getSettings();
+    const masterKey = parseMasterKey(cfg.masterKey ?? fs.readFileSync(path.join(cfg.dataDir, 'master.key'), 'utf8').trim());
     const envelope: BackupEnvelope = {
       format: 'latedev-backup',
       version: BACKUP_VERSION,
@@ -94,6 +105,7 @@ export async function registerBackupRoutes(app: FastifyInstance): Promise<void> 
       createdAt: new Date().toISOString(),
       payload: compressed.toString('base64'),
       checksum,
+      keyEnvelope: encryptBackupMasterKey(masterKey, passphrase),
     };
     const envBuf = Buffer.from(JSON.stringify(envelope), 'utf8');
     const fileName = `latedev-backup-${new Date().toISOString().replace(/[:.]/g, '-')}.ldb.json`;
@@ -105,11 +117,15 @@ export async function registerBackupRoutes(app: FastifyInstance): Promise<void> 
 
   app.post('/api/admin/backup/restore', async (req, reply) => {
     const cfg = loadConfig();
-    // Expect raw JSON envelope in body
+    const incoming = req.body as { backup?: BackupEnvelope; passphrase?: string } | BackupEnvelope;
+    const wrapped = Boolean(incoming && 'backup' in incoming);
+    const wrappedBody = incoming as { backup?: BackupEnvelope; passphrase?: string };
+    const passphrase = wrapped ? wrappedBody.passphrase : undefined;
     let envelope: BackupEnvelope;
     try {
-      envelope = req.body as BackupEnvelope;
+      envelope = (wrapped ? wrappedBody.backup : incoming) as BackupEnvelope;
       if (!envelope || envelope.format !== 'latedev-backup') throw new Error('not a backup envelope');
+      if (envelope.keyEnvelope && !/^\d{6}$/.test(passphrase ?? '')) throw new Error('backup passphrase required');
     } catch {
       recordAudit({ action: 'db.restore', success: false, ip: req.ip, metadata: { reason: 'invalid_envelope' } });
       throw new GatewayError('invalid_request_error', 'Invalid backup file format', { status: 400 });
@@ -135,6 +151,16 @@ export async function registerBackupRoutes(app: FastifyInstance): Promise<void> 
     if (!(buf[0] === 0x53 && buf[1] === 0x51 && buf[2] === 0x4c && buf[3] === 0x69 && buf[4] === 0x74 && buf[5] === 0x65)) {
       recordAudit({ action: 'db.restore', success: false, ip: req.ip, metadata: { reason: 'not_sqlite' } });
       throw new GatewayError('invalid_request_error', 'Backup does not contain a valid SQLite database', { status: 400 });
+    }
+    let restoredMasterKey: Buffer | undefined;
+    if (envelope.keyEnvelope) {
+      try {
+        restoredMasterKey = decryptBackupMasterKey(envelope.keyEnvelope, passphrase!);
+        parseMasterKey(restoredMasterKey.toString('base64'));
+      } catch {
+        recordAudit({ action: 'db.restore', success: false, ip: req.ip, metadata: { reason: 'invalid_backup_passphrase' } });
+        throw new GatewayError('invalid_request_error', 'Invalid backup passphrase', { status: 400 });
+      }
     }
     const liveDb = cfg.dbFile;
     // Snapshot current DB before restore (kept for manual rollback).
@@ -192,6 +218,13 @@ export async function registerBackupRoutes(app: FastifyInstance): Promise<void> 
       }
       recordAudit({ action: 'db.restore', success: false, ip: req.ip, metadata: { reason: 'validation_failed', err: (e as Error).message } });
       throw new GatewayError('gateway_error', `Restore failed: ${(e as Error).message}`, { status: 500 });
+    }
+
+    if (restoredMasterKey) {
+      const restoredKey = restoredMasterKey.toString('base64');
+      fs.writeFileSync(path.join(cfg.dataDir, 'master.key'), restoredKey, { mode: 0o600, encoding: 'utf8' });
+      setConfigMasterKey(restoredKey);
+      resetMasterKeyCache();
     }
 
     // The swap invalidates the previous admin session (its row lived in the

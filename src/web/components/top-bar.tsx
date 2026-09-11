@@ -24,7 +24,7 @@ export function TopBar() {
 
   // Check for updates when mounted
   useEffect(() => {
-    api.get<UpdateStatus>('/api/admin/update/check')
+    api.get<UpdateStatus>('/api/admin/update/check?force=1')
       .then((r) => setUpdateInfo(r))
       .catch(() => {});
   }, []);

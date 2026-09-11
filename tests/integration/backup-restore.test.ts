@@ -62,10 +62,18 @@ describe('hot restore', () => {
   it('replaces the database in-process and keeps the admin session', async () => {
     // 1. Download a backup of the current (2-row) database.
     const createRes = await fetch(`${baseUrl}/api/admin/backup/create`, {
-      method: 'POST', headers: { cookie: cookies },
+      method: 'POST', headers: { cookie: cookies, 'content-type': 'application/json' },
+      body: JSON.stringify({ passphrase: '123456' }),
     });
     expect(createRes.status).toBe(200);
     const envelope = await createRes.json() as Record<string, unknown>;
+    expect(envelope.keyEnvelope).toBeTruthy();
+
+    const wrongPassphraseRes = await fetch(`${baseUrl}/api/admin/backup/restore`, {
+      method: 'POST', headers: { 'content-type': 'application/json', cookie: cookies },
+      body: JSON.stringify({ backup: envelope, passphrase: '654321' }),
+    });
+    expect(wrongPassphraseRes.status).toBe(400);
 
     // 2. Mutate the live database AFTER the backup: add model B.
     const db = (await import('../../src/server/db/index')).getDb();
@@ -83,7 +91,7 @@ describe('hot restore', () => {
     //    process (no restart) and re-seeds the admin session.
     const restoreRes = await fetch(`${baseUrl}/api/admin/backup/restore`, {
       method: 'POST', headers: { 'content-type': 'application/json', cookie: cookies },
-      body: JSON.stringify(envelope),
+      body: JSON.stringify({ backup: envelope, passphrase: '123456' }),
     });
     expect(restoreRes.status).toBe(200);
 

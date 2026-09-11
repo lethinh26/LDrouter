@@ -95,6 +95,9 @@ export function Settings() {
   const [totpDisableCode, setTotpDisableCode] = useState('');
   const [totpRegenerating, setTotpRegenerating] = useState(false);
   const [pendingRestoreFile, setPendingRestoreFile] = useState<File | null>(null);
+  const [backupPassphrase, setBackupPassphrase] = useState('');
+  const [backupPassphraseConfirm, setBackupPassphraseConfirm] = useState('');
+  const [restorePassphrase, setRestorePassphrase] = useState('');
 
   const reload = async () => {
     const r = await api.get<{ settings: Settings }>('/api/admin/settings');
@@ -111,7 +114,7 @@ export function Settings() {
   };
   // Refresh shared notification prefs store after every settings reload.
   useEffect(() => { void loadNotificationPrefs(true); }, []);
-  useEffect(() => { void reload(); void checkUpdate(); }, []);
+  useEffect(() => { void reload(); void checkUpdate(true); }, []);
   if (!s) return <div className="text-muted-foreground">Loading…</div>;
   const update = async (patch: Partial<Settings>) => {
     try { await api.patch('/api/admin/settings', patch); toast.success('Saved'); void reload(); }
@@ -336,9 +339,15 @@ export function Settings() {
           <Card>
             <CardHeader><CardTitle className="text-base">Backup & restore</CardTitle><CardDescription>Download a snapshot or restore from a previous backup</CardDescription></CardHeader>
             <CardContent className="space-y-3">
-              <Button onClick={async () => {
+              <div className="space-y-2 rounded border p-3">
+                <Label>Backup passphrase (6 digits)</Label>
+                <Input inputMode="numeric" maxLength={6} value={backupPassphrase} onChange={(e) => setBackupPassphrase(e.target.value.replace(/\D/g, ''))} placeholder="123456" />
+                <Input inputMode="numeric" maxLength={6} value={backupPassphraseConfirm} onChange={(e) => setBackupPassphraseConfirm(e.target.value.replace(/\D/g, ''))} placeholder="Repeat passphrase" />
+                <p className="text-xs text-muted-foreground">This passphrase encrypts the master key inside the backup. You must enter the same 6 digits when importing on a new instance. Without it, encrypted provider credentials cannot be recovered.</p>
+              </div>
+              <Button disabled={backupPassphrase.length !== 6 || backupPassphrase !== backupPassphraseConfirm} onClick={async () => {
                 try {
-                  const res = await fetch('/api/admin/backup/create', { method: 'POST', credentials: 'include' });
+                  const res = await fetch('/api/admin/backup/create', { method: 'POST', credentials: 'include', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ passphrase: backupPassphrase }) });
                   if (!res.ok) throw new Error('Backup failed');
                   const blob = await res.blob();
                   const url = URL.createObjectURL(blob);
@@ -346,8 +355,14 @@ export function Settings() {
                   a.href = url; a.download = 'latedev-backup.json'; a.click();
                   URL.revokeObjectURL(url);
                   toast.success('Backup downloaded');
+                  setBackupPassphrase(''); setBackupPassphraseConfirm('');
                 } catch (e) { toast.error((e as Error).message); }
               }}>Download backup</Button>
+              <div className="space-y-2 rounded border p-3">
+                <Label>Backup passphrase for restore</Label>
+                <Input inputMode="numeric" maxLength={6} value={restorePassphrase} onChange={(e) => setRestorePassphrase(e.target.value.replace(/\D/g, ''))} placeholder="123456" />
+                <p className="text-xs text-muted-foreground">Use the 6-digit passphrase entered when the backup was created. It is required to restore the master key and administrator access.</p>
+              </div>
               <AlertDialog open={pendingRestoreFile !== null} onOpenChange={(o) => { if (!o) setPendingRestoreFile(null); }}>
                 <AlertDialogTrigger asChild>
                   <div>
@@ -373,9 +388,8 @@ export function Settings() {
                       const file = pendingRestoreFile;
                       if (!file) return;
                       try {
-                        const res = await fetch('/api/admin/backup/restore', {
-                          method: 'POST', body: file, credentials: 'include', headers: { 'content-type': 'application/json' },
-                        });
+                        const backup = JSON.parse(await file.text());
+                        const res = await fetch('/api/admin/backup/restore', { method: 'POST', credentials: 'include', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ backup, passphrase: restorePassphrase }) });
                         if (!res.ok) throw new Error((await res.json())?.error?.message ?? 'Restore failed');
                         toast.success('Restored. Reloading…');
                         setPendingRestoreFile(null);

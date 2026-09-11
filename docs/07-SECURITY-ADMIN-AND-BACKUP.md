@@ -110,8 +110,11 @@ Backup package should include enough metadata to validate:
 - schema version
 - creation timestamp
 - checksum
+- an encrypted master key envelope
 
-Provider credentials remain encrypted inside the database. The external master key is not included in the backup.
+Before downloading, the admin enters a six-digit backup passphrase. The passphrase is not stored in SQLite, logs, or audit metadata. It derives a key used to encrypt the master key in the backup envelope. The passphrase must be entered again during import; without it, the restored provider credentials cannot be decrypted. The backup database itself contains the admin username, Argon2id password hash, encrypted TOTP secret, and hashed recovery codes.
+
+Provider credentials remain encrypted inside the database. The master key is included only in the passphrase-protected envelope, never as plaintext backup metadata.
 
 Downloading a backup generates an audit event.
 
@@ -136,7 +139,7 @@ Required flow:
 
 Never execute SQL text embedded in arbitrary upload formats. Restore only the supported database backup format.
 
-The master key required to decrypt restored provider secrets must be supplied separately through deployment configuration.
+For passphrase-protected backups, the master key is restored from the encrypted envelope. Legacy backups without a key envelope still require the master key from deployment configuration.
 
 ## Web security headers
 

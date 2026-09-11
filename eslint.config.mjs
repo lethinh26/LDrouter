@@ -6,10 +6,10 @@ import reactHooks from 'eslint-plugin-react-hooks';
 import globals from 'globals';
 
 export default [
-  { ignores: ['dist/**', 'node_modules/**', 'migrations/**', 'src/web/dist/**', 'playwright-report/**', 'test-results/**', 'src/web/components/ui/**', '.gitnexus/**', '.debug/**', 'scripts/check-db.js', 'scripts/debug-db.sh', 'scripts/quick-check-db-node.js'] },
+  { ignores: ['dist/**', 'node_modules/**', 'migrations/**', 'src/web/dist/**', 'src/web/components/ui/**', '.gitnexus/**', '.debug/**', 'scripts/check-db.js', 'scripts/debug-db.sh', 'scripts/quick-check-db-node.js'] },
   js.configs.recommended,
   {
-    files: ['src/**/*.{ts,tsx}', 'scripts/**/*.ts', 'tests/**/*.{ts,tsx}', 'tests/e2e/**/*.mjs'],
+    files: ['src/**/*.{ts,tsx}', 'scripts/**/*.ts', 'tests/**/*.{ts,tsx}'],
     languageOptions: {
       parser: tsparser,
       parserOptions: { ecmaVersion: 2022, sourceType: 'module', ecmaFeatures: { jsx: true } },

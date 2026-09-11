@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.13.1] - 2026-09-11
+
+### Fixed
+
+- **Update notification**: force a fresh npm registry check when the admin UI loads, so the update button is not hidden by the 15-minute cache.
+
+## [1.13.0] - 2026-09-11
+
+### Added
+
+- **Passphrase-protected full backups**: backups now include administrator state and a master-key envelope protected by a user-entered six-digit passphrase; `/setup` can import them without recreating the admin account.
+
 ## [1.12.0] - 2026-09-05
 
 ### Added

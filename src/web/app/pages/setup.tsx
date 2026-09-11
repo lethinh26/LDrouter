@@ -17,6 +17,9 @@ export function Setup() {
   // true = master key must be entered on this form; false = already configured
   // via LATEDEV_MASTER_KEY (field hidden).
   const [masterKeyRequired, setMasterKeyRequired] = useState(true);
+  const [importFile, setImportFile] = useState<File | null>(null);
+  const [importPassphrase, setImportPassphrase] = useState('');
+  const [importing, setImporting] = useState(false);
 
   useEffect(() => {
     api.get<{ masterKeyConfigured: boolean }>('/api/admin/setup/status')
@@ -59,7 +62,7 @@ export function Setup() {
             </div>
           )}
         </CardContent>
-        <CardFooter>
+        <CardFooter className="flex-col items-stretch gap-4">
           <Button disabled={!canSubmit} onClick={async () => {
             setSubmitting(true);
             try {
@@ -73,6 +76,24 @@ export function Setup() {
               toast.error((e as Error).message);
             } finally { setSubmitting(false); }
           }}>Create admin</Button>
+          <div className="border-t pt-4 space-y-2">
+            <Label>Import existing database</Label>
+            <p className="text-xs text-muted-foreground">Use this to restore the administrator account, password, TOTP settings, providers, models, and master key from a backup without setting up again. Enter the same 6-digit backup passphrase used when the file was created.</p>
+            <Input type="file" accept=".json,application/json" onChange={(e) => setImportFile(e.target.files?.[0] ?? null)} />
+            <Input inputMode="numeric" maxLength={6} value={importPassphrase} onChange={(e) => setImportPassphrase(e.target.value.replace(/\D/g, ''))} placeholder="Backup passphrase (6 digits)" />
+            <Button variant="outline" disabled={!importFile || importPassphrase.length !== 6 || importing} onClick={async () => {
+              if (!importFile) return;
+              setImporting(true);
+              try {
+                const backup = JSON.parse(await importFile.text());
+                const res = await fetch('/api/admin/backup/restore', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ backup, passphrase: importPassphrase }) });
+                if (!res.ok) throw new Error((await res.json())?.error?.message ?? 'Import failed');
+                toast.success('Database imported');
+                window.location.assign('/login');
+              } catch (e) { toast.error((e as Error).message); }
+              finally { setImporting(false); }
+            }}>Import database</Button>
+          </div>
         </CardFooter>
       </Card>
     </div>
