@@ -71,4 +71,9 @@ export function getDb(): BetterSQLite3Database<typeof schema> {
   return _db;
 }
 
+export function getRawDb(): Database.Database {
+  if (!_raw) throw new Error('Database not opened');
+  return _raw;
+}
+
 export { schema };

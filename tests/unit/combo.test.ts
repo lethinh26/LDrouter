@@ -45,14 +45,13 @@ describe('combo routing', () => {
     expect(out.map((c) => c.modelId)).toEqual(['a', 'b', 'c']);
   });
 
-  it('weighted round robin rotates deterministically', () => {
+  it('weighted round robin follows configured member weights', () => {
     const req: RequiredCapabilities = { streaming: false, tools: false, structuredOutput: false, imageInput: false, audioInput: false, reasoning: false, responses: false };
     const plan = combo('weighted_round_robin');
     const first = orderCandidates(plan, selectCandidates(plan, candidates, req));
     const second = orderCandidates(plan, selectCandidates(plan, candidates, req));
     const third = orderCandidates(plan, selectCandidates(plan, candidates, req));
-    expect(first[0]!.modelId).not.toBe(second[0]!.modelId);
-    expect(second[0]!.modelId).not.toBe(third[0]!.modelId);
+    expect([first[0]!.modelId, second[0]!.modelId, third[0]!.modelId]).toEqual(['a', 'a', 'a']);
   });
 
   it('fallback decision matrix', () => {

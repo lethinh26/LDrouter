@@ -73,6 +73,9 @@ export async function registerModelRoutes(app: FastifyInstance): Promise<void> {
     // For simplicity: re-discover and match by upstream id.
     const { discoverProviderModels } = await import('../../providers/index');
     const { decryptSecret, decryptCustomHeaders } = await import('../../auth/crypto');
+    if (provider.type === 'codex' || !provider.encryptedApiKey || !provider.apiKeyNonce) {
+      throw new GatewayError('invalid_request_error', `${provider.type === 'codex' ? 'Codex providers require the Codex account adapter' : 'Provider credentials are missing'}`, { status: 501 });
+    }
     const apiKey = decryptSecret({ ciphertext: provider.encryptedApiKey, nonce: provider.apiKeyNonce, version: provider.apiKeyVersion });
     const headers = decryptCustomHeaders(provider.customHeadersEncrypted && provider.customHeadersNonce ? { ciphertext: provider.customHeadersEncrypted, nonce: provider.customHeadersNonce, version: 1 } : null);
     let discovered: Array<{ upstreamId: string; displayName: string; capabilities: Record<string, unknown> }>;

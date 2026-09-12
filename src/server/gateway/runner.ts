@@ -5,12 +5,14 @@ import { eq } from 'drizzle-orm';
 import { GatewayError } from '../errors';
 import { resolveRequestedModel, unwrapAlias } from '../routing/resolver';
 import { deriveRequiredCapabilities, modelMeets, type CanonicalRequest, type RequiredCapabilities } from '../routing/capabilities';
-import { loadCombo, selectCandidates, orderCandidates, shouldFallback, type ComboPlan, type CandidateModel } from '../routing/combo';
+import { loadCombo, selectCandidates, orderCandidates, shouldFallback, expandCodexAccountCandidates, type ComboPlan, type CandidateModel } from '../routing/combo';
+import { listCodexAccountsForProvider, setCodexAccountHealth } from '../db/repositories/codex-accounts';
 import { getEffectiveState, isOpen, recordSuccess, recordFailure, halfOpenProbeAllowed } from '../routing/circuit';
 import { checkRpm, checkTpm, acquireConcurrent, releaseConcurrent } from '../routing/ratelimit';
 import { checkDailyMonthly, consumeUsage } from '../routing/quota';
 import { keyAllowedFor, type AuthenticatedKey } from '../auth/api-key';
 import { providerToUpstreamConfig, callUpstreamNonStreaming, callUpstreamStreaming, upstreamUrl, type UpstreamCall } from '../upstream/client';
+import { callCodexNonStreaming, callCodexStreaming } from '../providers/codex';
 import { canonicalToOpenAIRequest, openAIResponseToCanonical } from '../protocols/canonical';
 import { canonicalToAnthropicRequest, anthropicResponseToCanonical } from '../protocols/anthropic';
 import { uuid } from '../auth/ids';
@@ -62,6 +64,7 @@ export interface AttemptOutcome {
   streamStarted: boolean;
   partialResponse: boolean;
   selectionReason: string;
+  codexAccountId?: string;
   failureReason: string | null;
   sanitizedError: string | null;
   upstreamRequestId: string | null;
@@ -193,7 +196,10 @@ export class GatewayRunner {
         if (filtered.length === 0) {
           throw new GatewayError('capability_not_supported', 'No combo member satisfies the request capabilities or availability', { status: 400 });
         }
-        candidates = orderCandidates(comboPlan, filtered);
+        candidates = orderCandidates(comboPlan, filtered).flatMap((candidate) => {
+          const provider = getDb().select().from(schema.providers).where(eq(schema.providers.id, candidate.providerId)).get();
+          return provider?.type === 'codex' ? expandCodexAccountCandidates(candidate, listCodexAccountsForProvider(provider.id)) : [candidate];
+        });
         debugHttp(ctx.requestId, 'CANDIDATES ORDERED', [
           `mode=${comboPlan.mode}`,
           ...candidates.map((c, i) => `candidate[${i}]: providerModelId=${c.modelId} publicModelId=${c.publicModelId}`),
@@ -267,7 +273,7 @@ export class GatewayRunner {
           break;
         }
 
-        const cfg = providerToUpstreamConfig(provider);
+        const cfg = providerToUpstreamConfig(provider, candidate.codexAccountId);
         const attemptStart = Date.now();
         // docs/13 §11–§12: provider/account + upstream request summary
         const upstreamModel = candidate.publicModelId.split('/').slice(1).join('/');
@@ -280,7 +286,7 @@ export class GatewayRunner {
           `upstreamType=${cfg.type}`,
           `baseUrl=${cfg.baseUrl}`,
           `stream=${req.canonical.stream}`,
-          `providerKeyFingerprint=${apiKeyFingerprint(cfg.apiKey)}`,
+          `providerKeyFingerprint=${apiKeyFingerprint(cfg.apiKey ?? '')}`,
         ]);
         const attempt: AttemptOutcome = {
           attemptNumber: i + 1,
@@ -296,7 +302,8 @@ export class GatewayRunner {
           usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, total: 0 },
           streamStarted: false,
           partialResponse: false,
-          selectionReason: selectionReasons[0] ?? 'direct',
+          selectionReason: candidate.selectionReason ?? selectionReasons[0] ?? 'direct',
+          codexAccountId: candidate.codexAccountId,
           failureReason: null,
           sanitizedError: null,
           upstreamRequestId: null,
@@ -330,6 +337,7 @@ export class GatewayRunner {
           resultToolCalls = out.result.toolCalls;
           resultFinishReason = out.result.finishReason;
           recordSuccess(provider.id);
+          if (candidate.codexAccountId) setCodexAccountHealth(candidate.codexAccountId, 'healthy');
           getDb().update(schema.providers).set({ healthState: 'healthy', updatedAt: new Date().toISOString() }).where(eq(schema.providers.id, provider.id)).run();
           attempts.push(attempt);
           sentToClient = (out as { streamStarted?: boolean }).streamStarted ?? false;
@@ -362,8 +370,11 @@ export class GatewayRunner {
           }
           attempts.push(attempt);
           lastError = err;
-          recordFailure(provider.id, provider.cbFailureThreshold, provider.cbCooldownSeconds);
-          getDb().update(schema.providers).set({ healthState: 'down', updatedAt: new Date().toISOString() }).where(eq(schema.providers.id, provider.id)).run();
+          if (isUpstreamHealthFailure(err)) {
+            recordFailure(provider.id, provider.cbFailureThreshold, provider.cbCooldownSeconds);
+            if (candidate.codexAccountId) setCodexAccountHealth(candidate.codexAccountId, 'down', redactString(err.message));
+            getDb().update(schema.providers).set({ healthState: 'down', updatedAt: new Date().toISOString() }).where(eq(schema.providers.id, provider.id)).run();
+          }
           if (shouldRetry && i + 1 < maxAttempts) {
             metrics.fallbackCount.inc();
             continue;
@@ -459,6 +470,11 @@ export class GatewayRunner {
       `caps.image_input=${(caps as { image_input?: boolean }).image_input}`,
       `caps.structured_output=${(caps as { structured_output?: boolean }).structured_output}`,
     ]);
+    if (p.type === 'codex') {
+      const expanded = expandCodexAccountCandidates(candidate, listCodexAccountsForProvider(p.id));
+      if (expanded.length === 0) reject('codex_account_unavailable');
+      return expanded;
+    }
     return [candidate];
   }
 
@@ -501,6 +517,10 @@ export class GatewayRunner {
     ctx: GatewayContext
   ): Promise<{ statusCode: number; ttftMs: number | null; upstreamRequestId: string | null; usage: UsageSummary; result: { text: string; toolCalls: Array<{ id: string; name: string; input: unknown }>; finishReason: string | null } }> {
     const upstreamModel = candidate.publicModelId.split('/').slice(1).join('/');
+    if (cfg.type === 'codex') {
+      const out = await callCodexNonStreaming({ baseUrl: cfg.baseUrl, accountId: cfg.codexAccountId ?? '', accountRecordId: cfg.accountRecordId, customHeaders: cfg.customHeaders, totalTimeoutMs: cfg.totalTimeoutMs }, { ...req.canonical, model: upstreamModel });
+      return { statusCode: out.status, ttftMs: null, upstreamRequestId: out.upstreamRequestId, usage: out.usage, result: { text: out.text, toolCalls: out.toolCalls, finishReason: out.finishReason } };
+    }
     let call: UpstreamCall;
     if (cfg.type === 'openai') {
       const payload = canonicalToOpenAIRequest(req.canonical, upstreamModel);
@@ -514,8 +534,8 @@ export class GatewayRunner {
     if (!call.ok) {
       if (call.status === 429) throw new GatewayError('upstream_rate_limit', `Upstream rate limited (HTTP ${call.status})`, { status: 429, code: 'upstream_http_429' });
       if (call.status === 401 || call.status === 403) throw new GatewayError('upstream_auth_error', 'Upstream authentication failed', { status: 502 });
-      if (call.status >= 500) throw new GatewayError('upstream_error', `Upstream HTTP ${call.status}`, { status: 502, code: `upstream_http_${call.status}` });
-      throw new GatewayError('upstream_error', `Upstream HTTP ${call.status}: ${redactString(call.text.slice(0, 300))}`, { status: 502 });
+      if (call.status >= 500) throw new GatewayError('upstream_error', `Upstream HTTP ${call.status}`, { status: 502, code: `upstream_http_${call.status}`, cause: { status: call.status } });
+      throw new GatewayError('upstream_error', `Upstream HTTP ${call.status}: ${redactString(call.text.slice(0, 300))}`, { status: 502, cause: { status: call.status } });
     }
     let parsed: unknown;
     try {
@@ -662,6 +682,23 @@ export class GatewayRunner {
     };
 
     try {
+      if (cfg.type === 'codex') {
+        const events: Array<ReturnType<typeof import('../providers/codex').codexStreamEventToCanonical>> = [];
+        let firstCodexEvent = true;
+        const meta = await callCodexStreaming({ baseUrl: cfg.baseUrl, accountId: cfg.codexAccountId ?? '', accountRecordId: cfg.accountRecordId, customHeaders: cfg.customHeaders, totalTimeoutMs: cfg.totalTimeoutMs }, { ...req.canonical, model: upstreamModel }, (event) => {
+          if (event.text || event.isLast) {
+            events.push(event);
+            if (event.usage) Object.assign(usage, event.usage);
+            chunkHandler({ data: codexStreamEventToClient(req.protocol, event, upstreamModel, ctx.requestId) }, firstCodexEvent);
+            firstCodexEvent = false;
+          }
+        });
+        if (!headWritten) writeHead();
+        pipe.write('data: [DONE]\n\n');
+        pipe.end();
+        if (!usage.total) usage.total = usage.input + usage.output;
+        return { statusCode: meta.status, ttftMs: events.length ? Date.now() - streamStartTs : null, upstreamRequestId: meta.upstreamRequestId, usage, result: { text: textBuf, toolCalls: toolBuf, finishReason } };
+      }
       const url = cfg.type === 'openai' ? upstreamUrl(cfg, '/v1/chat/completions') : upstreamUrl(cfg, '/v1/messages');
       const payload = cfg.type === 'openai' ? canonicalToOpenAIRequest(req.canonical, upstreamModel) : canonicalToAnthropicRequest(req.canonical, upstreamModel);
       logUpstreamRequest(ctx.requestId, cfg, url, payload, true);
@@ -915,6 +952,7 @@ export class GatewayRunner {
         attemptNumber: a.attemptNumber,
         providerId: a.providerId,
         modelId: a.modelId,
+        codexAccountId: a.codexAccountId ?? null,
         startedAt: a.startedAt,
         completedAt: a.completedAt,
         statusCode: a.statusCode,
@@ -939,7 +977,11 @@ export class GatewayRunner {
   }
 }
 
-function classifyFailure(err: GatewayError): string {
+export function isUpstreamHealthFailure(err: GatewayError): boolean {
+  return ['connection_error', 'connect_timeout', 'first_token_timeout', 'http_status', 'upstream_rate_limit'].includes(classifyFailure(err));
+}
+
+export function classifyFailure(err: GatewayError): string {
   switch (err.type) {
     case 'timeout_error':
       return err.message.includes('first token') ? 'first_token_timeout' : 'connect_timeout';
@@ -947,8 +989,10 @@ function classifyFailure(err: GatewayError): string {
       return 'connection_error';
     case 'upstream_rate_limit':
       return 'http_status';
-    case 'upstream_error':
-      return err.status >= 500 ? 'http_status' : 'connection_error';
+    case 'upstream_error': {
+      const upstreamStatus = (err.cause as { status?: unknown } | undefined)?.status;
+      return typeof upstreamStatus === 'number' && upstreamStatus >= 500 && upstreamStatus < 600 ? 'http_status' : 'unknown';
+    }
     default:
       return 'unknown';
   }
@@ -1049,6 +1093,27 @@ function safeJsonParse(s: string): unknown {
 
 function usageFromCache(u: { input: number; output: number; cacheRead: number; cacheWrite: number; reasoning: number } | null): UsageSummary {
   return u ? { ...u, total: u.input + u.output } : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, total: 0 };
+}
+
+// Map Codex's native response events to the public protocol stream shape.
+export function codexStreamEventToClient(
+  protocol: 'openai' | 'anthropic',
+  event: { text: string; isLast: boolean },
+  model: string,
+  requestId: string,
+): string {
+  if (protocol === 'openai') {
+    return JSON.stringify({
+      id: `chatcmpl-${requestId}`,
+      object: 'chat.completion.chunk',
+      created: Math.floor(Date.now() / 1000),
+      model,
+      choices: [{ index: 0, delta: event.isLast ? {} : { content: event.text }, finish_reason: event.isLast ? 'stop' : null }],
+    });
+  }
+  return JSON.stringify(event.isLast
+    ? { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: 0 } }
+    : { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: event.text } });
 }
 
 // SSE encoders: canonical stream chunk -> client protocol event

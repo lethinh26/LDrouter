@@ -19,6 +19,7 @@ Lightweight self-hosted LLM gateway with a polished admin UI. Presents stable Op
 - Consistent backup / restore (SQLite snapshot + checksum + schema validation)
 - Prometheus `/metrics`, structured logs, graceful shutdown
 - One distributable npm package, multi-stage Dockerfile, Docker Compose
+- Native Codex OAuth account pools with encrypted JSON/JSONL import, refresh/rotation, account-aware routing, and admin management
 
 ## Quick start
 
@@ -41,6 +42,25 @@ latedev-router --host 0.0.0.0 --port 8787
 ```
 
 The data directory defaults to `~/.latedev-router/` and can be overridden via `LATEDEV_DATA_DIR` or `--data-dir`.
+
+### Codex OAuth setup
+
+1. Set `LATEDEV_MASTER_KEY` before creating or importing credentials. Use a strong random base64 key; it encrypts Codex access, refresh, and ID tokens at rest.
+2. In **Providers**, create a provider with type **Codex**. Codex providers do not use the generic API-key field.
+3. Open the Codex account panel and import a redacted copy of a Codex OAuth `auth.json`, a JSON array, an `{ "accounts": [...] }` wrapper, or JSONL with one record per line. Records may contain a `tokens` object with access/refresh/ID tokens. For example:
+
+   `{ "accountId": "acct-…masked", "email": "admin@example.invalid", "tokens": { "accessToken": "[REDACTED]", "refreshToken": "[REDACTED]" } }`
+
+   JSONL stores one similarly redacted object per line; an array uses the same records: `[ { "accountId": "acct-…masked", "tokens": { "accessToken": "[REDACTED]" } } ]`.
+4. Review the preview and import only the records you want. Account/workspace identity is preferred for deduplication; email alone never merges unrelated accounts. Re-importing the same identity updates its encrypted tokens while preserving its enabled state.
+
+Raw tokens are accepted only by the authenticated import pipeline and are never returned in previews, API responses, UI state, audit logs, request logs, errors, or database backups. JWT claims are decoded for metadata only; token signatures are not verified locally. Tokens are refreshed proactively near expiry and once after an upstream 401/403, with rotated values persisted atomically.
+
+The import endpoint requires the normal admin session and CSRF token (`x-csrf-token`) for mutations, including multipart uploads. Use HTTPS for remote administration and protect the master key like any encryption key. Back up the SQLite data directory consistently; restoring encrypted credentials requires the matching master key, otherwise re-save/re-import credentials after restore.
+
+ZIP upload and automatic Codex CLI config-file generation/mutation are not included in this release. LateDev Router does not modify Codex CLI files.
+
+The per-account **Test** control currently returns HTTP 501 (`not_implemented`) by design; it does not call upstream, change account health/enabled state, or expose tokens. Routing requests use the implemented Codex adapter and account pool.
 
 ## Environment variables
 

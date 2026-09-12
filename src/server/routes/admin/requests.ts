@@ -241,6 +241,7 @@ export async function registerRequestRoutes(app: FastifyInstance): Promise<void>
         providerName: providerMap.get(a.providerId)?.name ?? '',
         modelId: a.modelId,
         modelPublicId: modelMap.get(a.modelId)?.publicModelId ?? '',
+        codexAccountId: a.codexAccountId,
         startedAt: a.startedAt,
         completedAt: a.completedAt,
         statusCode: a.statusCode,

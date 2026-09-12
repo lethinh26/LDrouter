@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.15.0] - 2026-09-12
+
+### Added
+
+- Native Codex OAuth account import from redacted JSON, JSON arrays, wrapper objects, and JSONL, with provider-scoped deduplication and encrypted token storage.
+- Codex token refresh/rotation, bounded unauthorized retry, account health tracking, account-aware routing, and attempt attribution.
+- Codex provider setup, account import, refresh status, enable/disable, and safe test controls in the admin UI.
+
 ## [1.14.1] - 2026-09-12
 
 ### Fixed

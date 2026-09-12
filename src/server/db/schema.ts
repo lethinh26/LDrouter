@@ -105,10 +105,10 @@ export const providers = sqliteTable(
     id: text('id').primaryKey(),
     name: text('name').notNull(),
     slug: text('slug').notNull().unique(),
-    type: text('type', { enum: ['openai', 'anthropic'] }).notNull(),
+    type: text('type', { enum: ['openai', 'anthropic', 'codex'] }).notNull(),
     baseUrl: text('base_url').notNull(),
-    encryptedApiKey: text('encrypted_api_key').notNull(),
-    apiKeyNonce: text('api_key_nonce').notNull(),
+    encryptedApiKey: text('encrypted_api_key'),
+    apiKeyNonce: text('api_key_nonce'),
     apiKeyVersion: integer('api_key_version').notNull().default(1),
     customHeadersEncrypted: text('custom_headers_encrypted'),
     customHeadersNonce: text('custom_headers_nonce'),
@@ -130,6 +130,42 @@ export const providers = sqliteTable(
   },
   (t) => ({
     slugIdx: uniqueIndex('uniq_provider_slug').on(t.slug),
+  })
+);
+
+export const codexAccounts = sqliteTable(
+  'codex_accounts',
+  {
+    id: text('id').primaryKey(),
+    providerId: text('provider_id').notNull().references(() => providers.id, { onDelete: 'restrict' }),
+    email: text('email'),
+    workspaceId: text('workspace_id'),
+    chatgptAccountId: text('chatgpt_account_id'),
+    planType: text('plan_type'),
+    encryptedAccessToken: text('encrypted_access_token').notNull(),
+    accessTokenNonce: text('access_token_nonce').notNull(),
+    accessTokenVersion: integer('access_token_version').notNull().default(1),
+    encryptedRefreshToken: text('encrypted_refresh_token').notNull(),
+    refreshTokenNonce: text('refresh_token_nonce').notNull(),
+    refreshTokenVersion: integer('refresh_token_version').notNull().default(1),
+    encryptedIdToken: text('encrypted_id_token'),
+    idTokenNonce: text('id_token_nonce'),
+    idTokenVersion: integer('id_token_version').notNull().default(1),
+    tokenExpiresAt: text('token_expires_at').notNull(),
+    lastRefreshAt: text('last_refresh_at'),
+    authMethod: text('auth_method', { enum: ['oauth', 'access_token'] }).notNull().default('oauth'),
+    enabled: integer('enabled', { mode: 'boolean' }).notNull().default(true),
+    healthState: text('health_state', { enum: ['healthy', 'degraded', 'down', 'unknown'] }).notNull().default('unknown'),
+    lastError: text('last_error'),
+    consecutiveFailures: integer('consecutive_failures').notNull().default(0),
+    priority: integer('priority').notNull().default(0),
+    createdAt: text('created_at').notNull().default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ','now'))`),
+    updatedAt: text('updated_at').notNull().default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ','now'))`),
+  },
+  (t) => ({
+    providerEnabledPriorityIdx: index('idx_codex_account_provider_enabled_priority').on(t.providerId, t.enabled, t.priority),
+    providerEmailIdx: index('idx_codex_account_provider_email').on(t.providerId, t.email),
+    providerChatgptIdx: index('idx_codex_account_provider_chatgpt').on(t.providerId, t.chatgptAccountId),
   })
 );
 
@@ -361,6 +397,7 @@ export const requestAttempts = sqliteTable(
     attemptNumber: integer('attempt_number').notNull(),
     providerId: text('provider_id').notNull(),
     modelId: text('model_id').notNull(),
+    codexAccountId: text('codex_account_id').references(() => codexAccounts.id, { onDelete: 'set null' }),
     startedAt: text('started_at').notNull(),
     completedAt: text('completed_at'),
     statusCode: integer('status_code'),
@@ -382,6 +419,7 @@ export const requestAttempts = sqliteTable(
   (t) => ({
     requestIdx: index('idx_attempt_request').on(t.requestId, t.attemptNumber),
     providerModelIdx: index('idx_attempt_provider_model').on(t.providerId, t.modelId, t.startedAt),
+    codexAccountIdx: index('idx_attempt_codex_account').on(t.codexAccountId, t.startedAt),
   })
 );
 
@@ -514,6 +552,7 @@ export const schemaMigrations = sqliteTable('schema_migrations', {
 
 // Convenience type re-exports
 export type Provider = typeof providers.$inferSelect;
+export type CodexAccount = typeof codexAccounts.$inferSelect;
 export type Model = typeof models.$inferSelect;
 export type Combo = typeof combos.$inferSelect;
 export type ComboMember = typeof comboMembers.$inferSelect;

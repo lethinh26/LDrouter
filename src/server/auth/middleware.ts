@@ -6,6 +6,28 @@ import { sql } from 'drizzle-orm';
 import { sha256Hex } from './ids';
 import { GatewayError } from '../errors';
 import { recordAudit } from '../db/repositories/audit';
+import { timingSafeEqual } from 'node:crypto';
+
+const CsrfHeader = 'x-csrf-token';
+
+export async function requireAdminCsrf(req: FastifyRequest): Promise<void> {
+  const token = req.headers[CsrfHeader];
+  if (typeof token !== 'string' || !req.adminSessionId) throw new GatewayError('authentication_error', 'CSRF token required', { status: 403 });
+  const row = getDb().select().from(schema.csrfTokens).where(sql`session_id = ${req.adminSessionId}`).get();
+  const expected = row?.token;
+  if (!expected || new Date(row.expiresAt).getTime() < Date.now()) throw new GatewayError('authentication_error', 'Invalid CSRF token', { status: 403 });
+  const actualBytes = Buffer.from(token);
+  const expectedBytes = Buffer.from(expected);
+  if (actualBytes.length !== expectedBytes.length || !timingSafeEqual(actualBytes, expectedBytes)) throw new GatewayError('authentication_error', 'Invalid CSRF token', { status: 403 });
+}
+
+export function csrfTokenForSession(sessionId: string): string {
+  const row = getDb().select().from(schema.csrfTokens).where(sql`session_id = ${sessionId}`).get();
+  if (!row || new Date(row.expiresAt).getTime() < Date.now()) throw new Error('CSRF token unavailable');
+  return row.token;
+}
+
+export { CsrfHeader };
 
 declare module 'fastify' {
   interface FastifyRequest {

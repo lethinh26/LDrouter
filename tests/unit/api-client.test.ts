@@ -21,7 +21,7 @@ describe('api client request shaping', () => {
     const fetchMock = mockFetch();
     vi.stubGlobal('fetch', fetchMock);
     await api.post('/api/admin/providers/some-id/test');
-    const init = fetchMock.mock.calls[0]![1] as RequestInit;
+    const init = fetchMock.mock.calls.at(-1)![1] as RequestInit;
     const headers = (init.headers ?? {}) as Record<string, string>;
     expect(headers['content-type']).toBeUndefined();
     expect(init.body).toBeUndefined();
@@ -31,7 +31,7 @@ describe('api client request shaping', () => {
     const fetchMock = mockFetch();
     vi.stubGlobal('fetch', fetchMock);
     await api.post('/api/admin/providers', { name: 'x' });
-    const init = fetchMock.mock.calls[0]![1] as RequestInit;
+    const init = fetchMock.mock.calls.at(-1)![1] as RequestInit;
     const headers = (init.headers ?? {}) as Record<string, string>;
     expect(headers['content-type']).toBe('application/json');
     expect(init.body).toBe(JSON.stringify({ name: 'x' }));
@@ -41,7 +41,7 @@ describe('api client request shaping', () => {
     const fetchMock = mockFetch();
     vi.stubGlobal('fetch', fetchMock);
     await api.get('/api/admin/providers');
-    const init = fetchMock.mock.calls[0]![1] as RequestInit;
+    const init = fetchMock.mock.calls.at(-1)![1] as RequestInit;
     const headers = (init.headers ?? {}) as Record<string, string>;
     expect(headers['content-type']).toBeUndefined();
     expect(init.body).toBeUndefined();
@@ -52,7 +52,7 @@ describe('api client request shaping', () => {
     const fetchMock = mockFetch();
     vi.stubGlobal('fetch', fetchMock);
     await api.del('/api/admin/providers/some-id');
-    const init = fetchMock.mock.calls[0]![1] as RequestInit;
+    const init = fetchMock.mock.calls.at(-1)![1] as RequestInit;
     const headers = (init.headers ?? {}) as Record<string, string>;
     expect(headers['content-type']).toBeUndefined();
     expect(init.body).toBeUndefined();

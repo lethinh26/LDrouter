@@ -1,5 +1,5 @@
 // Providers page — list + create form.
-import { useEffect, useState } from 'react';
+import { Fragment, useEffect, useState } from 'react';
 import { PageHeader } from '../../components/ui/skeleton';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '../../components/ui/card';
 import { Button } from '../../components/ui/button';
@@ -13,14 +13,21 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '.
 import { Switch } from '../../components/ui/switch';
 import { api } from '../../lib/api';
 import { toast } from 'sonner';
-import { Plus, Play, Trash2 } from 'lucide-react';
+import { Plus, Play, Trash2, Upload, Settings2 } from 'lucide-react';
+import { CodexImportDialog } from '../../components/codex-import-dialog';
 
 interface Provider {
-  id: string; name: string; slug: string; type: 'openai' | 'anthropic'; baseUrl: string;
+  id: string; name: string; slug: string; type: 'openai' | 'anthropic' | 'codex'; baseUrl: string;
   enabled: boolean; health: string; modelCount: number;
 }
 
-const EMPTY = { name: '', slug: '', type: 'openai' as 'openai' | 'anthropic', baseUrl: 'https://api.openai.com', apiKey: '', customHeaders: '', enabled: true };
+interface CodexAccount {
+  id: string; email: string | null; accountIdMasked: string | null; workspaceIdMasked: string | null;
+  planType: string | null; tokenExpiresAt: string; enabled: boolean; healthState: string;
+  lastRefreshAt: string | null; priority: number;
+}
+
+const EMPTY = { name: '', slug: '', type: 'openai' as 'openai' | 'anthropic' | 'codex', baseUrl: 'https://api.openai.com', apiKey: '', customHeaders: '', enabled: true };
 
 export function Providers() {
   const [rows, setRows] = useState<Provider[]>([]);
@@ -32,8 +39,24 @@ export function Providers() {
   const [editForm, setEditForm] = useState<typeof EMPTY>(EMPTY);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [deleteSubmitting, setDeleteSubmitting] = useState(false);
+  const [codexAccounts, setCodexAccounts] = useState<Record<string, CodexAccount[]>>({});
+  const requiresApiKey = form.type !== 'codex';
+  const [importProviderId, setImportProviderId] = useState<string | null>(null);
+  const [accountAction, setAccountAction] = useState<string | null>(null);
 
-  const reload = () => api.get<{ providers: Provider[] }>('/api/admin/providers').then((r) => setRows(r.providers));
+  const reloadCodex = async (providerId: string) => {
+    try { const result = await api.get<{ accounts: CodexAccount[] }>(`/api/admin/codex/accounts?providerId=${encodeURIComponent(providerId)}`); setCodexAccounts((current) => ({ ...current, [providerId]: result.accounts })); }
+    catch (e) { toast.error((e as Error).message || 'Unable to load Codex accounts'); }
+  };
+  const reload = async () => {
+    try {
+      const result = await api.get<{ providers: Provider[] }>('/api/admin/providers');
+      setRows(result.providers);
+      await Promise.all(result.providers.filter((provider) => provider.type === 'codex').map((provider) => reloadCodex(provider.id)));
+    } catch (e) { toast.error((e as Error).message || 'Unable to load providers'); }
+  };
+  // reload is intentionally stable for the page lifetime; mutations call it explicitly.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { void reload(); }, []);
 
   const submit = async () => {
@@ -87,6 +110,25 @@ export function Providers() {
   };
 
   // Runs after the AlertDialog confirmation — deletingId is the row under deletion.
+  const updateAccount = async (account: CodexAccount, changes: Record<string, unknown>) => {
+    setAccountAction(account.id);
+    try { await api.patch(`/api/admin/codex/accounts/${account.id}`, changes); toast.success('Codex account updated'); const provider = rows.find((item) => codexAccounts[item.id]?.some((row) => row.id === account.id)); if (provider) await reloadCodex(provider.id); }
+    catch (e) { toast.error((e as Error).message || 'Unable to update Codex account'); }
+    finally { setAccountAction(null); }
+  };
+  const testAccount = async (account: CodexAccount) => {
+    setAccountAction(account.id);
+    try { await api.post(`/api/admin/codex/accounts/${account.id}/test`); toast.success('Codex account test passed'); }
+    catch (e) { toast.error((e as Error).message || 'Codex account test failed'); }
+    finally { setAccountAction(null); }
+  };
+  const deleteAccount = async (account: CodexAccount) => {
+    setAccountAction(account.id);
+    try { await api.del(`/api/admin/codex/accounts/${account.id}`); toast.success('Codex account deleted'); const provider = rows.find((item) => codexAccounts[item.id]?.some((row) => row.id === account.id)); if (provider) await reloadCodex(provider.id); }
+    catch (e) { toast.error((e as Error).message || 'Unable to delete Codex account'); }
+    finally { setAccountAction(null); }
+  };
+
   const del = async (id: string) => {
     setDeleteSubmitting(true);
     try { await api.del(`/api/admin/providers/${id}`); toast.success('Provider removed'); void reload(); }
@@ -105,11 +147,12 @@ export function Providers() {
               <div><Label>Name</Label><Input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></div>
               <div><Label>Slug (optional)</Label><Input value={form.slug} onChange={(e) => setForm({ ...form, slug: e.target.value })} /></div>
               <div><Label>Type</Label>
-                <Select value={form.type} onValueChange={(v) => setForm({ ...form, type: v as 'openai' | 'anthropic' })}>
+                <Select value={form.type} onValueChange={(v) => setForm({ ...form, type: v as 'openai' | 'anthropic' | 'codex' })}>
                   <SelectTrigger><SelectValue /></SelectTrigger>
                   <SelectContent>
                     <SelectItem value="openai">OpenAI-compatible</SelectItem>
                     <SelectItem value="anthropic">Anthropic-compatible</SelectItem>
+                    <SelectItem value="codex">Codex OAuth</SelectItem>
                   </SelectContent>
                 </Select>
               </div>
@@ -120,7 +163,7 @@ export function Providers() {
             </div>
             <DialogFooter>
               <Button variant="outline" onClick={() => setOpen(false)}>Cancel</Button>
-              <Button disabled={submitting || !form.name || !form.apiKey} onClick={submit}>Create</Button>
+              <Button disabled={submitting || !form.name || (requiresApiKey && !form.apiKey)} onClick={submit}>Create</Button>
             </DialogFooter>
           </DialogContent>
         </Dialog>
@@ -143,7 +186,8 @@ export function Providers() {
             <TableBody>
               {rows.length === 0 && <TableRow><TableCell colSpan={7} className="text-center text-muted-foreground">No providers yet.</TableCell></TableRow>}
               {rows.map((p) => (
-                <TableRow key={p.id}>
+                <Fragment key={p.id}>
+                <TableRow>
                   <TableCell className="font-medium">{p.name} <span className="text-xs text-muted-foreground">{p.slug}</span></TableCell>
                   <TableCell><Badge variant="outline">{p.type}</Badge></TableCell>
                   <TableCell className="text-xs text-muted-foreground">{p.baseUrl}</TableCell>
@@ -158,7 +202,13 @@ export function Providers() {
                     </div>
                   </TableCell>
                 </TableRow>
+                {p.type === 'codex' && <TableRow><TableCell colSpan={7} className="bg-muted/30 p-4">
+                  <div className="mb-3 flex items-center justify-between"><div><h3 className="font-medium">Codex accounts</h3><p className="text-xs text-muted-foreground">OAuth accounts are masked and never expose token fields.</p></div><Button size="sm" onClick={() => setImportProviderId(p.id)}><Upload className="mr-1 h-4 w-4" /> Import accounts</Button></div>
+                  {(codexAccounts[p.id] ?? []).length === 0 ? <p className="py-3 text-sm text-muted-foreground">No Codex accounts imported yet.</p> : <div className="overflow-x-auto"><Table><TableHeader><TableRow><TableHead>Email / identity</TableHead><TableHead>Plan</TableHead><TableHead>Expiry</TableHead><TableHead>Health</TableHead><TableHead>Last refresh</TableHead><TableHead>Priority</TableHead><TableHead>Actions</TableHead></TableRow></TableHeader><TableBody>{(codexAccounts[p.id] ?? []).map((account) => <TableRow key={account.id}><TableCell><div>{account.email || 'Unknown email'}</div><div className="text-xs text-muted-foreground">{account.accountIdMasked || '—'}{account.workspaceIdMasked ? ` · ${account.workspaceIdMasked}` : ''}</div></TableCell><TableCell>{account.planType || '—'}</TableCell><TableCell>{new Date(account.tokenExpiresAt).toLocaleDateString()}</TableCell><TableCell><Badge variant={account.healthState === 'healthy' ? 'success' : account.healthState === 'down' ? 'destructive' : 'secondary'}>{account.healthState}</Badge></TableCell><TableCell>{account.lastRefreshAt ? new Date(account.lastRefreshAt).toLocaleString() : '—'}</TableCell><TableCell><Input aria-label={`Priority for ${account.email || account.id}`} className="w-20" type="number" value={account.priority} onChange={(event) => void updateAccount(account, { priority: Number(event.target.value) })} /></TableCell><TableCell><div className="flex gap-1"><Button size="sm" variant="outline" disabled={accountAction === account.id} onClick={() => void updateAccount(account, { enabled: !account.enabled })}>{account.enabled ? 'Disable' : 'Enable'}</Button><Button size="sm" variant="outline" aria-label={`Test Codex account ${account.email || account.id}`} disabled={accountAction === account.id} onClick={() => void testAccount(account)}><Settings2 className="h-3 w-3" /></Button><Button size="sm" variant="destructive" disabled={accountAction === account.id} onClick={() => { if (window.confirm('Delete this Codex account?')) void deleteAccount(account); }}>Delete</Button></div></TableCell></TableRow>)}</TableBody></Table></div>}
+                </TableCell></TableRow>}
+                </Fragment>
               ))}
+              {importProviderId && <CodexImportDialog providerId={importProviderId} open onOpenChange={(open) => { if (!open) setImportProviderId(null); }} onImported={() => void reloadCodex(importProviderId)} />}
             </TableBody>
           </Table>
         </CardContent>
@@ -177,7 +227,8 @@ export function Providers() {
                 <SelectContent>
                   <SelectItem value="openai">OpenAI-compatible</SelectItem>
                   <SelectItem value="anthropic">Anthropic-compatible</SelectItem>
-                </SelectContent>
+                  <SelectItem value="codex">Codex OAuth</SelectItem>
+                  </SelectContent>
               </Select>
             </div>
             <div><Label>Base URL</Label><Input value={editForm.baseUrl} onChange={(e) => setEditForm({ ...editForm, baseUrl: e.target.value })} /></div>

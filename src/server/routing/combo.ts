@@ -56,6 +56,25 @@ export interface CandidateModel {
   upstreamAvailable: boolean;
   circuitOpen: boolean;
   capabilities: ModelCapabilitiesInput;
+  codexAccountId?: string;
+  codexChatgptAccountId?: string;
+  selectionReason?: string;
+}
+
+export interface CodexAccountCandidate {
+  id: string;
+  chatgptAccountId: string;
+  enabled: boolean;
+  healthState: 'healthy' | 'degraded' | 'down' | 'unknown';
+  tokenExpiresAt: string;
+  priority: number;
+}
+
+export function expandCodexAccountCandidates(candidate: CandidateModel, accounts: CodexAccountCandidate[], now = new Date()): CandidateModel[] {
+  if (!candidate.publicModelId.startsWith('codex/')) return [candidate];
+  const usable = accounts.filter((a) => a.enabled && (a.healthState === 'healthy' || a.healthState === 'unknown') && Date.parse(a.tokenExpiresAt) > now.getTime())
+    .sort((a, b) => a.priority - b.priority || a.id.localeCompare(b.id));
+  return usable.map((a) => ({ ...candidate, codexAccountId: a.id, codexChatgptAccountId: a.chatgptAccountId, selectionReason: 'codex_account' }));
 }
 
 export function selectCandidates(
@@ -103,25 +122,25 @@ export function orderCandidates(combo: ComboPlan, candidates: CandidateModel[]):
   }
   // Weighted round-robin: stable order with weighted lead bias.
   // We rotate via a process-local cursor keyed by combo id.
-  const cursor = nextCursor(combo.comboId, candidates);
+  const cursor = nextCursor(combo.comboId, combo.members, candidates);
   return cursor;
 }
 
 const comboCursors = new Map<string, number>();
 
-function nextCursor(comboId: string, candidates: CandidateModel[]): CandidateModel[] {
+function nextCursor(comboId: string, members: ComboMember[], candidates: CandidateModel[]): CandidateModel[] {
   if (candidates.length === 0) return [];
-  // Compute total weight of available candidates
-  const totalWeight = candidates.reduce((s, c) => {
-    const m = (candidates.find((x) => x.modelId === c.modelId));
-    void m;
-    return s + 1; // weight normalization happens upstream
-  }, 0);
-  void totalWeight;
-  // Simple modulo rotation for determinism in tests
-  const cur = (comboCursors.get(comboId) ?? 0) % candidates.length;
+  // Repeat each available member according to its configured positive weight,
+  // then advance one slot per request. This is deterministic weighted RR.
+  const slots = members.flatMap((member) => {
+    const candidate = candidates.find((c) => c.modelId === member.modelId);
+    if (!candidate) return [];
+    return Array.from({ length: Math.max(1, member.weight) }, () => candidate);
+  });
+  const cur = (comboCursors.get(comboId) ?? 0) % Math.max(1, slots.length);
   comboCursors.set(comboId, cur + 1);
-  return [...candidates.slice(cur), ...candidates.slice(0, cur)];
+  const selected = slots[cur] ?? candidates[0]!;
+  return [selected, ...candidates.filter((candidate) => candidate !== selected)];
 }
 
 export function shouldFallback(combo: ComboPlan, reason: { type: string; status?: number }): boolean {

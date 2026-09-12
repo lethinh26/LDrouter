@@ -5,6 +5,7 @@ import cookie from '@fastify/cookie';
 import helmet from '@fastify/helmet';
 import cors from '@fastify/cors';
 import staticPlugin from '@fastify/static';
+import multipart from '@fastify/multipart';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -53,6 +54,7 @@ export async function buildApp(opts: AppOptions = {}): Promise<App> {
     crossOriginEmbedderPolicy: false,
   });
   await app.register(cors, { origin: false, credentials: true });
+  await app.register(multipart, { limits: { fileSize: 2_000_000, files: 20, parts: 25 } });
 
   // Every request is logged as structured JSON for Docker. Bodies and headers
   // are intentionally excluded; sensitive values must never reach logs.
@@ -75,7 +77,12 @@ export async function buildApp(opts: AppOptions = {}): Promise<App> {
     const normalized = err instanceof ZodError
       ? new GatewayError('invalid_request_error', err.issues.map((i) => `${i.path.join('.') || 'body'}: ${i.message}`).join('; '), { status: 400 })
       : err;
-    const g = normalized instanceof GatewayError ? normalized : null;
+    const multipartTooLarge = (normalized as { code?: string }).code === 'FST_REQ_FILE_TOO_LARGE';
+    const g = normalized instanceof GatewayError
+      ? normalized
+      : multipartTooLarge
+        ? new GatewayError('invalid_request_error', 'Import exceeds maximum size', { status: 413 })
+        : null;
     const status = g?.status ?? 500;
     const requestId = req.id as string;
     // Fastify runs with `logger: false`, so req.log is a silent no-op — use the app

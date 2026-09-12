@@ -161,10 +161,10 @@ function buildInitialSchemaSql(): string {
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
       slug TEXT NOT NULL UNIQUE,
-      type TEXT NOT NULL CHECK (type IN ('openai','anthropic')),
-      base_url TEXT NOT NULL,
-      encrypted_api_key TEXT NOT NULL,
-      api_key_nonce TEXT NOT NULL,
+      type TEXT NOT NULL CHECK (type IN ('openai','anthropic','codex')),
+            base_url TEXT NOT NULL,
+            encrypted_api_key TEXT,
+            api_key_nonce TEXT,
       api_key_version INTEGER NOT NULL DEFAULT 1,
       custom_headers_encrypted TEXT,
       custom_headers_nonce TEXT,
@@ -323,6 +323,37 @@ function buildInitialSchemaSql(): string {
     CREATE INDEX IF NOT EXISTS idx_request_requested ON requests(requested_model, created_at);
     CREATE INDEX IF NOT EXISTS idx_request_protocol ON requests(protocol, created_at);
 
+    CREATE TABLE IF NOT EXISTS codex_accounts (
+      id TEXT PRIMARY KEY,
+      provider_id TEXT NOT NULL REFERENCES providers(id) ON DELETE RESTRICT,
+      email TEXT,
+      workspace_id TEXT,
+      chatgpt_account_id TEXT,
+      plan_type TEXT,
+      encrypted_access_token TEXT NOT NULL,
+      access_token_nonce TEXT NOT NULL,
+      access_token_version INTEGER NOT NULL DEFAULT 1,
+      encrypted_refresh_token TEXT NOT NULL,
+      refresh_token_nonce TEXT NOT NULL,
+      refresh_token_version INTEGER NOT NULL DEFAULT 1,
+      encrypted_id_token TEXT,
+      id_token_nonce TEXT,
+      id_token_version INTEGER NOT NULL DEFAULT 1,
+      token_expires_at TEXT NOT NULL,
+      last_refresh_at TEXT,
+      auth_method TEXT NOT NULL DEFAULT 'oauth' CHECK (auth_method IN ('oauth','access_token')),
+      enabled INTEGER NOT NULL DEFAULT 1,
+      health_state TEXT NOT NULL DEFAULT 'unknown' CHECK (health_state IN ('healthy','degraded','down','unknown')),
+      last_error TEXT,
+      consecutive_failures INTEGER NOT NULL DEFAULT 0,
+      priority INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_codex_account_provider_enabled_priority ON codex_accounts(provider_id, enabled, priority);
+    CREATE INDEX IF NOT EXISTS idx_codex_account_provider_email ON codex_accounts(provider_id, email);
+    CREATE INDEX IF NOT EXISTS idx_codex_account_provider_chatgpt ON codex_accounts(provider_id, chatgpt_account_id);
+
     CREATE TABLE IF NOT EXISTS request_attempts (
       id TEXT PRIMARY KEY,
       request_id TEXT NOT NULL REFERENCES requests(id) ON DELETE CASCADE,
@@ -345,9 +376,11 @@ function buildInitialSchemaSql(): string {
       selection_reason TEXT NOT NULL,
       failure_reason TEXT,
       error_message TEXT,
-      upstream_request_id TEXT
+      upstream_request_id TEXT,
+      codex_account_id TEXT REFERENCES codex_accounts(id) ON DELETE SET NULL
     );
     CREATE INDEX IF NOT EXISTS idx_attempt_request ON request_attempts(request_id, attempt_number);
+    CREATE INDEX IF NOT EXISTS idx_attempt_codex_account ON request_attempts(codex_account_id, started_at);
     CREATE INDEX IF NOT EXISTS idx_attempt_provider_model ON request_attempts(provider_id, model_id, started_at);
 
     CREATE TABLE IF NOT EXISTS audit_logs (
