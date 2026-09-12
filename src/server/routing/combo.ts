@@ -87,7 +87,7 @@ function capabilityRejection(caps: ModelCapabilitiesInput, req: RequiredCapabili
   if (req.structuredOutput && caps.structured_output === false) return 'structured_output';
   if (req.imageInput && caps.image_input === false) return 'image_input';
   if (req.audioInput && caps.audio_input === false) return 'audio_input';
-  if (req.reasoning && caps.reasoning === false) return 'reasoning';
+
   if (req.responses && caps.responses === false) return 'responses';
   return 'capability_mismatch';
 }

@@ -36,4 +36,9 @@ describe('capability derivation', () => {
     expect(modelMeets({ streaming: true, tools: false }, req)).toBe(false);
     expect(modelMeets({ streaming: false, tools: true }, req)).toBe(false);
   });
+
+  it('does not reject a model only because reasoning metadata is false', () => {
+    const req = { streaming: true, tools: true, structuredOutput: false, imageInput: false, audioInput: false, reasoning: true, responses: false };
+    expect(modelMeets({ streaming: true, tools: true, reasoning: false }, req)).toBe(true);
+  });
 });

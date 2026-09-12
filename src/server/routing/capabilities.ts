@@ -90,7 +90,9 @@ export interface ModelCapabilitiesInput {
  * IMPORTANT: Treat undefined as "unknown" rather than "unsupported".
  * For generic OpenAI-compatible providers where capabilities weren't explicitly imported,
  * undefined means we don't know, so we should assume it's potentially supported.
- * Explicit false means "known unsupported".
+ * Explicit false means "known unsupported" for protocol capabilities such as
+ * tools, images, and streaming. Reasoning is advisory metadata because the
+ * upstream may support it even when discovery cannot identify it.
  */
 export function modelMeets(caps: ModelCapabilitiesInput, req: RequiredCapabilities): boolean {
   // Only reject if capability is explicitly false, not if unknown (undefined)
@@ -99,7 +101,7 @@ export function modelMeets(caps: ModelCapabilitiesInput, req: RequiredCapabiliti
   if (req.structuredOutput && caps.structured_output === false) return false;
   if (req.imageInput && caps.image_input === false) return false;
   if (req.audioInput && caps.audio_input === false) return false;
-  if (req.reasoning && caps.reasoning === false) return false;
+
   if (req.responses && caps.responses === false) return false;
   return true;
 }

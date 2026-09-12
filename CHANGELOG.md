@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.14.1] - 2026-09-12
+
+### Fixed
+
+- Do not reject any model solely because its stored `reasoning` capability is `false`; reasoning support is advisory for OpenAI-compatible providers and must not block Claude/Hermes requests.
+- Redact API-key digests and metadata from authentication debug logs.
+
 ## [1.14.0] - 2026-09-11
 
 ### Added
