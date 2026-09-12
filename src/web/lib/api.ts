@@ -32,7 +32,7 @@ async function parseResponse<T>(res: Response): Promise<T> {
   return parsed as T;
 }
 
-async function request<T>(method: string, path: string, body?: unknown, init?: RequestInit): Promise<T> {
+async function request<T>(method: string, path: string, body?: unknown, init?: RequestInit, retry = true): Promise<T> {
   const hasBody = body !== undefined;
   const headers: Record<string, string> = { ...(init?.headers as Record<string, string> | undefined) };
   if (hasBody && !headers['content-type']) headers['content-type'] = 'application/json';
@@ -44,17 +44,37 @@ async function request<T>(method: string, path: string, body?: unknown, init?: R
     body: hasBody ? JSON.stringify(body) : undefined,
     credentials: 'include',
   });
-  return parseResponse<T>(res);
+  try {
+    return await parseResponse<T>(res);
+  } catch (error) {
+    const authFailure = error instanceof ApiError && (error.status === 401 || error.status === 403) &&
+      (error.type === 'authentication_error' || error.type === 'csrf_error');
+    if (retry && authFailure && method !== 'GET' && method !== 'HEAD' && path !== '/api/admin/login') {
+      csrfToken = null;
+      return request<T>(method, path, body, init, false);
+    }
+    throw error;
+  }
 }
 
-async function upload<T>(path: string, form: FormData): Promise<T> {
+async function upload<T>(path: string, form: FormData, retry = true): Promise<T> {
   const res = await fetch(`${baseUrl}${path}`, {
     method: 'POST',
     headers: { [csrfHeader]: await getCsrfToken() },
     body: form,
     credentials: 'include',
   });
-  return parseResponse<T>(res);
+  try {
+    return await parseResponse<T>(res);
+  } catch (error) {
+    const authFailure = error instanceof ApiError && (error.status === 401 || error.status === 403) &&
+      (error.type === 'authentication_error' || error.type === 'csrf_error');
+    if (retry && authFailure) {
+      csrfToken = null;
+      return upload<T>(path, form, false);
+    }
+    throw error;
+  }
 }
 
 export const api = {

@@ -50,10 +50,27 @@ async function setLists(allow: string | null, block: string | null): Promise<voi
 }
 
 describe('admin-site IP access control', () => {
+  it('recreates missing and expired CSRF rows for an authenticated session', async () => {
+    const { getDb, schema } = await import('../../src/server/db/index');
+    getDb().delete(schema.csrfTokens).run();
+    const missing = await fetch(`${baseUrl}/api/admin/csrf`, { headers: { cookie: cookies } });
+    expect(missing.status).toBe(200);
+    const first = await missing.json() as { csrfToken: string };
+    expect(first.csrfToken).toHaveLength(43);
+
+    getDb().update(schema.csrfTokens).set({ expiresAt: new Date(0).toISOString() }).run();
+    const expired = await fetch(`${baseUrl}/api/admin/csrf`, { headers: { cookie: cookies } });
+    expect(expired.status).toBe(200);
+    const second = await expired.json() as { csrfToken: string };
+    expect(second.csrfToken).toHaveLength(43);
+    expect(second.csrfToken).not.toBe(first.csrfToken);
+  });
+
   it('no lists configured: everything reachable', async () => {
     const res = await fetch(`${baseUrl}/api/admin/providers`, { headers: { cookie: cookies } });
     expect(res.status).toBe(200);
   });
+
 
   it('block list matching the client IP kicks out the whole site (API + login), but /health stays open', async () => {
     await setLists(null, '127.0.0.1');

@@ -48,6 +48,26 @@ describe('api client request shaping', () => {
     expect(init.method).toBe('GET');
   });
 
+  it('invalidates a cached CSRF token and retries once after an auth failure', async () => {
+    let csrfCalls = 0;
+    let mutationCalls = 0;
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url.endsWith('/api/admin/csrf')) {
+        csrfCalls += 1;
+        return new Response(JSON.stringify({ csrfToken: `token-${csrfCalls}` }), { status: 200 });
+      }
+      mutationCalls += 1;
+      if (mutationCalls === 1) return new Response(JSON.stringify({ error: { type: 'authentication_error' } }), { status: 403 });
+      expect((init?.headers as Record<string, string>)['x-csrf-token']).toBe('token-2');
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await api.post('/api/admin/providers', { name: 'x' });
+    expect(csrfCalls).toBe(2);
+    expect(mutationCalls).toBe(2);
+  });
+
   it('DELETE without a body does NOT send content-type application/json', async () => {
     const fetchMock = mockFetch();
     vi.stubGlobal('fetch', fetchMock);
