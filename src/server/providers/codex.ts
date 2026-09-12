@@ -57,7 +57,8 @@ export async function codexModels(cfg: CodexProviderConfig): Promise<DiscoveredM
   const ctl = timeout(cfg.totalTimeoutMs);
   try {
     const response = await fetch(codexRequest(cfg, '/models'), { headers: codexHeaders(cfg), signal: ctl.signal });
-    if (!response.ok) throw new Error(`Provider returned HTTP ${response.status}`);
+    // status is required: withCodexCredentials keys its one-shot refresh-and-retry off it.
+    if (!response.ok) throw Object.assign(new Error(`Provider returned HTTP ${response.status}`), { status: response.status });
     const body = await response.json() as { models?: Array<{ id?: string; name?: string }> };
     return (body.models ?? []).filter((m): m is { id: string; name?: string } => typeof m.id === 'string').map((m) => ({
       upstreamId: m.id, displayName: m.name ?? m.id,

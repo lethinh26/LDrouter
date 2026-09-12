@@ -64,4 +64,10 @@ describe('Codex upstream adapter', () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({ models: [{ id: 'gpt-5-codex' }] }), { status: 200 })));
     await expect(probeCodex(config())).resolves.toMatchObject({ ok: true, modelCount: 1 });
   });
+
+  it('tags model-discovery HTTP failures with a status so the refresh-and-retry path can see them', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('denied', { status: 401 })));
+    // Without .status, isUnauthorized() cannot detect the 401 and a bare error escapes as a 500.
+    await expect(codexModels(config())).rejects.toMatchObject({ status: 401 });
+  });
 });

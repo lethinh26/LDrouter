@@ -52,6 +52,8 @@ The data directory defaults to `~/.latedev-router/` and can be overridden via `L
    `{ "accountId": "acct-…masked", "email": "admin@example.invalid", "tokens": { "accessToken": "[REDACTED]", "refreshToken": "[REDACTED]" } }`
 
    JSONL stores one similarly redacted object per line; an array uses the same records: `[ { "accountId": "acct-…masked", "tokens": { "accessToken": "[REDACTED]" } } ]`.
+
+   Alternatively, use **Connect Codex** to authorize a ChatGPT account in the browser. The dialog shows the Codex CLI PKCE authorize URL, waits for the loopback callback, and also accepts a pasted callback URL or bare authorization code. The PKCE verifier and the authorization code stay server-side and never appear in the UI. The Codex CLI callback (`http://localhost:1455/auth/callback`) is captured by `GET /oauth/codex/callback`; because browsers block that cross-origin redirect, paste the address bar URL into step 2 when the auto-capture page fails to load.
 4. Review the preview and import only the records you want. Account/workspace identity is preferred for deduplication; email alone never merges unrelated accounts. Re-importing the same identity updates its encrypted tokens while preserving its enabled state.
 
 Raw tokens are accepted only by the authenticated import pipeline and are never returned in previews, API responses, UI state, audit logs, request logs, errors, or database backups. JWT claims are decoded for metadata only; token signatures are not verified locally. Tokens are refreshed proactively near expiry and once after an upstream 401/403, with rotated values persisted atomically.
@@ -60,7 +62,7 @@ The import endpoint requires the normal admin session and CSRF token (`x-csrf-to
 
 ZIP upload and automatic Codex CLI config-file generation/mutation are not included in this release. LateDev Router does not modify Codex CLI files.
 
-The per-account **Test** control currently returns HTTP 501 (`not_implemented`) by design; it does not call upstream, change account health/enabled state, or expose tokens. Routing requests use the implemented Codex adapter and account pool.
+The account panel shows the 5-hour and weekly quota windows with reset countdowns, per-account and bulk usage refresh, weekly reset credits, an opt-in 5-hour window auto-start, and a **Test** control that probes the upstream account without exposing tokens. Routing order is set by dragging rows; the saved order is the fallback order the router uses. **Delete** is permanent and erases the stored encrypted credentials — past request logs are kept but lose the account reference.
 
 ## Environment variables
 

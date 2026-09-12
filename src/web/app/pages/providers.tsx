@@ -1,33 +1,35 @@
-// Providers page — list + create form.
+// Providers page — list + create form. Codex providers get a collapsible account-pool group
+// with quota, auto-start, and model import; the generic Add Provider modal never collects
+// Codex credentials (those come from Import accounts).
 import { Fragment, useEffect, useState } from 'react';
 import { PageHeader } from '../../components/ui/skeleton';
-import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '../../components/ui/card';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../../components/ui/card';
 import { Button } from '../../components/ui/button';
 import { Input } from '../../components/ui/input';
 import { Label } from '../../components/ui/label';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../../components/ui/table';
 import { Badge } from '../../components/ui/badge';
-import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from '../../components/ui/dialog';
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from '../../components/ui/dialog';
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from '../../components/ui/alert-dialog';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../../components/ui/select';
 import { Switch } from '../../components/ui/switch';
 import { api } from '../../lib/api';
 import { toast } from 'sonner';
-import { Plus, Play, Trash2, Upload, Settings2 } from 'lucide-react';
-import { CodexImportDialog } from '../../components/codex-import-dialog';
+import { ChevronDown, ChevronRight, Download, Play, Plus, Trash2, UserPlus } from 'lucide-react';
+import { CodexUsagePanel } from '../../components/codex-usage-panel';
+import { CodexDiscoverDialog } from '../../components/codex-discover-dialog';
 
 interface Provider {
   id: string; name: string; slug: string; type: 'openai' | 'anthropic' | 'codex'; baseUrl: string;
   enabled: boolean; health: string; modelCount: number;
 }
 
-interface CodexAccount {
-  id: string; email: string | null; accountIdMasked: string | null; workspaceIdMasked: string | null;
-  planType: string | null; tokenExpiresAt: string; enabled: boolean; healthState: string;
-  lastRefreshAt: string | null; priority: number;
-}
-
 const EMPTY = { name: '', slug: '', type: 'openai' as 'openai' | 'anthropic' | 'codex', baseUrl: 'https://api.openai.com', apiKey: '', customHeaders: '', enabled: true };
+// Codex uses the ChatGPT backend, not api.openai.com; prefill so operators do not guess.
+const CODEX_BASE_URL = 'https://chatgpt.com';
+const DEFAULT_BASE_URL: Record<'openai' | 'anthropic' | 'codex', string> = {
+  openai: 'https://api.openai.com', anthropic: 'https://api.anthropic.com', codex: CODEX_BASE_URL,
+};
 
 export function Providers() {
   const [rows, setRows] = useState<Provider[]>([]);
@@ -39,26 +41,18 @@ export function Providers() {
   const [editForm, setEditForm] = useState<typeof EMPTY>(EMPTY);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [deleteSubmitting, setDeleteSubmitting] = useState(false);
-  const [codexAccounts, setCodexAccounts] = useState<Record<string, CodexAccount[]>>({});
+  const [discoverProvider, setDiscoverProvider] = useState<Provider | null>(null);
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const requiresApiKey = form.type !== 'codex';
-  const [importProviderId, setImportProviderId] = useState<string | null>(null);
-  const [accountAction, setAccountAction] = useState<string | null>(null);
 
-  const reloadCodex = async (providerId: string) => {
-    try { const result = await api.get<{ accounts: CodexAccount[] }>(`/api/admin/codex/accounts?providerId=${encodeURIComponent(providerId)}`); setCodexAccounts((current) => ({ ...current, [providerId]: result.accounts })); }
-    catch (e) { toast.error((e as Error).message || 'Unable to load Codex accounts'); }
-  };
   const reload = async () => {
     try {
       const result = await api.get<{ providers: Provider[] }>('/api/admin/providers');
       setRows(result.providers);
-      await Promise.all(result.providers.filter((provider) => provider.type === 'codex').map((provider) => reloadCodex(provider.id)));
     } catch (e) { toast.error((e as Error).message || 'Unable to load providers'); }
   };
   // reload is intentionally stable for the page lifetime; mutations call it explicitly.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { void reload(); }, []);
-
   const submit = async () => {
     setSubmitting(true);
     try {
@@ -67,11 +61,12 @@ export function Providers() {
         try { customHeaders = JSON.parse(form.customHeaders); }
         catch { throw new Error('Custom headers must be valid JSON object'); }
       }
-      await api.post('/api/admin/providers', { name: form.name, slug: form.slug || undefined, type: form.type, baseUrl: form.baseUrl, apiKey: form.apiKey, customHeaders, enabled: form.enabled });
-      toast.success('Provider created');
+      await api.post('/api/admin/providers', { name: form.name, slug: form.slug || undefined, type: form.type, baseUrl: form.baseUrl, apiKey: form.type === 'codex' ? undefined : form.apiKey, customHeaders, enabled: form.enabled });
+      toast.success(form.type === 'codex' ? 'Codex provider created — add accounts next' : 'Provider created');
       setOpen(false);
       setForm(EMPTY);
-      void reload();
+      const result = await api.get<{ providers: Provider[] }>('/api/admin/providers');
+      setRows(result.providers);
     } catch (e) { toast.error((e as Error).message); }
     finally { setSubmitting(false); }
   };
@@ -109,26 +104,6 @@ export function Providers() {
     finally { setSubmitting(false); }
   };
 
-  // Runs after the AlertDialog confirmation — deletingId is the row under deletion.
-  const updateAccount = async (account: CodexAccount, changes: Record<string, unknown>) => {
-    setAccountAction(account.id);
-    try { await api.patch(`/api/admin/codex/accounts/${account.id}`, changes); toast.success('Codex account updated'); const provider = rows.find((item) => codexAccounts[item.id]?.some((row) => row.id === account.id)); if (provider) await reloadCodex(provider.id); }
-    catch (e) { toast.error((e as Error).message || 'Unable to update Codex account'); }
-    finally { setAccountAction(null); }
-  };
-  const testAccount = async (account: CodexAccount) => {
-    setAccountAction(account.id);
-    try { await api.post(`/api/admin/codex/accounts/${account.id}/test`); toast.success('Codex account test passed'); }
-    catch (e) { toast.error((e as Error).message || 'Codex account test failed'); }
-    finally { setAccountAction(null); }
-  };
-  const deleteAccount = async (account: CodexAccount) => {
-    setAccountAction(account.id);
-    try { await api.del(`/api/admin/codex/accounts/${account.id}`); toast.success('Codex account deleted'); const provider = rows.find((item) => codexAccounts[item.id]?.some((row) => row.id === account.id)); if (provider) await reloadCodex(provider.id); }
-    catch (e) { toast.error((e as Error).message || 'Unable to delete Codex account'); }
-    finally { setAccountAction(null); }
-  };
-
   const del = async (id: string) => {
     setDeleteSubmitting(true);
     try { await api.del(`/api/admin/providers/${id}`); toast.success('Provider removed'); void reload(); }
@@ -142,12 +117,15 @@ export function Providers() {
         <Dialog open={open} onOpenChange={setOpen}>
           <DialogTrigger asChild><Button><Plus className="mr-1 h-4 w-4" /> Add provider</Button></DialogTrigger>
           <DialogContent>
-            <DialogHeader><DialogTitle>New provider</DialogTitle></DialogHeader>
+            <DialogHeader>
+              <DialogTitle>New provider</DialogTitle>
+              <DialogDescription>{requiresApiKey ? 'API-key or compatible endpoint.' : 'Codex providers authenticate through imported ChatGPT accounts — no API key is stored.'}</DialogDescription>
+            </DialogHeader>
             <div className="space-y-3">
-              <div><Label>Name</Label><Input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></div>
-              <div><Label>Slug (optional)</Label><Input value={form.slug} onChange={(e) => setForm({ ...form, slug: e.target.value })} /></div>
+              <div><Label htmlFor="provider-name">Name</Label><Input id="provider-name" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></div>
+              <div><Label htmlFor="provider-slug">Slug (optional)</Label><Input id="provider-slug" value={form.slug} onChange={(e) => setForm({ ...form, slug: e.target.value })} /></div>
               <div><Label>Type</Label>
-                <Select value={form.type} onValueChange={(v) => setForm({ ...form, type: v as 'openai' | 'anthropic' | 'codex' })}>
+                <Select value={form.type} onValueChange={(v) => setForm((current) => ({ ...current, type: v as 'openai' | 'anthropic' | 'codex', baseUrl: DEFAULT_BASE_URL[v as 'openai' | 'anthropic' | 'codex'], apiKey: v === 'codex' ? '' : current.apiKey }))}>
                   <SelectTrigger><SelectValue /></SelectTrigger>
                   <SelectContent>
                     <SelectItem value="openai">OpenAI-compatible</SelectItem>
@@ -156,14 +134,16 @@ export function Providers() {
                   </SelectContent>
                 </Select>
               </div>
-              <div><Label>Base URL</Label><Input value={form.baseUrl} onChange={(e) => setForm({ ...form, baseUrl: e.target.value })} /></div>
-              <div><Label>API key</Label><Input type="password" value={form.apiKey} onChange={(e) => setForm({ ...form, apiKey: e.target.value })} /></div>
-              <div><Label>Custom headers (JSON)</Label><Input value={form.customHeaders} onChange={(e) => setForm({ ...form, customHeaders: e.target.value })} placeholder='{"X-Org":"acme"}' /></div>
+              <div><Label htmlFor="provider-base-url">Base URL</Label><Input id="provider-base-url" value={form.baseUrl} onChange={(e) => setForm({ ...form, baseUrl: e.target.value })} /></div>
+              {requiresApiKey
+                ? <div><Label htmlFor="provider-api-key">API key</Label><Input id="provider-api-key" type="password" value={form.apiKey} onChange={(e) => setForm({ ...form, apiKey: e.target.value })} /></div>
+                : <p className="rounded-md border border-dashed p-3 text-xs text-muted-foreground">After creating this provider, use <span className="font-medium">Import accounts</span> on its row to add Codex OAuth credentials.</p>}
+              <div><Label htmlFor="provider-headers">Custom headers (JSON)</Label><Input id="provider-headers" value={form.customHeaders} onChange={(e) => setForm({ ...form, customHeaders: e.target.value })} placeholder='{"X-Org":"acme"}' /></div>
               <div className="flex items-center gap-2"><Switch checked={form.enabled} onCheckedChange={(v) => setForm({ ...form, enabled: v })} /><Label>Enabled</Label></div>
             </div>
             <DialogFooter>
               <Button variant="outline" onClick={() => setOpen(false)}>Cancel</Button>
-              <Button disabled={submitting || !form.name || (requiresApiKey && !form.apiKey)} onClick={submit}>Create</Button>
+              <Button disabled={submitting || !form.name || (requiresApiKey && !form.apiKey)} onClick={submit}>{submitting ? 'Creating…' : requiresApiKey ? 'Create' : 'Create and add accounts'}</Button>
             </DialogFooter>
           </DialogContent>
         </Dialog>
@@ -196,23 +176,36 @@ export function Providers() {
                   <TableCell>{p.enabled ? 'Yes' : 'No'}</TableCell>
                   <TableCell className="text-right">
                     <div className="flex justify-end gap-1">
+                      {p.type === 'codex' && (
+                        <>
+                          <Button size="sm" variant={expanded[p.id] ? 'secondary' : 'outline'} aria-expanded={!!expanded[p.id]} onClick={() => setExpanded((current) => ({ ...current, [p.id]: !current[p.id] }))}>
+                            {expanded[p.id] ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+                            <span className="ml-1">Accounts</span>
+                          </Button>
+                          <Button size="sm" variant="outline" onClick={() => setDiscoverProvider(p)}><Download className="mr-1 h-3 w-3" /> Import models</Button>
+                        </>
+                      )}
                       <Button size="sm" variant="outline" disabled={testingId === p.id} onClick={() => test(p.id)}><Play className="h-3 w-3" /></Button>
                       <Button size="sm" variant="outline" onClick={() => startEdit(p)}>✎</Button>
                       <Button size="sm" variant="outline" onClick={() => setDeletingId(p.id)}><Trash2 className="h-3 w-3" /></Button>
                     </div>
                   </TableCell>
                 </TableRow>
-                {p.type === 'codex' && <TableRow><TableCell colSpan={7} className="bg-muted/30 p-4">
-                  <div className="mb-3 flex items-center justify-between"><div><h3 className="font-medium">Codex accounts</h3><p className="text-xs text-muted-foreground">OAuth accounts are masked and never expose token fields.</p></div><Button size="sm" onClick={() => setImportProviderId(p.id)}><Upload className="mr-1 h-4 w-4" /> Import accounts</Button></div>
-                  {(codexAccounts[p.id] ?? []).length === 0 ? <p className="py-3 text-sm text-muted-foreground">No Codex accounts imported yet.</p> : <div className="overflow-x-auto"><Table><TableHeader><TableRow><TableHead>Email / identity</TableHead><TableHead>Plan</TableHead><TableHead>Expiry</TableHead><TableHead>Health</TableHead><TableHead>Last refresh</TableHead><TableHead>Priority</TableHead><TableHead>Actions</TableHead></TableRow></TableHeader><TableBody>{(codexAccounts[p.id] ?? []).map((account) => <TableRow key={account.id}><TableCell><div>{account.email || 'Unknown email'}</div><div className="text-xs text-muted-foreground">{account.accountIdMasked || '—'}{account.workspaceIdMasked ? ` · ${account.workspaceIdMasked}` : ''}</div></TableCell><TableCell>{account.planType || '—'}</TableCell><TableCell>{new Date(account.tokenExpiresAt).toLocaleDateString()}</TableCell><TableCell><Badge variant={account.healthState === 'healthy' ? 'success' : account.healthState === 'down' ? 'destructive' : 'secondary'}>{account.healthState}</Badge></TableCell><TableCell>{account.lastRefreshAt ? new Date(account.lastRefreshAt).toLocaleString() : '—'}</TableCell><TableCell><Input aria-label={`Priority for ${account.email || account.id}`} className="w-20" type="number" value={account.priority} onChange={(event) => void updateAccount(account, { priority: Number(event.target.value) })} /></TableCell><TableCell><div className="flex gap-1"><Button size="sm" variant="outline" disabled={accountAction === account.id} onClick={() => void updateAccount(account, { enabled: !account.enabled })}>{account.enabled ? 'Disable' : 'Enable'}</Button><Button size="sm" variant="outline" aria-label={`Test Codex account ${account.email || account.id}`} disabled={accountAction === account.id} onClick={() => void testAccount(account)}><Settings2 className="h-3 w-3" /></Button><Button size="sm" variant="destructive" disabled={accountAction === account.id} onClick={() => { if (window.confirm('Delete this Codex account?')) void deleteAccount(account); }}>Delete</Button></div></TableCell></TableRow>)}</TableBody></Table></div>}
-                </TableCell></TableRow>}
+                {p.type === 'codex' && expanded[p.id] && (
+                  <TableRow>
+                    <TableCell colSpan={7} className="bg-muted/30">
+                      <CodexUsagePanel providerId={p.id} providerName={p.name} />
+                    </TableCell>
+                  </TableRow>
+                )}
                 </Fragment>
               ))}
-              {importProviderId && <CodexImportDialog providerId={importProviderId} open onOpenChange={(open) => { if (!open) setImportProviderId(null); }} onImported={() => void reloadCodex(importProviderId)} />}
             </TableBody>
           </Table>
         </CardContent>
       </Card>
+
+      {discoverProvider && <CodexDiscoverDialog providerId={discoverProvider.id} providerName={discoverProvider.name} open onOpenChange={(next) => { if (!next) setDiscoverProvider(null); }} onImported={() => void reload()} />}
 
       {/* Edit Dialog */}
       <Dialog open={!!editingId} onOpenChange={(open) => { if (!open) { setEditingId(null); setEditForm(EMPTY); } }}>
@@ -222,7 +215,7 @@ export function Providers() {
             <div><Label>Name</Label><Input value={editForm.name} onChange={(e) => setEditForm({ ...editForm, name: e.target.value })} /></div>
             <div><Label>Slug (optional)</Label><Input value={editForm.slug} onChange={(e) => setEditForm({ ...editForm, slug: e.target.value })} /></div>
             <div><Label>Type</Label>
-              <Select value={editForm.type} onValueChange={(v) => setEditForm({ ...editForm, type: v as 'openai' | 'anthropic' })}>
+              <Select value={editForm.type} onValueChange={(v) => setEditForm({ ...editForm, type: v as 'openai' | 'anthropic' | 'codex' })}>
                 <SelectTrigger><SelectValue /></SelectTrigger>
                 <SelectContent>
                   <SelectItem value="openai">OpenAI-compatible</SelectItem>
@@ -232,7 +225,9 @@ export function Providers() {
               </Select>
             </div>
             <div><Label>Base URL</Label><Input value={editForm.baseUrl} onChange={(e) => setEditForm({ ...editForm, baseUrl: e.target.value })} /></div>
-            <div><Label>API key (leave empty to keep current)</Label><Input type="password" value={editForm.apiKey} onChange={(e) => setEditForm({ ...editForm, apiKey: e.target.value })} /></div>
+            {editForm.type === 'codex'
+              ? <p className="rounded-md border border-dashed p-3 text-xs text-muted-foreground"><UserPlus className="mr-1 inline h-3 w-3" /> Codex credentials live in the account pool — manage them from the Accounts panel.</p>
+              : <div><Label>API key (leave empty to keep current)</Label><Input type="password" value={editForm.apiKey} onChange={(e) => setEditForm({ ...editForm, apiKey: e.target.value })} /></div>}
             <div><Label>Custom headers (JSON)</Label><Input value={editForm.customHeaders} onChange={(e) => setEditForm({ ...editForm, customHeaders: e.target.value })} placeholder='{"X-Org":"acme"}' /></div>
             <div className="flex items-center gap-2"><Switch checked={editForm.enabled} onCheckedChange={(v) => setEditForm({ ...editForm, enabled: v })} /><Label>Enabled</Label></div>
           </div>

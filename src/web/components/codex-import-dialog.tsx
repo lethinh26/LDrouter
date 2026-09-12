@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { api } from '../lib/api';
+import { toast } from 'sonner';
 import { Button } from './ui/button';
 import { Checkbox } from './ui/checkbox';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from './ui/dialog';
@@ -42,7 +43,7 @@ export function CodexImportDialog({ providerId, open, onOpenChange, onImported }
       const result = await api.upload<ImportResponse>('/api/admin/codex/accounts/import', makeForm(selected));
       onOpenChange(false); onImported();
       setFiles([]); setPaste(''); setPreview(null); setSelected([]);
-      window.dispatchEvent(new CustomEvent('toast', { detail: `${result.added} added, ${result.updated} updated, ${result.failed} failed` }));
+      toast.success(`${result.added} added, ${result.updated} updated, ${result.failed} failed`);
     } catch (e) { setError((e as Error).message || 'Unable to import accounts'); }
     finally { setBusy(false); }
   };

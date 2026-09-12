@@ -1,4 +1,19 @@
 import { getCodexCredentials, getCodexAccountRefreshState, persistCodexRefresh, setCodexAccountHealth, type DecryptedCodexCredentials } from '../db/repositories/codex-accounts';
+import { GatewayError } from '../errors';
+
+/**
+ * Maps the credential-layer's opaque error codes onto typed admin-facing errors. Call sites that
+ * must not leak a bare 500 wrap their `withCodexCredentials` call in this. Codex fixes credential
+ * failures by re-importing the account, not by re-saving a provider API key.
+ */
+export function codexCredentialError(error: unknown): unknown {
+  const code = error instanceof Error ? error.message : '';
+  if (code === 'account_not_found') return new GatewayError('invalid_request_error', 'Codex account not found', { status: 404 });
+  if (code === 'oauth_refresh_failed' || code === 'invalid_refresh_response' || code === 'credential_unavailable') {
+    return new GatewayError('authentication_error', 'Codex credentials could not be refreshed — re-import the account', { status: 401 });
+  }
+  return error;
+}
 
 export interface CodexRefreshAccount {
   tokenExpiresAt: string;

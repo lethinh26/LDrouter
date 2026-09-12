@@ -12,7 +12,7 @@ import type { Provider } from '../../db/schema';
 import { probeProvider, discoverProviderModels, type DiscoveredModel, type ProbeResult } from '../../providers/index';
 import { probeCodex, codexModels } from '../../providers/codex';
 import { listCodexAccountSummaries } from '../../db/repositories/codex-accounts';
-import { withCodexCredentials } from '../../providers/codex-refresh';
+import { codexCredentialError, withCodexCredentials } from '../../providers/codex-refresh';
 import { redactString } from '../../security/redact';
 
 const ProviderCreate = z.object({
@@ -171,7 +171,7 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
       const account = listCodexAccountSummaries(p.id).find((candidate) => candidate.enabled && candidate.healthState !== 'down');
       if (!account) throw new GatewayError('authentication_error', 'No eligible Codex account is configured', { status: 503 });
       const row = getRawDb().prepare('SELECT chatgpt_account_id AS accountId FROM codex_accounts WHERE id=?').get(account.id) as { accountId: string | null } | undefined;
-      const result = await withCodexCredentials(account.id, async (credentials) => probeCodex({ baseUrl: p.baseUrl, accountId: row?.accountId ?? '', accessToken: credentials.accessToken, customHeaders: {}, totalTimeoutMs: Math.min(p.totalTimeoutMs, 20000) }));
+      const result = await withCodexCredentials(account.id, async (credentials) => probeCodex({ baseUrl: p.baseUrl, accountId: row?.accountId ?? '', accessToken: credentials.accessToken, customHeaders: {}, totalTimeoutMs: Math.min(p.totalTimeoutMs, 20000) })).catch((error) => { throw codexCredentialError(error); });
       db.update(schema.providers).set({ healthState: result.ok ? 'healthy' : 'down', updatedAt: new Date().toISOString() }).where(eq(schema.providers.id, id)).run();
       recordAudit({ action: 'provider.test', success: result.ok, targetType: 'provider', targetId: id, targetName: p.name, ip: req.ip, metadata: { detail: redactString(result.detail) } });
       return { ...result, detail: redactString(result.detail) };
@@ -206,7 +206,7 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
       const account = listCodexAccountSummaries(p.id).find((candidate) => candidate.enabled && candidate.healthState !== 'down');
       if (!account) throw new GatewayError('authentication_error', 'No eligible Codex account is configured', { status: 503 });
       const row = getRawDb().prepare('SELECT chatgpt_account_id AS accountId FROM codex_accounts WHERE id=?').get(account.id) as { accountId: string | null } | undefined;
-      discovered = await withCodexCredentials(account.id, async (credentials) => codexModels({ baseUrl: p.baseUrl, accountId: row?.accountId ?? '', accessToken: credentials.accessToken, customHeaders: {}, totalTimeoutMs: 30000 }));
+      discovered = await withCodexCredentials(account.id, async (credentials) => codexModels({ baseUrl: p.baseUrl, accountId: row?.accountId ?? '', accessToken: credentials.accessToken, customHeaders: {}, totalTimeoutMs: 30000 })).catch((error) => { throw codexCredentialError(error); });
     } else {
       if (!p.encryptedApiKey || !p.apiKeyNonce) throw new GatewayError('invalid_request_error', 'Provider credentials are missing', { status: 501 });
       const apiKey = decryptSecret({ ciphertext: p.encryptedApiKey, nonce: p.apiKeyNonce, version: p.apiKeyVersion });

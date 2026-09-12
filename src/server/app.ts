@@ -220,6 +220,8 @@ export async function startApp(): Promise<App> {
   process.once('SIGTERM', () => void close('SIGTERM'));
   process.once('SIGINT', () => void close('SIGINT'));
   await app.listen({ host: cfg.host, port: cfg.port });
+  const { startCodexAutostart } = await import('./providers/codex-autostart');
+  startCodexAutostart();
   return app;
 }
 

@@ -51,7 +51,7 @@ export function identityFromCodexRecord(record: NormalizedCodexRecord): CodexIde
   };
 }
 
-export function toCodexAccountSummary(row: Pick<AccountRow, 'id' | 'email' | 'workspaceId' | 'chatgptAccountId' | 'planType' | 'tokenExpiresAt' | 'enabled' | 'healthState' | 'lastRefreshAt' | 'priority' | 'createdAt' | 'updatedAt'>): CodexAccountSummary {
+export function toCodexAccountSummary(row: Pick<AccountRow, 'id' | 'email' | 'workspaceId' | 'chatgptAccountId' | 'planType' | 'tokenExpiresAt' | 'enabled' | 'healthState' | 'lastRefreshAt' | 'priority' | 'createdAt' | 'updatedAt'> & { enabled: boolean | number }): CodexAccountSummary {
   return {
     id: row.id,
     email: row.email,
@@ -59,7 +59,8 @@ export function toCodexAccountSummary(row: Pick<AccountRow, 'id' | 'email' | 'wo
     workspaceIdMasked: maskCodexValue(row.workspaceId),
     planType: row.planType,
     tokenExpiresAt: row.tokenExpiresAt,
-    enabled: row.enabled,
+    // SQLite hands raw rows back as 0/1; the API contract (and the web UI) expects a boolean.
+    enabled: Boolean(row.enabled),
     healthState: row.healthState,
     lastRefreshAt: row.lastRefreshAt,
     priority: row.priority,
@@ -89,9 +90,9 @@ export function getCodexAccountById(id: string): { id: string; chatgptAccountId:
   return row.chatgptAccountId ? { id: row.id, chatgptAccountId: row.chatgptAccountId } : null;
 }
 
-export function listCodexAccountSummaries(providerId: string): CodexAccountSummary[] {
-  const rows = client().prepare(`SELECT id,email,workspace_id AS workspaceId,chatgpt_account_id AS chatgptAccountId,plan_type AS planType,token_expires_at AS tokenExpiresAt,enabled,health_state AS healthState,last_refresh_at AS lastRefreshAt,priority,created_at AS createdAt,updated_at AS updatedAt FROM codex_accounts WHERE provider_id=? ORDER BY priority,id`).all(providerId) as Array<Parameters<typeof toCodexAccountSummary>[0]>;
-  return rows.map(toCodexAccountSummary);
+export function listCodexAccountSummaries(providerId: string): CodexAccountDetail[] {
+  const rows = client().prepare(`SELECT id,email,workspace_id AS workspaceId,chatgpt_account_id AS chatgptAccountId,plan_type AS planType,token_expires_at AS tokenExpiresAt,enabled,health_state AS healthState,last_refresh_at AS lastRefreshAt,priority,codex_autostart_enabled AS autostart,codex_usage_json AS usageJson,codex_usage_error AS usageError,codex_usage_updated_at AS usageUpdatedAt,last_pinged_reset_at AS lastPingedResetAt,last_ping_at AS lastPingAt,created_at AS createdAt,updated_at AS updatedAt FROM codex_accounts WHERE provider_id=? ORDER BY priority,id`).all(providerId) as Array<Parameters<typeof toCodexAccountSummaryRow>[0]>;
+  return rows.map(toCodexAccountSummaryRow);
 }
 
 export function findCodexAccountForImport(providerId: string, identity: CodexIdentity): AccountRow | null {
@@ -200,4 +201,73 @@ export function setCodexAccountHealth(id: string, healthState: AccountRow['healt
 export function upsertCodexAccount(providerId: string, record: NormalizedCodexRecord): { id: string; status: 'added' | 'updated' } {
   const existing = findCodexAccountForImport(providerId, identityFromCodexRecord(record));
   return existing ? { id: updateCodexAccountFromImport(existing.id, record), status: 'updated' } : { id: insertCodexAccount(providerId, record), status: 'added' };
+}
+
+// ============================================================================
+// Quota snapshots and 5-hour window auto-start state
+// ============================================================================
+
+/** Stored quota snapshot for display. `unavailable` carries the upstream message, never a credential. */
+export interface StoredCodexUsage { quotas: Record<string, { used: number; total: number; remaining: number; resetAt: string | null }>; plan: string; limitReached: boolean; resetCredits: number; fetchedAt: string; unavailable?: string }
+
+export function saveCodexUsage(id: string, usage: StoredCodexUsage): void {
+  client().prepare('UPDATE codex_accounts SET codex_usage_json=?, codex_usage_updated_at=?, codex_usage_error=NULL, updated_at=? WHERE id=?')
+    .run(JSON.stringify(usage), usage.fetchedAt, nextUpdatedAt(id), id);
+}
+
+export function saveCodexUsageError(id: string, message: string): void {
+  client().prepare('UPDATE codex_accounts SET codex_usage_error=?, updated_at=? WHERE id=?').run(message.slice(0, 500), nextUpdatedAt(id), id);
+}
+
+export interface CodexAccountUsageRow {
+  id: string; providerId: string; accountId: string | null; enabled: boolean; autostart: boolean;
+  lastPingedResetAt: string | null; lastPingedResetKey: string | null; lastPingAt: string | null;
+  usage: StoredCodexUsage | null; usageError: string | null;
+}
+
+function parseUsage(raw: string | null): StoredCodexUsage | null {
+  if (!raw) return null;
+  try { return JSON.parse(raw) as StoredCodexUsage; } catch { return null; }
+}
+
+export function listCodexAccountUsage(providerId: string): CodexAccountUsageRow[] {
+  const rows = client().prepare('SELECT id,provider_id AS providerId,chatgpt_account_id AS accountId,enabled,codex_autostart_enabled AS autostart,last_pinged_reset_at AS lastPingedResetAt,last_pinged_reset_key AS lastPingedResetKey,last_ping_at AS lastPingAt,codex_usage_json AS usageJson,codex_usage_error AS usageError FROM codex_accounts WHERE provider_id=? ORDER BY priority,id').all(providerId) as Array<CodexAccountUsageRow & { usageJson: string | null }>;
+  return rows.map(({ usageJson, ...row }) => ({ ...row, autostart: Boolean(row.autostart), enabled: Boolean(row.enabled), usage: parseUsage(usageJson) }));
+}
+
+/** Auto-start targets: enabled accounts that opted in, for the 10-minute scheduler tick. */
+export function listCodexAutostartTargets(): Array<{ id: string; providerId: string; lastPingAt: string | null }> {
+  const rows = client().prepare('SELECT id,provider_id AS providerId,last_ping_at AS lastPingAt FROM codex_accounts WHERE enabled=1 AND codex_autostart_enabled=1').all() as Array<{ id: string; providerId: string; lastPingAt: string | null }>;
+  return rows;
+}
+
+export function markCodexAccountPinged(id: string, resetAt: string | null, resetKey: string | null): void {
+  const now = new Date().toISOString();
+  client().prepare('UPDATE codex_accounts SET last_pinged_reset_at=?, last_pinged_reset_key=?, last_ping_at=?, updated_at=? WHERE id=?')
+    .run(resetAt, resetKey, now, nextUpdatedAt(id), id);
+}
+
+/** Admin-facing account row: safe summary plus quota snapshot and auto-start state. */
+export interface CodexAccountDetail extends CodexAccountSummary {
+  autostart: boolean;
+  usage: StoredCodexUsage | null;
+  usageError: string | null;
+  usageUpdatedAt: string | null;
+  lastPingedResetAt: string | null;
+  lastPingAt: string | null;
+}
+
+export function toCodexAccountSummaryRow(row: Parameters<typeof toCodexAccountSummary>[0] & {
+  autostart?: boolean | number; usageJson?: string | null; usageError?: string | null; usageUpdatedAt?: string | null;
+  lastPingedResetAt?: string | null; lastPingAt?: string | null;
+}): CodexAccountDetail {
+  return {
+    ...toCodexAccountSummary(row),
+    autostart: Boolean(row.autostart),
+    usage: parseUsage(row.usageJson ?? null),
+    usageError: row.usageError ?? null,
+    usageUpdatedAt: row.usageUpdatedAt ?? null,
+    lastPingedResetAt: row.lastPingedResetAt ?? null,
+    lastPingAt: row.lastPingAt ?? null,
+  };
 }
