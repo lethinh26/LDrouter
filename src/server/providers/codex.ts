@@ -21,6 +21,18 @@ export interface CodexCanonicalResult {
 }
 
 const base = (url: string) => url.replace(/\/$/, '');
+/**
+ * Reported Codex CLI client version. The models endpoint rejects requests without it:
+ * `400 [{'loc': ('query', 'client_version'), 'msg': 'Field required'}]`.
+ */
+export const CODEX_CLIENT_VERSION = '0.144.6';
+
+/** Shape the Codex models endpoint returns; only the identifier and label are used. */
+interface CodexModelEntry {
+  slug?: string; id?: string; model?: string; name?: string;
+  display_name?: string; displayName?: string;
+}
+
 export function codexRequest(cfg: CodexProviderConfig, path: string): string {
   return `${base(cfg.baseUrl)}/backend-api/codex${path.startsWith('/') ? path : `/${path}`}`;
 }
@@ -56,14 +68,21 @@ export async function probeCodex(cfg: CodexProviderConfig): Promise<ProbeResult>
 export async function codexModels(cfg: CodexProviderConfig): Promise<DiscoveredModel[]> {
   const ctl = timeout(cfg.totalTimeoutMs);
   try {
-    const response = await fetch(codexRequest(cfg, '/models'), { headers: codexHeaders(cfg), signal: ctl.signal });
+    const response = await fetch(`${codexRequest(cfg, '/models')}?client_version=${CODEX_CLIENT_VERSION}`, { headers: codexHeaders(cfg), signal: ctl.signal });
     // status is required: withCodexCredentials keys its one-shot refresh-and-retry off it.
     if (!response.ok) throw Object.assign(new Error(`Provider returned HTTP ${response.status}`), { status: response.status });
-    const body = await response.json() as { models?: Array<{ id?: string; name?: string }> };
-    return (body.models ?? []).filter((m): m is { id: string; name?: string } => typeof m.id === 'string').map((m) => ({
-      upstreamId: m.id, displayName: m.name ?? m.id,
-      capabilities: { responses: true, streaming: true, reasoning: true },
-    }));
+    const body = await response.json() as { models?: CodexModelEntry[] } | CodexModelEntry[];
+    const entries = Array.isArray(body) ? body : body.models ?? [];
+    // Upstream identifies models by `slug`; other deployments may use id/model/name.
+    return entries.flatMap((entry) => {
+      const id = [entry.slug, entry.id, entry.model, entry.name].find((value): value is string => typeof value === 'string' && value.length > 0);
+      if (!id) return [];
+      return [{
+        upstreamId: id,
+        displayName: entry.display_name ?? entry.displayName ?? entry.name ?? id,
+        capabilities: { responses: true, streaming: true, reasoning: true },
+      }];
+    });
   } finally { ctl.cancel(); }
 }
 

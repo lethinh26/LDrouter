@@ -1,7 +1,8 @@
 import { describe, expect, it, vi, afterEach } from 'vitest';
 import { callCodexNonStreaming, callCodexStreaming, type CodexProviderConfig } from '../../src/server/providers/codex';
 
-afterEach(() => vi.restoreAllMocks());
+// restoreAllMocks does not un-stub stubGlobal; a leaked fetch stub breaks later integration files.
+afterEach(() => vi.unstubAllGlobals());
 const cfg: CodexProviderConfig = { baseUrl: 'https://chatgpt.com', accountId: 'a1', accessToken: 'tok', customHeaders: {}, totalTimeoutMs: 5_000 };
 const request = { model: 'gpt-5-codex', messages: [{ role: 'user' as const, content: [{ type: 'text' as const, text: 'hello' }] }], stream: false };
 

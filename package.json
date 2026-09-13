@@ -1,6 +1,6 @@
 {
   "name": "latedev-router",
-  "version": "1.16.0",
+  "version": "1.16.1",
   "description": "LateDev Router — lightweight self-hosted LLM gateway with admin UI",
   "type": "module",
   "license": "MIT",

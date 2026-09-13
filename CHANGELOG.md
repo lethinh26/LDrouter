@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.16.1] - 2026-09-13
+
+### Fixed
+
+- **Test connection** and **Import models** on the Codex accounts group always failed with `Gateway error`: the models request omitted the `client_version` query parameter the Codex endpoint requires, and the response was read from `models[].id` while the endpoint returns `models[].slug`, so discovery came back empty or errored.
+- Deleting a Codex provider failed with `Gateway error`: `codex_accounts.provider_id` is `ON DELETE RESTRICT`, so removing the provider last raised a raw SQLite constraint error. The provider delete now removes the provider and its Codex account pool in one transaction and reports how many accounts were deleted.
+
 ## [1.16.0] - 2026-09-13
 
 ### Added

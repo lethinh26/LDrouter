@@ -232,4 +232,19 @@ describe('authenticated Codex admin HTTP API', () => {
     expect(await unknown.text()).toContain('Authorization failed');
     expect(await (await fetch(`${baseUrl}/oauth/codex/callback?error=access_denied&state=${session.state}`)).text()).toContain('Authorization failed');
   });
+
+  it('deletes a Codex provider together with its account pool', async () => {
+    const { getRawDb } = await import('../../src/server/db');
+    const raw = getRawDb();
+    // codex_accounts.provider_id is ON DELETE RESTRICT: without cascading the account rows the
+    // delete threw a raw SQLite constraint error, which surfaced as 500 "Gateway error".
+    raw.prepare("INSERT INTO providers (id,name,slug,type,base_url) VALUES ('codex-del-probe','Probe','codex-del-probe','codex','https://codex.invalid')").run();
+    raw.prepare("INSERT INTO codex_accounts (id,provider_id,email,encrypted_access_token,access_token_nonce,encrypted_refresh_token,refresh_token_nonce,token_expires_at) VALUES ('acct-del-probe','codex-del-probe','probe@example.com','ct','n','ct','n','2099-01-01T00:00:00.000Z')").run();
+
+    const res = await fetch(`${baseUrl}/api/admin/providers/codex-del-probe`, { method: 'DELETE', headers: { cookie, 'x-csrf-token': csrf } });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ ok: true, codexAccountsDeleted: 1 });
+    expect(raw.prepare('SELECT COUNT(*) AS n FROM providers WHERE id=?').get('codex-del-probe')).toEqual({ n: 0 });
+    expect(raw.prepare('SELECT COUNT(*) AS n FROM codex_accounts WHERE provider_id=?').get('codex-del-probe')).toEqual({ n: 0 });
+  });
 });

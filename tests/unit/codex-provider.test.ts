@@ -10,7 +10,8 @@ import {
   type CodexProviderConfig,
 } from '../../src/server/providers/codex';
 
-afterEach(() => vi.restoreAllMocks());
+// restoreAllMocks does not un-stub stubGlobal; a leaked fetch stub breaks integration files.
+afterEach(() => vi.unstubAllGlobals());
 
 const config = (): CodexProviderConfig => ({
   baseUrl: 'https://chatgpt.com', accountId: 'acct-1', accessToken: 'access-secret',
@@ -30,9 +31,23 @@ describe('Codex upstream adapter', () => {
   });
 
   it('discovers models from the Codex model endpoint without importing them', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({ models: [{ id: 'gpt-5-codex', name: 'GPT-5 Codex' }] }), { status: 200 })));
+    // Real upstream shape: models are keyed by `slug`, not `id`.
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      models: [
+        { slug: 'gpt-5-codex', display_name: 'GPT-5 Codex' },
+        { slug: 'gpt-reserve', display_name: null },
+        { display_name: 'No identifier, must be skipped' },
+      ],
+    }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
     const models = await codexModels(config());
-    expect(models).toEqual([{ upstreamId: 'gpt-5-codex', displayName: 'GPT-5 Codex', capabilities: { responses: true, streaming: true, reasoning: true } }]);
+    expect(models).toEqual([
+      { upstreamId: 'gpt-5-codex', displayName: 'GPT-5 Codex', capabilities: { responses: true, streaming: true, reasoning: true } },
+      { upstreamId: 'gpt-reserve', displayName: 'gpt-reserve', capabilities: { responses: true, streaming: true, reasoning: true } },
+    ]);
+    // The endpoint rejects requests without the required client_version query parameter.
+    const requested = String(fetchMock.mock.calls[0]![0]);
+    expect(requested).toContain('/backend-api/codex/models?client_version=');
   });
 
   it('maps non-streaming responses and ignores unsupported fields', () => {

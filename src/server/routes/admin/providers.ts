@@ -157,9 +157,20 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
       recordAudit({ action: 'provider.soft_disable', success: true, targetType: 'provider', targetId: id, targetName: p.name, ip: req.ip });
       return { ok: true, softDisabled: true };
     }
-    db.delete(schema.providers).where(eq(schema.providers.id, id)).run();
-    recordAudit({ action: 'provider.delete', success: true, targetType: 'provider', targetId: id, targetName: p.name, ip: req.ip });
-    return { ok: true };
+    // A Codex provider owns its account pool. codex_accounts.provider_id is ON DELETE RESTRICT,
+    // so the accounts must go in the same transaction or the delete fails with a raw SQLite
+    // constraint error (which surfaces as an opaque 500 "Gateway error").
+    let codexAccountsDeleted = 0;
+    try {
+      getRawDb().transaction(() => {
+        codexAccountsDeleted = getRawDb().prepare('DELETE FROM codex_accounts WHERE provider_id=?').run(id).changes;
+        db.delete(schema.providers).where(eq(schema.providers.id, id)).run();
+      })();
+    } catch (error) {
+      throw new GatewayError('invalid_request_error', 'Provider is still referenced and cannot be deleted', { status: 409, cause: error });
+    }
+    recordAudit({ action: 'provider.delete', success: true, targetType: 'provider', targetId: id, targetName: p.name, ip: req.ip, metadata: { codexAccountsDeleted } });
+    return { ok: true, codexAccountsDeleted };
   });
 
   app.post('/api/admin/providers/:id/test', async (req) => {
