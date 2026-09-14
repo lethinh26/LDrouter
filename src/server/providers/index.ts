@@ -116,14 +116,39 @@ function inferOpenAICapabilities(id: string): DiscoveredModel['capabilities'] {
     chat: true,
     streaming: true,
     tools: !(lower.includes('embedding') || lower.includes('whisper') || lower.includes('dall-e') || lower.includes('tts')),
-    image_input: lower.includes('vision') || lower.includes('gpt-4o') || lower.includes('4-vision') || lower.includes('claude'),
-    structured_output: lower.includes('gpt-4') || lower.includes('gpt-3.5') || lower.includes('o1') || lower.includes('claude'),
-    reasoning: lower.includes('o1') || lower.includes('o3') || lower.includes('reasoning'),
+    // image_input / structured_output / reasoning are intentionally omitted.
+    // A guessed `false` is read as "known unsupported" and hard-rejects matching
+    // requests (docs/04 §capability filtering); docs/00 requires unknown
+    // capabilities to stay unknown, so leave them undefined (undefined = allow).
+    // ponytail: name-based guessing was wrong for most ids (e.g. qwen-vl-max,
+    // claude-sonnet-4-5). Upgrade path: a real /models metadata probe, or the
+    // admin capability override UI.
   };
 }
 
 function stripSlash(u: string): string {
   return u.endsWith('/') ? u.slice(0, -1) : u;
+}
+
+/**
+ * Merge freshly discovered capabilities into a stored model record.
+ *
+ * `baseline` is what discovery last wrote for this model. An admin edit is by
+ * definition a divergence from that baseline, so those keys survive a
+ * re-import; everything else is refreshed (this is what clears stale guesses
+ * such as `image_input: false`). A record with no baseline predates this
+ * tracking, so it is refreshed wholesale rather than preserved blindly.
+ */
+export function mergeDiscoveredCapabilities(
+  stored: Record<string, unknown>,
+  baseline: Record<string, unknown> | null,
+  discovered: Record<string, unknown>
+): { capabilities: Record<string, unknown>; baseline: Record<string, unknown> } {
+  const overrides: Record<string, unknown> = {};
+  if (baseline) {
+    for (const [k, v] of Object.entries(stored)) if (stored[k] !== baseline[k]) overrides[k] = v;
+  }
+  return { capabilities: { ...discovered, ...overrides }, baseline: discovered };
 }
 
 export { buildHeaders, fetchWithTimeout, stripSlash };

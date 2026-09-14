@@ -11,12 +11,36 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '.
 import { Checkbox } from '../../components/ui/checkbox';
 import { api } from '../../lib/api';
 import { toast } from 'sonner';
-import { Download, Trash2, FlaskConical, Loader2, Search, X } from 'lucide-react';
+import { Download, Trash2, FlaskConical, Loader2, Search, X, SlidersHorizontal } from 'lucide-react';
+
+// A capability the admin can declare. Anything left off stays "unknown",
+// which the router treats as allowed rather than unsupported.
+export const TUNABLE_CAPS = ['image_input', 'audio_input', 'tools', 'structured_output', 'reasoning', 'chat', 'streaming'] as const;
+export type TunableCap = typeof TUNABLE_CAPS[number];
+export const CAP_TRI = ['unknown', 'yes', 'no'] as const;
+export type CapTri = typeof CAP_TRI[number];
+
+/** Read a stored tri-state capability: absent = unknown. */
+export function capTri(caps: Record<string, unknown>, key: TunableCap): CapTri {
+  return caps[key] === true ? 'yes' : caps[key] === false ? 'no' : 'unknown';
+}
+
+/**
+ * Materialize the tri-state selection as the PATCH payload for one model.
+ * "unknown" is sent as null so the server removes the key: serializing it as
+ * `undefined` would drop it from the JSON body and leave the old value in place.
+ */
+export function capsPatch(tri: Record<string, CapTri>): Record<string, boolean | null> {
+  const out: Record<string, boolean | null> = {};
+  for (const k of TUNABLE_CAPS) out[k] = tri[k] === 'yes' ? true : tri[k] === 'no' ? false : null;
+  return out;
+}
 
 interface ModelRow {
   id: string; providerId: string; providerSlug: string; providerType: string;
   publicModelId: string; upstreamModelId: string; displayName: string;
   enabled: boolean; upstreamAvailable: boolean; capabilities: Record<string, unknown>;
+  discoveredCapabilities: Record<string, unknown> | null; maxContextTokens: number | null; maxOutputTokens: number | null;
 }
 interface Provider { id: string; name: string; slug: string; type: string; }
 interface Discovered { upstreamId: string; displayName: string; capabilities: Record<string, unknown>; alreadyImported: boolean; existingModelId: string | null; }
@@ -49,6 +73,31 @@ export function Models() {
   const [testOpen, setTestOpen] = useState(false);
   const [testResult, setTestResult] = useState<TestState | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<ModelRow | null>(null);
+  const [capTarget, setCapTarget] = useState<ModelRow | null>(null);
+  const [capTriState, setCapTriState] = useState<Record<string, CapTri>>({});
+  const [savingCaps, setSavingCaps] = useState(false);
+
+  const openCaps = (m: ModelRow) => {
+    const tri: Record<string, CapTri> = {};
+    for (const k of TUNABLE_CAPS) tri[k] = capTri(m.capabilities, k);
+    setCapTriState(tri);
+    setCapTarget(m);
+  };
+
+  const saveCaps = async () => {
+    if (!capTarget) return;
+    setSavingCaps(true);
+    try {
+      await api.patch('/api/admin/models', { id: capTarget.id, capabilities: capsPatch(capTriState) });
+      toast.success('Capabilities updated');
+      setCapTarget(null);
+      void reload();
+    } catch (e) {
+      toast.error((e as Error).message);
+    } finally {
+      setSavingCaps(false);
+    }
+  };
 
   const reload = async () => {
     const [m, p] = await Promise.all([
@@ -310,6 +359,9 @@ export function Models() {
                   <TableCell>{m.enabled ? 'Yes' : 'No'}</TableCell>
                   <TableCell className="text-right">
                     <div className="flex items-center justify-end gap-1">
+                      <Button size="sm" variant="outline" onClick={() => openCaps(m)} disabled={testingId !== null}>
+                        <SlidersHorizontal className="h-3.5 w-3.5" /> Capabilities
+                      </Button>
                       <Button size="sm" variant="outline" onClick={() => void testModel(m.id)} disabled={testingId !== null}>
                         {testingId === m.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <FlaskConical className="h-3.5 w-3.5" />} Test
                       </Button>
@@ -336,6 +388,48 @@ export function Models() {
           <DialogFooter>
             <Button variant="outline" onClick={() => setDeleteTarget(null)}>Huỷ</Button>
             <Button variant="destructive" onClick={handleDelete}>Xoá</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Capability override dialog */}
+      <Dialog open={capTarget !== null} onOpenChange={(o) => { if (!o) setCapTarget(null); }}>
+        <DialogContent className="max-w-lg">
+          <DialogHeader><DialogTitle>Capabilities — {capTarget?.publicModelId}</DialogTitle></DialogHeader>
+          <div className="space-y-1">
+            <p className="text-xs text-muted-foreground">
+              <strong>Unknown</strong> means the router has no verified answer and will attempt the request.{' '}
+              <strong>No</strong> blocks requests needing that capability (HTTP 400/502 before any upstream call).
+            </p>
+            {TUNABLE_CAPS.map((k) => {
+              const discovered = capTarget?.discoveredCapabilities?.[k];
+              return (
+                <div key={k} className="flex items-center justify-between gap-3 rounded px-1 py-1 text-sm hover:bg-accent">
+                  <span className="flex items-baseline gap-2">
+                    <code className="text-xs">{k}</code>
+                    <span className="text-xs text-muted-foreground">
+                      {discovered === undefined ? 'discovered: unknown' : `discovered: ${String(discovered)}`}
+                    </span>
+                  </span>
+                  <div className="flex gap-1">
+                    {CAP_TRI.map((t) => (
+                      <Button
+                        key={t}
+                        size="sm"
+                        variant={capTriState[k] === t ? 'default' : 'outline'}
+                        onClick={() => setCapTriState((prev) => ({ ...prev, [k]: t }))}
+                      >
+                        {t === 'unknown' ? 'Unknown' : t === 'yes' ? 'Yes' : 'No'}
+                      </Button>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setCapTarget(null)}>Huỷ</Button>
+            <Button onClick={saveCaps} disabled={savingCaps}>{savingCaps ? 'Saving…' : 'Lưu'}</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

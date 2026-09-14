@@ -4,7 +4,7 @@ import type { CanonicalRequest, CanonicalMessage, CanonicalContentBlock, Canonic
 
 export interface AnthropicMessage {
   role: 'user' | 'assistant';
-  content: string | Array<{ type: string; text?: string; source?: { type: string; media_type: string; data: string }; id?: string; name?: string; input?: unknown; content?: unknown | string; tool_use_id?: string; is_error?: boolean }>;
+  content: string | Array<{ type: string; text?: string; source?: { type: string; media_type?: string; data?: string; url?: string }; id?: string; name?: string; input?: unknown; content?: unknown | string; tool_use_id?: string; is_error?: boolean }>;
 }
 
 export interface AnthropicRequest {
@@ -83,7 +83,9 @@ function parseAnthropicUserContent(content: AnthropicMessage['content']): Canoni
       if (b.source.type === 'base64') {
         out.push({ type: 'image', image: { base64: b.source.data, mimeType: b.source.media_type } });
       } else if (b.source.type === 'url') {
-        out.push({ type: 'image', image: { url: b.source.data } });
+        // Anthropic's url source carries the image in `url`; only our own older
+        // base64->url downgrade ever put it in `data` (see canonicalToAnthropicRequest).
+        out.push({ type: 'image', image: { url: b.source.url ?? b.source.data } });
       }
     }
     if (b.type === 'tool_result') {
@@ -108,11 +110,11 @@ export function canonicalToAnthropicRequest(req: CanonicalRequest, targetModel: 
       if (allText) {
         messages.push({ role: 'user', content: m.content.map((b) => b.text ?? '').join('') });
       } else {
-        const blocks: Array<{ type: string; text?: string; source?: { type: string; media_type: string; data: string }; tool_use_id?: string; content?: unknown; is_error?: boolean }> = [];
+        const blocks: Array<{ type: string; text?: string; source?: { type: string; media_type?: string; data?: string; url?: string }; tool_use_id?: string; content?: unknown; is_error?: boolean }> = [];
         for (const b of m.content) {
           if (b.type === 'text' && b.text) blocks.push({ type: 'text', text: b.text });
           if (b.type === 'image' && b.image?.base64) blocks.push({ type: 'image', source: { type: 'base64', media_type: b.image.mimeType ?? 'image/png', data: b.image.base64 } });
-          if (b.type === 'image' && b.image?.url) blocks.push({ type: 'image', source: { type: 'url', media_type: 'image/png', data: b.image.url } });
+          else if (b.type === 'image' && b.image?.url) blocks.push({ type: 'image', source: { type: 'url', url: b.image.url } });
           if (b.type === 'tool_result') blocks.push({ type: 'tool_result', tool_use_id: b.toolResult!.toolUseId, content: b.toolResult!.content, is_error: b.toolResult!.isError });
         }
         messages.push({ role: 'user', content: blocks as never });

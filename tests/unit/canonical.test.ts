@@ -33,6 +33,32 @@ describe('OpenAI <-> canonical', () => {
     expect(out.messages[0]).toEqual({ role: 'user', content: 'hi' });
   });
 
+  it('parses chat image_url given as an object', () => {
+    const out = openAIToCanonical({
+      model: 'gpt-4o',
+      messages: [{ role: 'user', content: [
+        { type: 'text', text: 'what is this' },
+        { type: 'image_url', image_url: { url: 'https://example.com/cat.png' } },
+      ] }],
+    });
+    const blocks = out.messages[0]!.content;
+    expect(blocks[1]).toEqual({ type: 'image', image: { url: 'https://example.com/cat.png' } });
+  });
+
+  it('parses Responses-style input_text/input_image parts (string image_url)', () => {
+    const out = openAIToCanonical({
+      model: 'gpt-4o',
+      messages: [{ role: 'user', content: [
+        { type: 'input_text', text: 'what is this' },
+        { type: 'input_image', image_url: 'data:image/png;base64,AAAA' },
+      ] }],
+    });
+    expect(out.messages[0]!.content).toEqual([
+      { type: 'text', text: 'what is this' },
+      { type: 'image', image: { url: 'data:image/png;base64,AAAA' } },
+    ]);
+  });
+
   it('parses usage into normalized fields', () => {
     const r = openAIResponseToCanonical({
       id: 'x', object: 'chat.completion', created: 0, model: 'gpt',
@@ -74,6 +100,27 @@ describe('Anthropic <-> canonical', () => {
     expect(blocks[0]!.type).toBe('text');
     expect(blocks[1]!.type).toBe('image');
     expect(blocks[1]!.image?.base64).toBe('AAAA');
+  });
+
+  it('parses url image blocks (source.url, not source.data)', () => {
+    const out = anthropicToCanonical({
+      model: 'claude',
+      messages: [{ role: 'user', content: [
+        { type: 'image', source: { type: 'url', url: 'https://example.com/cat.png' } },
+      ] }],
+      max_tokens: 256,
+    });
+    expect(out.messages[0]!.content[0]!.image?.url).toBe('https://example.com/cat.png');
+  });
+
+  it('emits a valid Anthropic url source for a url image', () => {
+    const out = canonicalToAnthropicRequest({
+      model: 'claude',
+      messages: [{ role: 'user', content: [{ type: 'image', image: { url: 'https://example.com/cat.png' } }] }],
+      stream: false,
+    }, 'claude-3-5');
+    const block = (out.messages[0]!.content as Array<{ type: string; source: { type: string; url: string } }>)[0]!;
+    expect(block).toEqual({ type: 'image', source: { type: 'url', url: 'https://example.com/cat.png' } });
   });
 
   it('round-trips back to Anthropic with tool_use', () => {

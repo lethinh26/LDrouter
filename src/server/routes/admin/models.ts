@@ -20,11 +20,23 @@ const ModelUpdate = z.object({
   displayName: z.string().min(1).max(128).optional(),
   enabled: z.boolean().optional(),
   upstreamAvailable: z.boolean().optional(),
-  capabilities: z.record(z.any()).optional(),
+  // Values may be true / false / null. null clears the key back to "unknown",
+  // which the router treats as "not verified" rather than "unsupported".
+  capabilities: z.record(z.union([z.boolean(), z.null()])).optional(),
   cacheOverrideEnabled: z.boolean().nullable().optional(),
   maxContextTokens: z.number().int().min(1).nullable().optional(),
   maxOutputTokens: z.number().int().min(1).nullable().optional(),
 });
+
+/** Apply an admin capability override. `null` removes the key (= unknown). */
+function applyCapabilityOverrides(stored: Record<string, unknown>, patch: Record<string, unknown>): Record<string, unknown> {
+  const out = { ...stored };
+  for (const [k, v] of Object.entries(patch)) {
+    if (v === null) delete out[k];
+    else out[k] = v;
+  }
+  return out;
+}
 
 export async function registerModelRoutes(app: FastifyInstance): Promise<void> {
   app.addHook('preHandler', requireAdminAuth);
@@ -55,6 +67,7 @@ export async function registerModelRoutes(app: FastifyInstance): Promise<void> {
       enabled: m.enabled,
       upstreamAvailable: m.upstreamAvailable,
       capabilities: safeJson(m.capabilitiesJson),
+      discoveredCapabilities: m.discoveredMetadataJson ? safeJson(m.discoveredMetadataJson) : null,
       maxContextTokens: m.maxContextTokens,
       maxOutputTokens: m.maxOutputTokens,
       lastSeenUpstreamAt: m.lastSeenUpstreamAt,
@@ -71,7 +84,7 @@ export async function registerModelRoutes(app: FastifyInstance): Promise<void> {
 
     // Fetch discovered model metadata fresh (so import uses current discovery data)
     // For simplicity: re-discover and match by upstream id.
-    const { discoverProviderModels } = await import('../../providers/index');
+    const { discoverProviderModels, mergeDiscoveredCapabilities } = await import('../../providers/index');
     const { decryptSecret, decryptCustomHeaders } = await import('../../auth/crypto');
     const apiKey = decryptSecret({ ciphertext: provider.encryptedApiKey, nonce: provider.apiKeyNonce, version: provider.apiKeyVersion });
     const headers = decryptCustomHeaders(provider.customHeadersEncrypted && provider.customHeadersNonce ? { ciphertext: provider.customHeadersEncrypted, nonce: provider.customHeadersNonce, version: 1 } : null);
@@ -89,7 +102,23 @@ export async function registerModelRoutes(app: FastifyInstance): Promise<void> {
       const disc = discMap.get(upstreamId);
       const caps = (disc?.capabilities as Record<string, unknown>) ?? { chat: true, streaming: true, tools: true };
       if (existing) {
-        db.update(schema.models).set({ upstreamAvailable: true, lastSeenUpstreamAt: now, updatedAt: now }).where(eq(schema.models.id, existing.id)).run();
+        // Refresh capabilities so stale discoveries (e.g. a wrong
+        // `image_input: false`) heal on re-import, while admin edits survive.
+        const merged = mergeDiscoveredCapabilities(
+          safeJson(existing.capabilitiesJson),
+          existing.discoveredMetadataJson ? safeJson(existing.discoveredMetadataJson) : null,
+          caps
+        );
+        db.update(schema.models)
+          .set({
+            upstreamAvailable: true,
+            lastSeenUpstreamAt: now,
+            updatedAt: now,
+            capabilitiesJson: JSON.stringify(merged.capabilities),
+            discoveredMetadataJson: JSON.stringify(merged.baseline),
+          })
+          .where(eq(schema.models.id, existing.id))
+          .run();
         continue;
       }
       const publicModelId = `${provider.slug}/${upstreamId}`;
@@ -102,6 +131,7 @@ export async function registerModelRoutes(app: FastifyInstance): Promise<void> {
         enabled: true,
         upstreamAvailable: true,
         capabilitiesJson: JSON.stringify(caps),
+        discoveredMetadataJson: JSON.stringify(caps),
         maxContextTokens: typeof caps.max_context_tokens === 'number' ? caps.max_context_tokens : null,
         maxOutputTokens: typeof caps.max_output_tokens === 'number' ? caps.max_output_tokens : null,
         lastSeenUpstreamAt: now,
@@ -122,7 +152,7 @@ export async function registerModelRoutes(app: FastifyInstance): Promise<void> {
     if (body.enabled !== undefined) update.enabled = body.enabled;
     if (body.upstreamAvailable !== undefined) update.upstreamAvailable = body.upstreamAvailable;
     if (body.capabilities) {
-      const merged = { ...safeJson(m.capabilitiesJson), ...body.capabilities };
+      const merged = applyCapabilityOverrides(safeJson(m.capabilitiesJson), body.capabilities);
       update.capabilitiesJson = JSON.stringify(merged);
       if (typeof merged.max_context_tokens === 'number') update.maxContextTokens = merged.max_context_tokens;
       if (typeof merged.max_output_tokens === 'number') update.maxOutputTokens = merged.max_output_tokens;

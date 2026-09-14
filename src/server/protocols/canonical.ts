@@ -63,8 +63,12 @@ export function openAIToCanonical(req: OpenAIChatRequest): CanonicalRequest {
       if (typeof m.content === 'string' && m.content) blocks.push({ type: 'text', text: m.content });
       else if (Array.isArray(m.content)) {
         for (const c of m.content as Array<{ type: string; text?: string; image_url?: { url: string } }>) {
-          if (c.type === 'text' && c.text) blocks.push({ type: 'text', text: c.text });
-          else if (c.type === 'image_url' && c.image_url) blocks.push({ type: 'image', image: { url: c.image_url.url } });
+          const t = textBlock(c);
+          if (t) blocks.push(t);
+          else {
+            const u = imageUrlOf(c);
+            if (u) blocks.push({ type: 'image', image: { url: u } });
+          }
         }
       }
       if (m.tool_calls) {
@@ -218,13 +222,29 @@ function normalizeContent(content: unknown): CanonicalContentBlock[] {
   if (typeof content === 'string') return [{ type: 'text', text: content }];
   if (Array.isArray(content)) {
     const out: CanonicalContentBlock[] = [];
-    for (const b of content as Array<{ type: string; text?: string; image_url?: { url: string } }>) {
-      if (b.type === 'text' && b.text) out.push({ type: 'text', text: b.text });
-      if (b.type === 'image_url' && b.image_url) out.push({ type: 'image', image: { url: b.image_url.url } });
+    for (const b of content as Array<{ type: string; text?: string; image_url?: { url: string } | string }>) {
+      const t = textBlock(b);
+      if (t) out.push(t);
+      const u = imageUrlOf(b);
+      if (u) out.push({ type: 'image', image: { url: u } });
     }
     return out;
   }
   throw new GatewayError('invalid_request_error', 'Unsupported message content', { status: 400 });
+}
+
+// OpenAI Responses (`input_text`/`output_text`, `input_image`) and Chat
+// (`text`/`image_url`) use different part names for the same content.
+function textBlock(c: { type: string; text?: string }): CanonicalContentBlock | null {
+  if (!c.text) return null;
+  return c.type === 'text' || c.type === 'input_text' || c.type === 'output_text' ? { type: 'text', text: c.text } : null;
+}
+
+// `image_url` is an object in Chat Completions and a plain string in Responses.
+function imageUrlOf(c: { type?: string; image_url?: { url: string } | string }): string | undefined {
+  if (c.type !== 'image_url' && c.type !== 'input_image') return undefined;
+  if (typeof c.image_url === 'string') return c.image_url;
+  return typeof c.image_url?.url === 'string' ? c.image_url.url : undefined;
 }
 
 function safeJson(s: string): unknown {
