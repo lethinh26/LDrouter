@@ -4,6 +4,19 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.16.3] - 2026-09-14
+
+### Fixed
+
+- **Routing rejections now name the model and the reason.** A request a model could not serve answered `No available model candidates` (direct model) or `No combo member satisfies the request capabilities or availability` (combo) — the same failure described differently, naming neither the model nor the cause. Both paths now share one taxonomy of capability gaps and availability reasons, grouped per model and reported with the model name without its provider prefix (`vl/gpt-5.5` is reported as `gpt-5.5`).
+- **Error codes reached clients again.** `GatewayError.code` was dropped when each gateway route rebuilt the error from the runner outcome, so `rpm_limit`, `tpm_limit`, `quota_limit`, `concurrency_limit`, and `upstream_http_*` never left the process.
+- **Admin-disabled models answered `404 Unknown model`.** The resolver skipped disabled models, so callers looked for a typo in a model that had just been switched off; it now reports `model disabled`. The candidate loader also pre-filtered disabled models and providers, making the recorded reasons unreachable and collapsing every case into `model not found`.
+- **Upstream HTTP failures agreed across paths.** A 429 surfaced as 529 without a code on the non-streaming path and with one on another; all paths now share one mapping (429 → `upstream_http_429`, 401/403 → `upstream_http_401`/`upstream_http_403`, ≥500 → `upstream_http_503`).
+- **No internal JS errors in responses.** A 200 with an unexpected body shape surfaced `Cannot read properties of undefined (reading '0')`; it is now `Upstream response for "<model>" has no "choices" array` with code `upstream_bad_response`.
+- **Combo create/update no longer 500, leave orphans, or rename the public ID.** Uniqueness checked only `publicModelId` while `combos.slug` is its own UNIQUE column, duplicate members hit `UNIQUE(combo_id, model_id)`, and both operations ran outside a transaction — update deleting members before inserting the new ones. Saving the edit form unchanged also rewrote a public ID such as `smart` into `combo/smart`, breaking aliases and API keys. All uniqueness checks share one path, both operations are atomic, and the ID is never derived from the name.
+- **Image requests to image-capable models failed.** `/v1/responses` dropped `input_image` blocks, Anthropic inbound read URLs from `source.data`, and outbound Anthropic conversion emitted `{"type":"url","media_type","data"}` instead of `source.url`.
+- **Model capabilities are no longer guessed.** `inferOpenAICapabilities` wrote `image_input`, `structured_output`, and `reasoning` as `false` whenever a model name missed a substring heuristic, hard-rejecting `gpt-4o-2024-11-20`, `gemini-*`, `qwen-vl-*`, and `grok-*`. Unknown stays unknown; manual admin edits survive re-import.
+
 ## [1.14.1] - 2026-09-12
 
 ### Fixed
