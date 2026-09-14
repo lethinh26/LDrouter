@@ -37,7 +37,7 @@ Then visit `http://localhost:8787/` and complete the first-run admin setup.
 ### Using npm
 
 ```bash
-npx latedev-router
+npx ldrouter
 latedev-router --host 0.0.0.0 --port 8787
 ```
 

@@ -2,7 +2,7 @@
 
 ## npm package
 
-Publishable package name should be `latedev-router` if available. If registry naming requires a scope, keep the CLI binary name `latedev-router`.
+Publishable package name is **`ldrouter`**. The name `latedev-router` is held on the registry by an empty, treated-as-unpublished package, so writing a new version under it fails with `E409` until npm support releases it. Both binary names stay available: the package is `ldrouter` and exposes `ldrouter` and `latedev-router`.
 
 `package.json` must expose a binary entry:
 
@@ -33,7 +33,7 @@ npm pack --dry-run
 Required run modes:
 
 ```bash
-npx latedev-router
+npx ldrouter
 latedev-router
 latedev-router --host 0.0.0.0 --port 8787
 ```

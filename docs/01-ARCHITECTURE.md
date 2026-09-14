@@ -190,7 +190,7 @@ Production build should contain:
 CLI examples:
 
 ```bash
-npx latedev-router
+npx ldrouter
 latedev-router --host 0.0.0.0 --port 8787
 ```
 

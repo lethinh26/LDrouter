@@ -4,6 +4,12 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.16.2] - 2026-09-14
+
+### Fixed
+
+- npm release failed with `E409 Conflict - Failed to save packument`: the package had been renamed to `latedev-router`, which the registry still holds as an empty package after all of its versions were unpublished, so no new version can be written under that name. The package name is back to `ldrouter` (the name that last published successfully); the CLI still exposes both `ldrouter` and `latedev-router` binaries.
+
 ## [1.16.1] - 2026-09-13
 
 ### Fixed
