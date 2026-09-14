@@ -71,6 +71,20 @@ export interface StreamChunk {
   isLast: boolean;
 }
 
+/**
+ * One conversion of an upstream HTTP status into a gateway error, shared by the
+ * streaming and non-streaming paths so both report identical type/code/status.
+ * Before this, the same upstream 429 arrived as "Upstream rate limited" over a
+ * stream and "Upstream rate limited (HTTP 429)" without one, with a different
+ * code (or none) each time.
+ */
+export function upstreamHttpError(status: number, bodyExcerpt: string, cause?: unknown): GatewayError {
+  if (status >= 500) return new GatewayError('upstream_error', `Upstream HTTP ${status}`, { status: 502, cause, code: `upstream_http_${status}` });
+  if (status === 429) return new GatewayError('upstream_rate_limit', `Upstream rate limited (HTTP ${status})`, { status: 429, cause, code: 'upstream_http_429' });
+  if (status === 401 || status === 403) return new GatewayError('upstream_auth_error', `Upstream authentication failed (HTTP ${status})`, { status: 502, cause, code: `upstream_http_${status}` });
+  return new GatewayError('upstream_error', `Upstream HTTP ${status}: ${bodyExcerpt}`, { status: 502, cause, code: `upstream_http_${status}` });
+}
+
 export async function callUpstreamNonStreaming(cfg: UpstreamConfig, url: string, payload: unknown, requestId = '-'): Promise<UpstreamCall> {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), cfg.totalTimeoutMs);
@@ -214,10 +228,7 @@ export async function callUpstreamStreaming(
     };
   } catch (e) {
     if (e instanceof UpstreamHttpError) {
-      if (e.status >= 500) throw new GatewayError('upstream_error', `Upstream HTTP ${e.status}`, { status: 502, cause: e, code: 'upstream_http_' + e.status });
-      if (e.status === 429) throw new GatewayError('upstream_rate_limit', 'Upstream rate limited', { status: 529, cause: e });
-      if (e.status === 401 || e.status === 403) throw new GatewayError('upstream_auth_error', 'Upstream authentication failed', { status: 502, cause: e });
-      throw new GatewayError('upstream_error', `Upstream HTTP ${e.status}: ${e.bodyExcerpt}`, { status: 502, cause: e });
+      throw upstreamHttpError(e.status, e.bodyExcerpt, e);
     }
     const err = e as Error;
     errorLine(requestId, 'UPSTREAM FETCH ERROR', [

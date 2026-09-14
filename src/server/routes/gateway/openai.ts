@@ -7,7 +7,7 @@ import { getDb, schema } from '../../db/index';
 import { authenticateGatewayKey, type AuthenticatedKey } from '../../auth/api-key';
 import { resolveClientIp } from '../../util/client-ip';
 import { openAIToCanonical, openAIModelList, type OpenAIChatRequest } from '../../protocols/canonical';
-import { GatewayError, toOpenAIError } from '../../errors';
+import { GatewayError, toOpenAIError, outcomeError } from '../../errors';
 import { GatewayRunner, type GatewayContext } from '../../gateway/runner';
 import { uuid } from '../../auth/ids';
 import { lifecycle, debugHttp, debugBody, getDebugFlags, summarizeBody, summarizeMessages, summarizeTools, summarizeHeaders, sanitizeJson, truncate } from '../../logging/debug';
@@ -92,7 +92,7 @@ export async function registerOpenAIRoutes(app: FastifyInstance): Promise<void> 
         // the client should get a regular protocol error instead of a dangling
         // stream.
         if (!outcome.success) {
-          const g = new GatewayError((outcome.errorType as never) ?? 'gateway_error', outcome.errorMessage ?? 'Gateway error', { status: outcome.httpStatus });
+          const g = outcomeError(outcome);
           reply.code(outcome.httpStatus).send(toOpenAIError(g, ctx.requestId));
           return;
         }
@@ -101,7 +101,7 @@ export async function registerOpenAIRoutes(app: FastifyInstance): Promise<void> 
         return;
       }
       if (!outcome.success) {
-        const g = new GatewayError((outcome.errorType as never) ?? 'gateway_error', outcome.errorMessage ?? 'Gateway error', { status: outcome.httpStatus });
+        const g = outcomeError(outcome);
         lifecycle(requestId, 'DONE', [`status=${outcome.httpStatus} durationMs=${outcome.latencyMs} error=true type=${g.type}`]);
         reply.code(outcome.httpStatus).send(toOpenAIError(g, ctx.requestId));
         return;
@@ -182,7 +182,7 @@ export async function registerOpenAIRoutes(app: FastifyInstance): Promise<void> 
           return reply;
         }
         if (!outcome.success) {
-          const g = new GatewayError((outcome.errorType as never) ?? 'gateway_error', outcome.errorMessage ?? 'Gateway error', { status: outcome.httpStatus });
+          const g = outcomeError(outcome);
           reply.code(outcome.httpStatus).send(toOpenAIError(g, ctx.requestId));
           return;
         }
@@ -190,7 +190,7 @@ export async function registerOpenAIRoutes(app: FastifyInstance): Promise<void> 
         return;
       }
       if (!outcome.success) {
-        const g = new GatewayError((outcome.errorType as never) ?? 'gateway_error', outcome.errorMessage ?? 'Gateway error', { status: outcome.httpStatus });
+        const g = outcomeError(outcome);
         reply.code(outcome.httpStatus).send(toOpenAIError(g, ctx.requestId));
         return;
       }

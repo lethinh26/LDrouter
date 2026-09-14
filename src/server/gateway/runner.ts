@@ -4,13 +4,13 @@ import { getDb, schema } from '../db/index';
 import { eq } from 'drizzle-orm';
 import { GatewayError } from '../errors';
 import { resolveRequestedModel, unwrapAlias } from '../routing/resolver';
-import { deriveRequiredCapabilities, modelMeets, type CanonicalRequest, type RequiredCapabilities } from '../routing/capabilities';
+import { bareModelName, deriveRequiredCapabilities, describeRejections, firstMissingCapability, type CanonicalRequest, type RejectedMember, type RejectionReason, type RequiredCapabilities } from '../routing/capabilities';
 import { loadCombo, selectCandidates, orderCandidates, shouldFallback, type ComboPlan, type CandidateModel } from '../routing/combo';
 import { getEffectiveState, isOpen, recordSuccess, recordFailure, halfOpenProbeAllowed } from '../routing/circuit';
 import { checkRpm, checkTpm, acquireConcurrent, releaseConcurrent } from '../routing/ratelimit';
 import { checkDailyMonthly, consumeUsage } from '../routing/quota';
 import { keyAllowedFor, type AuthenticatedKey } from '../auth/api-key';
-import { providerToUpstreamConfig, callUpstreamNonStreaming, callUpstreamStreaming, upstreamUrl, type UpstreamCall } from '../upstream/client';
+import { providerToUpstreamConfig, callUpstreamNonStreaming, callUpstreamStreaming, upstreamUrl, upstreamHttpError, type UpstreamCall } from '../upstream/client';
 import { canonicalToOpenAIRequest, openAIResponseToCanonical } from '../protocols/canonical';
 import { canonicalToAnthropicRequest, anthropicResponseToCanonical } from '../protocols/anthropic';
 import { uuid } from '../auth/ids';
@@ -73,6 +73,9 @@ export interface GatewayOutcome {
   httpStatus: number;
   errorType: string | null;
   errorMessage: string | null;
+  /** Specific code (rpm_limit, upstream_http_429, capability_not_supported, …)
+   *  so the route layer can reproduce the exact error the runner raised. */
+  errorCode: string | null;
   text: string | null;
   toolCalls: Array<{ id: string; name: string; input: unknown }> | null;
   finishReason: string | null;
@@ -165,20 +168,21 @@ export class GatewayRunner {
 
       // --- Determine candidates ---
       let candidates: CandidateModel[] = [];
-      let selectionReasons: string[] = [];
+      const selectionReasons: string[] = [];
+      const rejected: RejectedMember[] = [];
       if (resolved.kind === 'model') {
-        candidates = await this.loadModelCandidate(resolved.modelId, required, ctx.requestId);
+        const loaded = await this.loadModelCandidate(resolved.modelId, required, ctx.requestId);
+        candidates = loaded.candidates;
+        rejected.push(...loaded.rejected);
         selectionReasons.push('direct_model');
-        if (candidates.length === 0) {
-          debugHttp(ctx.requestId, 'CAPABILITY REJECT', [
-            `model=${resolved.publicModelId}`,
-            `reason=direct_model_unavailable_or_capability_mismatch`,
-            '(direct model candidates rejected: not found / provider disabled / model disabled / upstream unavailable / circuit open / capability mismatch)',
-          ]);
-        }
       } else if (comboPlan) {
+        // A disabled combo is a configuration decision, not a routing failure:
+        // say so instead of blaming its members for not being available.
+        if (!resolved.enabled) {
+          const s = describeRejections({ kind: 'combo', publicModelId: resolved.publicModelId }, [{ publicModelId: resolved.publicModelId, reason: 'combo_disabled' }]);
+          throw new GatewayError(s.type, s.message, { status: s.status, code: s.type });
+        }
         const all = await this.loadAllModels();
-        const rejected: Array<{ publicModelId: string; reason: string }> = [];
         const filtered = selectCandidates(comboPlan, all, required, (c, reason) => {
           rejected.push({ publicModelId: c.publicModelId, reason });
           debugHttp(ctx.requestId, 'CAPABILITY REJECT', [`model=${c.publicModelId}`, `reason=${reason}`]);
@@ -191,7 +195,8 @@ export class GatewayRunner {
           ...rejected.map((r) => `rejected: ${r.publicModelId} reason=${r.reason}`),
         ]);
         if (filtered.length === 0) {
-          throw new GatewayError('capability_not_supported', 'No combo member satisfies the request capabilities or availability', { status: 400 });
+          const s = describeRejections({ kind: 'combo', publicModelId: resolved.publicModelId }, rejected);
+          throw new GatewayError(s.type, s.message, { status: s.status, code: s.type });
         }
         candidates = orderCandidates(comboPlan, filtered);
         debugHttp(ctx.requestId, 'CANDIDATES ORDERED', [
@@ -202,7 +207,8 @@ export class GatewayRunner {
       }
 
       if (candidates.length === 0) {
-        throw new GatewayError('upstream_unavailable', 'No available model candidates', { status: 502 });
+        const s = describeRejections({ kind: 'model', publicModelId: resolved.publicModelId }, rejected);
+        throw new GatewayError(s.type, s.message, { status: s.status, code: s.type });
       }
 
       // --- Gateway response cache check ---
@@ -379,6 +385,7 @@ export class GatewayRunner {
         httpStatus: lastError ? lastError.status : 200,
         errorType: lastError?.type ?? null,
         errorMessage: lastError ? redactString(lastError.message) : null,
+        errorCode: lastError?.code ?? null,
         text: lastError ? null : resultText,
         toolCalls: lastError ? null : resultToolCalls,
         finishReason: lastError ? null : resultFinishReason,
@@ -427,30 +434,39 @@ export class GatewayRunner {
     }
   }
 
-  private async loadModelCandidate(modelId: string, required: RequiredCapabilities, requestId?: string): Promise<CandidateModel[]> {
+  /** Resolve a direct physical model into a candidate, reporting the exact
+   *  reason it cannot serve the request instead of a blanket "no candidates". */
+  private async loadModelCandidate(
+    modelId: string,
+    required: RequiredCapabilities,
+    requestId?: string
+  ): Promise<{ candidates: CandidateModel[]; rejected: RejectedMember[] }> {
     const db = getDb();
-    const reject = (reason: string) => {
+    const reject = (publicModelId: string, reason: RejectionReason): RejectedMember[] => {
       if (requestId) debugHttp(requestId, 'CAPABILITY REJECT', [`modelId=${modelId}`, `reason=${reason}`]);
+      return [{ publicModelId, reason }];
     };
     const m = db.select().from(schema.models).where(eq(schema.models.id, modelId)).get();
-    if (!m) { reject('model_not_found'); return []; }
+    if (!m) return { candidates: [], rejected: reject(modelId, 'model_not_found') };
     const p = db.select().from(schema.providers).where(eq(schema.providers.id, m.providerId)).get();
-    if (!p) { reject('provider_not_found'); return []; }
-    if (!p.enabled) { reject('provider_disabled'); return []; }
+    if (!p) return { candidates: [], rejected: reject(m.publicModelId, 'provider_not_found') };
+    if (!p.enabled) return { candidates: [], rejected: reject(m.publicModelId, 'provider_disabled') };
     const caps = safeJson(m.capabilitiesJson);
     const candidate: CandidateModel = {
       modelId: m.id,
       publicModelId: m.publicModelId,
       providerId: m.providerId,
       enabled: m.enabled,
+      providerEnabled: p.enabled,
       upstreamAvailable: m.upstreamAvailable,
       circuitOpen: isOpen(m.providerId),
       capabilities: caps as never,
     };
-    if (!m.enabled) { reject('model_disabled'); return []; }
-    if (!m.upstreamAvailable) { reject('upstream_unavailable'); return []; }
-    if (candidate.circuitOpen) { reject('circuit_open'); return []; }
-    if (!modelMeets(caps, required)) { reject('capability_mismatch'); return []; }
+    if (!m.enabled) return { candidates: [], rejected: reject(m.publicModelId, 'model_disabled') };
+    if (!m.upstreamAvailable) return { candidates: [], rejected: reject(m.publicModelId, 'upstream_unavailable') };
+    if (candidate.circuitOpen) return { candidates: [], rejected: reject(m.publicModelId, 'circuit_open') };
+    const missing = firstMissingCapability(caps, required);
+    if (missing) return { candidates: [], rejected: reject(m.publicModelId, missing) };
     debugHttp(requestId ?? '-', 'CAPABILITY CANDIDATE', [
       `model=${m.publicModelId}`,
       `caps.tools=${(caps as { tools?: boolean }).tools}`,
@@ -459,7 +475,7 @@ export class GatewayRunner {
       `caps.image_input=${(caps as { image_input?: boolean }).image_input}`,
       `caps.structured_output=${(caps as { structured_output?: boolean }).structured_output}`,
     ]);
-    return [candidate];
+    return { candidates: [candidate], rejected: [] };
   }
 
   private async loadAllModels(): Promise<CandidateModel[]> {
@@ -467,15 +483,19 @@ export class GatewayRunner {
     const models = db.select().from(schema.models).all();
     const providers = db.select().from(schema.providers).all();
     const providerEnabled = new Map(providers.map((p) => [p.id, p.enabled]));
+    // Deliberately unfiltered: every combo member must reach selectCandidates so
+    // it can report WHY it was skipped. Pre-filtering here erased the model rows
+    // and turned every distinct reason into "model not found".
     return models.map((m) => ({
       modelId: m.id,
       publicModelId: m.publicModelId,
       providerId: m.providerId,
       enabled: m.enabled,
+      providerEnabled: providerEnabled.get(m.providerId),
       upstreamAvailable: m.upstreamAvailable,
       circuitOpen: isOpen(m.providerId),
       capabilities: safeJson(m.capabilitiesJson) as never,
-    })).filter((m) => m.enabled && m.upstreamAvailable && providerEnabled.get(m.providerId));
+    }));
   }
 
   private async runOneAttempt(
@@ -512,16 +532,24 @@ export class GatewayRunner {
       call = await callUpstreamNonStreaming(cfg, upstreamUrl(cfg, '/v1/messages'), payload, ctx.requestId);
     }
     if (!call.ok) {
-      if (call.status === 429) throw new GatewayError('upstream_rate_limit', `Upstream rate limited (HTTP ${call.status})`, { status: 429, code: 'upstream_http_429' });
-      if (call.status === 401 || call.status === 403) throw new GatewayError('upstream_auth_error', 'Upstream authentication failed', { status: 502 });
-      if (call.status >= 500) throw new GatewayError('upstream_error', `Upstream HTTP ${call.status}`, { status: 502, code: `upstream_http_${call.status}` });
-      throw new GatewayError('upstream_error', `Upstream HTTP ${call.status}: ${redactString(call.text.slice(0, 300))}`, { status: 502 });
+      throw upstreamHttpError(call.status, redactString(call.text.slice(0, 300)));
     }
     let parsed: unknown;
     try {
       parsed = JSON.parse(call.text);
     } catch {
-      throw new GatewayError('upstream_error', 'Upstream returned invalid JSON', { status: 502 });
+      throw new GatewayError('upstream_error', `Upstream returned invalid JSON for "${bareModelName(candidate.publicModelId)}"`, { status: 502, code: 'upstream_bad_response' });
+    }
+    // A 200 carrying the wrong shape used to explode into a raw
+    // "Cannot read properties of undefined (reading '0')" that reached the client
+    // verbatim. Name the model and the missing field instead.
+    const expectedField = cfg.type === 'openai' ? 'choices' : 'content';
+    if (!parsed || typeof parsed !== 'object' || !Array.isArray((parsed as Record<string, unknown>)[expectedField])) {
+      throw new GatewayError(
+        'upstream_error',
+        `Upstream response for "${bareModelName(candidate.publicModelId)}" has no "${expectedField}" array`,
+        { status: 502, code: 'upstream_bad_response' }
+      );
     }
     let result: { text: string; toolCalls: Array<{ id: string; name: string; input: unknown }>; finishReason: string | null };
     let usage: UsageSummary;
@@ -840,6 +868,7 @@ export class GatewayRunner {
       httpStatus: 200,
       errorType: null,
       errorMessage: null,
+      errorCode: null,
       text,
       toolCalls,
       finishReason,

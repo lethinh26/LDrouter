@@ -5,7 +5,7 @@ import { z } from 'zod';
 import { authenticateGatewayKey, type AuthenticatedKey } from '../../auth/api-key';
 import { resolveClientIp } from '../../util/client-ip';
 import { anthropicToCanonical, type AnthropicRequest } from '../../protocols/anthropic';
-import { GatewayError, toAnthropicError } from '../../errors';
+import { GatewayError, toAnthropicError, outcomeError } from '../../errors';
 import { GatewayRunner, type GatewayContext } from '../../gateway/runner';
 import { uuid } from '../../auth/ids';
 import { lifecycle, debugHttp, debugBody, getDebugFlags, summarizeMessages, summarizeTools, summarizeHeaders, sanitizeJson, truncate } from '../../logging/debug';
@@ -65,7 +65,7 @@ export async function registerAnthropicRoutes(app: FastifyInstance): Promise<voi
           return reply;
         }
         if (!outcome.success) {
-          const g = new GatewayError((outcome.errorType as never) ?? 'gateway_error', outcome.errorMessage ?? 'Gateway error', { status: outcome.httpStatus });
+          const g = outcomeError(outcome);
           reply.code(outcome.httpStatus).send(toAnthropicError(g, ctx.requestId));
           return;
         }
@@ -73,7 +73,7 @@ export async function registerAnthropicRoutes(app: FastifyInstance): Promise<voi
         return;
       }
       if (!outcome.success) {
-        const g = new GatewayError((outcome.errorType as never) ?? 'gateway_error', outcome.errorMessage ?? 'Gateway error', { status: outcome.httpStatus });
+        const g = outcomeError(outcome);
         lifecycle(requestId, 'DONE', [`status=${outcome.httpStatus} durationMs=${outcome.latencyMs} error=true type=${g.type}`]);
         reply.code(outcome.httpStatus).send(toAnthropicError(g, ctx.requestId));
         return;

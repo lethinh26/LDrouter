@@ -82,3 +82,15 @@ export function toAnthropicError(g: GatewayError, requestId?: string): { type: '
     ...(requestId ? { request_id: requestId } : {}),
   };
 }
+
+/**
+ * Rehydrate the error for the client from a gateway outcome. `errorCode` matters:
+ * without it every propagated failure lost its specific code (rpm_limit,
+ * upstream_http_429, …) and arrived as a bare type.
+ */
+export function outcomeError(outcome: { errorType: string | null; errorMessage: string | null; httpStatus: number; errorCode?: string | null }): GatewayError {
+  return new GatewayError((outcome.errorType as GatewayErrorType) ?? 'gateway_error', outcome.errorMessage ?? 'Gateway error', {
+    status: outcome.httpStatus,
+    ...(outcome.errorCode ? { code: outcome.errorCode } : {}),
+  });
+}

@@ -2,7 +2,7 @@
 
 import { eq } from 'drizzle-orm';
 import { getDb, schema } from '../db/index';
-import { RequiredCapabilities, ModelCapabilitiesInput, modelMeets } from './capabilities';
+import { RequiredCapabilities, ModelCapabilitiesInput, firstMissingCapability, type RejectionReason } from './capabilities';
 
 export interface ComboMember {
   id: string;
@@ -54,6 +54,8 @@ export interface CandidateModel {
   providerId: string;
   enabled: boolean;
   upstreamAvailable: boolean;
+  /** undefined = unknown (treated as usable); only an explicit false rejects. */
+  providerEnabled?: boolean;
   circuitOpen: boolean;
   capabilities: ModelCapabilitiesInput;
 }
@@ -62,7 +64,7 @@ export function selectCandidates(
   combo: ComboPlan,
   allModels: CandidateModel[],
   req: RequiredCapabilities,
-  onReject?: (candidate: { modelId: string; publicModelId: string }, reason: string) => void
+  onReject?: (candidate: { modelId: string; publicModelId: string }, reason: RejectionReason) => void
 ): CandidateModel[] {
   // Resolve each combo member to a candidate and apply filters
   const map = new Map(allModels.map((m) => [m.modelId, m]));
@@ -71,25 +73,15 @@ export function selectCandidates(
     if (!m.enabled) { onReject?.({ modelId: m.modelId, publicModelId: map.get(m.modelId)?.publicModelId ?? m.modelId }, 'member_disabled'); continue; }
     const c = map.get(m.modelId);
     if (!c) { onReject?.({ modelId: m.modelId, publicModelId: m.modelId }, 'model_not_found'); continue; }
+    if (c.providerEnabled === false) { onReject?.(c, 'provider_disabled'); continue; }
     if (!c.enabled) { onReject?.(c, 'model_disabled'); continue; }
     if (!c.upstreamAvailable) { onReject?.(c, 'upstream_unavailable'); continue; }
     if (c.circuitOpen) { onReject?.(c, 'circuit_open'); continue; }
-    if (!modelMeets(c.capabilities, req)) { onReject?.(c, capabilityRejection(c.capabilities, req)); continue; }
+    const missing = firstMissingCapability(c.capabilities, req);
+    if (missing) { onReject?.(c, missing); continue; }
     candidates.push(c);
   }
   return candidates;
-}
-
-/** First capability that explicitly failed (undefined = unknown caps never reject). */
-function capabilityRejection(caps: ModelCapabilitiesInput, req: RequiredCapabilities): string {
-  if (req.streaming && caps.streaming === false) return 'streaming';
-  if (req.tools && caps.tools === false) return 'tools';
-  if (req.structuredOutput && caps.structured_output === false) return 'structured_output';
-  if (req.imageInput && caps.image_input === false) return 'image_input';
-  if (req.audioInput && caps.audio_input === false) return 'audio_input';
-
-  if (req.responses && caps.responses === false) return 'responses';
-  return 'capability_mismatch';
 }
 
 export function orderCandidates(combo: ComboPlan, candidates: CandidateModel[]): CandidateModel[] {
