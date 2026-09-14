@@ -44,6 +44,60 @@ function comboSlug(input: string): string {
   );
 }
 
+/**
+ * A combo's slug and public id both have to be unique, and `slug` is NOT
+ * derivable from `public_model_id` (a slugless combo has slug "beta" and id
+ * "beta"; a slugged one has slug "beta" and id "combo/beta"). Checking only the
+ * public id lets a new name collide with an existing *slug*: the insert then
+ * dies as a raw SQLITE_CONSTRAINT and reaches the admin as an opaque
+ * 500 "Gateway error".
+ */
+function assertComboIdFree(db: ComboDb, slug: string, publicModelId: string, excludeId?: string): void {
+  const clash = db
+    .select()
+    .from(schema.combos)
+    .where(sql`public_model_id = ${publicModelId} OR slug = ${slug}`)
+    .all()
+    .find((c) => c.id !== excludeId);
+  if (clash) throw new GatewayError('invalid_request_error', 'Combo ID already in use', { status: 400 });
+  if (db.select().from(schema.models).where(eq(schema.models.publicModelId, publicModelId)).get()) {
+    throw new GatewayError('invalid_request_error', `A model with ID "${publicModelId}" already exists`, { status: 400 });
+  }
+}
+
+/** Slug triple the route / slug triple the runtime resolver expects. */
+function comboIds(name: string, slug?: string): { slug: string; publicModelId: string } {
+  const s = comboSlug(slug || name);
+  return { slug: s, publicModelId: slug ? `combo/${s}` : s };
+}
+
+/**
+ * `combo_members` is UNIQUE(combo_id, model_id) and the admin UI's member rows
+ * are the payload of record, so two rows for one model collapse silently. Reject
+ * that here: a member list is a set, and telling the operator beats a lost row.
+ */
+function assertMembersUsable(db: ComboDb, members: Array<{ modelId: string }>): void {
+  const ids = members.map((m) => m.modelId);
+  const dupes = ids.filter((id, i) => ids.indexOf(id) !== i);
+  if (dupes.length > 0) {
+    throw new GatewayError('invalid_request_error', `Duplicate members: ${[...new Set(dupes)].join(', ')}`, { status: 400 });
+  }
+  assertModelsExist(db, members);
+}
+
+function assertModelsExist(db: ComboDb, members: Array<{ modelId: string }>): void {
+  const models = db
+    .select()
+    .from(schema.models)
+    .where(sql`id IN (${sql.join(members.map((m) => sql`${m.modelId}`), sql`, `)})`)
+    .all();
+  if (models.length !== members.length) {
+    throw new GatewayError('invalid_request_error', 'One or more members are not valid physical models', { status: 400 });
+  }
+}
+
+type ComboDb = ReturnType<typeof getDb>;
+
 export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
   app.addHook('preHandler', requireAdminAuth);
 
@@ -103,42 +157,36 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
     const body = ComboCreate.parse(req.body);
     const db = getDb();
     // No slug given → the public id IS the normalized name (no "combo/" prefix).
-    const slug = comboSlug(body.slug ?? body.name);
-    const publicModelId = body.slug ? `combo/${slug}` : slug;
+    const { slug, publicModelId } = comboIds(body.name, body.slug);
     // The id must be globally unique across combos AND physical models — the
     // resolver treats every name as one routing surface.
-    if (db.select().from(schema.combos).where(eq(schema.combos.publicModelId, publicModelId)).get()) {
-      throw new GatewayError('invalid_request_error', 'Combo ID already in use', { status: 400 });
-    }
-    if (db.select().from(schema.models).where(eq(schema.models.publicModelId, publicModelId)).get()) {
-      throw new GatewayError('invalid_request_error', `A model with ID "${publicModelId}" already exists`, { status: 400 });
-    }
-
-    // Verify all referenced models exist and are physical
-    const modelIds = body.members.map((m) => m.modelId);
-    const models = db.select().from(schema.models).where(sql`id IN (${sql.join(modelIds.map((id) => sql`${id}`), sql`, `)})`).all();
-    if (models.length !== new Set(modelIds).size) throw new GatewayError('invalid_request_error', 'One or more members are not valid physical models', { status: 400 });
+    assertComboIdFree(db, slug, publicModelId);
+    assertMembersUsable(db, body.members);
 
     const id = uuid();
-    db.insert(schema.combos).values({
-      id,
-      name: body.name,
-      slug,
-      publicModelId,
-      mode: body.mode,
-      enabled: body.enabled ?? true,
-      maxTotalAttempts: body.maxTotalAttempts ?? 3,
-      fallbackOnConnection: body.fallbackOnConnection ?? true,
-      fallbackOnConnectTimeout: body.fallbackOnConnectTimeout ?? true,
-      fallbackOnFirstTokenTimeout: body.fallbackOnFirstTokenTimeout ?? true,
-      fallbackOn408: body.fallbackOn408 ?? true,
-      fallbackOn429: body.fallbackOn429 ?? true,
-      fallbackOn5xx: body.fallbackOn5xx ?? true,
-      configVersion: 1,
-    }).run();
-    for (const m of body.members) {
-      db.insert(schema.comboMembers).values({ id: uuid(), comboId: id, modelId: m.modelId, position: m.position, weight: m.weight ?? 1, enabled: m.enabled ?? true }).run();
-    }
+    // ponytail: one transaction — a combo row without its members is unroutable,
+    // and a half-applied create used to burn the name and report only "Gateway error".
+    db.transaction((tx) => {
+      tx.insert(schema.combos).values({
+        id,
+        name: body.name,
+        slug,
+        publicModelId,
+        mode: body.mode,
+        enabled: body.enabled ?? true,
+        maxTotalAttempts: body.maxTotalAttempts ?? 3,
+        fallbackOnConnection: body.fallbackOnConnection ?? true,
+        fallbackOnConnectTimeout: body.fallbackOnConnectTimeout ?? true,
+        fallbackOnFirstTokenTimeout: body.fallbackOnFirstTokenTimeout ?? true,
+        fallbackOn408: body.fallbackOn408 ?? true,
+        fallbackOn429: body.fallbackOn429 ?? true,
+        fallbackOn5xx: body.fallbackOn5xx ?? true,
+        configVersion: 1,
+      }).run();
+      for (const m of body.members) {
+        tx.insert(schema.comboMembers).values({ id: uuid(), comboId: id, modelId: m.modelId, position: m.position, weight: m.weight ?? 1, enabled: m.enabled ?? true }).run();
+      }
+    });
     recordAudit({ action: 'combo.create', success: true, targetType: 'combo', targetId: id, targetName: body.name, ip: req.ip, metadata: { members: body.members.length, mode: body.mode } });
     return { id, slug, publicModelId };
   });
@@ -150,17 +198,17 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
     if (!c) throw new GatewayError('invalid_request_error', 'Combo not found', { status: 404 });
     const update: Partial<typeof schema.combos.$inferInsert> = { updatedAt: new Date().toISOString(), configVersion: c.configVersion + 1 };
     if (body.name) update.name = body.name;
-    if (body.slug !== undefined) {
-      // Same rule as creation: empty slug → plain id, provided slug → combo/<slug>.
-      const slug = comboSlug(body.slug || body.name || c.name);
-      const publicModelId = body.slug ? `combo/${slug}` : slug;
-      const clashCombo = db.select().from(schema.combos).where(eq(schema.combos.publicModelId, publicModelId)).get();
-      if (clashCombo && clashCombo.id !== body.id) throw new GatewayError('invalid_request_error', 'Combo ID already in use', { status: 400 });
-      if (db.select().from(schema.models).where(eq(schema.models.publicModelId, publicModelId)).get()) {
-        throw new GatewayError('invalid_request_error', `A model with ID "${publicModelId}" already exists`, { status: 400 });
+    // Same rule as creation: no slug → the id IS the (normalized) name, slug →
+    // combo/<slug>. Deliberately no `|| body.name || c.name` fallback: a request
+    // carrying neither field would otherwise re-derive the id from the current
+    // name and silently rename the combo (or degrade it to "item").
+    if (body.name !== undefined || body.slug !== undefined) {
+      const { slug, publicModelId } = comboIds(body.name ?? c.name, body.slug);
+      if (slug !== c.slug || publicModelId !== c.publicModelId) {
+        assertComboIdFree(db, slug, publicModelId, body.id);
+        update.slug = slug;
+        update.publicModelId = publicModelId;
       }
-      update.slug = slug;
-      update.publicModelId = publicModelId;
     }
     if (body.mode) update.mode = body.mode;
     if (body.enabled !== undefined) update.enabled = body.enabled;
@@ -171,12 +219,19 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
     if (body.fallbackOn408 !== undefined) update.fallbackOn408 = body.fallbackOn408;
     if (body.fallbackOn429 !== undefined) update.fallbackOn429 = body.fallbackOn429;
     if (body.fallbackOn5xx !== undefined) update.fallbackOn5xx = body.fallbackOn5xx;
-    db.update(schema.combos).set(update).where(eq(schema.combos.id, body.id)).run();
     if (body.members) {
-      db.delete(schema.comboMembers).where(eq(schema.comboMembers.comboId, body.id)).run();
-      for (const m of body.members) {
-        db.insert(schema.comboMembers).values({ id: uuid(), comboId: body.id, modelId: m.modelId, position: m.position, weight: m.weight ?? 1, enabled: m.enabled ?? true }).run();
-      }
+      assertMembersUsable(db, body.members);
+      // Replace members inside one transaction: the delete-then-insert used to
+      // leave the combo memberless (and so unroutable) if any insert failed.
+      db.transaction((tx) => {
+        tx.update(schema.combos).set(update).where(eq(schema.combos.id, body.id)).run();
+        tx.delete(schema.comboMembers).where(eq(schema.comboMembers.comboId, body.id)).run();
+        for (const m of body.members!) {
+          tx.insert(schema.comboMembers).values({ id: uuid(), comboId: body.id, modelId: m.modelId, position: m.position, weight: m.weight ?? 1, enabled: m.enabled ?? true }).run();
+        }
+      });
+    } else {
+      db.update(schema.combos).set(update).where(eq(schema.combos.id, body.id)).run();
     }
     // Invalidate cache for this combo
     const { invalidateCacheFor } = await import('../../caching/store');

@@ -66,7 +66,11 @@ export function Combos() {
       setEditingId(d.id);
       setEditForm({
         name: d.name,
-        slug: d.slug ?? '',
+        // The server derives `slug` from the name for slugless combos, but
+        // `publicModelId` is the real switch for the "combo/" prefix. Seeding the
+        // box from `slug` made every "open edit → save" round-trip look like the
+        // operator had typed a slug, which re-prefixed the model ID.
+        slug: d.publicModelId.startsWith('combo/') ? d.slug : '',
         mode: d.mode as 'fallback' | 'weighted_round_robin',
         enabled: d.enabled,
         members: d.members.map((m) => ({ modelId: m.modelId, weight: m.weight, position: m.position, enabled: m.enabled })),
@@ -110,7 +114,7 @@ export function Combos() {
             <DialogHeader><DialogTitle>New combo</DialogTitle></DialogHeader>
             <div className="space-y-3">
               <div><Label>Name</Label><Input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></div>
-              <div><Label>Slug (optional — leave empty to use the name as the model ID)</Label><Input value={form.slug} onChange={(e) => setForm({ ...form, slug: e.target.value })} placeholder="empty → gpt-5.5 · set → combo/gpt-5.5" /></div>
+              <div><Label>Slug (optional — empty uses the name as the model ID)</Label><Input value={form.slug} onChange={(e) => setForm({ ...form, slug: e.target.value })} placeholder="empty → gpt-5.5 · set → combo/gpt-5.5" /></div>
               <div><Label>Mode</Label>
                 <Select value={form.mode} onValueChange={(v) => setForm({ ...form, mode: v as 'fallback' | 'weighted_round_robin' })}>
                   <SelectTrigger><SelectValue /></SelectTrigger>
