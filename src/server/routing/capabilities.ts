@@ -97,6 +97,7 @@ export type RejectionReason =
   | 'circuit_open'
   | 'combo_disabled'
   | 'member_disabled'
+  | 'codex_account_unavailable'
   | 'streaming'
   | 'tools'
   | 'structured_output'
@@ -133,6 +134,7 @@ const NON_CAPABILITY_TEXT: Partial<Record<RejectionReason, string>> = {
   circuit_open: 'provider circuit is open',
   combo_disabled: 'combo disabled',
   member_disabled: 'disabled in this combo',
+  codex_account_unavailable: 'no available Codex account',
 };
 
 const REASON_TEXT: Record<RejectionReason, string> = {

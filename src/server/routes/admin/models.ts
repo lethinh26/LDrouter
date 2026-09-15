@@ -86,11 +86,25 @@ export async function registerModelRoutes(app: FastifyInstance): Promise<void> {
     // For simplicity: re-discover and match by upstream id.
     const { discoverProviderModels, mergeDiscoveredCapabilities } = await import('../../providers/index');
     const { decryptSecret, decryptCustomHeaders } = await import('../../auth/crypto');
-    const apiKey = decryptSecret({ ciphertext: provider.encryptedApiKey, nonce: provider.apiKeyNonce, version: provider.apiKeyVersion });
-    const headers = decryptCustomHeaders(provider.customHeadersEncrypted && provider.customHeadersNonce ? { ciphertext: provider.customHeadersEncrypted, nonce: provider.customHeadersNonce, version: 1 } : null);
+    const { codexModels } = await import('../../providers/codex');
+    const { getCodexAccountById, listCodexAccountSummaries } = await import('../../db/repositories/codex-accounts');
+    const { withCodexCredentials } = await import('../../providers/codex-refresh');
     let discovered: Array<{ upstreamId: string; displayName: string; capabilities: Record<string, unknown> }>;
     try {
-      discovered = await discoverProviderModels({ type: provider.type, baseUrl: provider.baseUrl, apiKey, customHeaders: headers, connectTimeoutMs: 5000, totalTimeoutMs: 30000 });
+      if (provider.type === 'codex') {
+        const summary = listCodexAccountSummaries(provider.id).find((candidate) => candidate.enabled && candidate.healthState !== 'down');
+        const account = summary ? getCodexAccountById(summary.id) : null;
+        if (!account) throw new GatewayError('authentication_error', 'No eligible Codex account is configured', { status: 503 });
+        discovered = await withCodexCredentials(account.id, (credentials) => codexModels({
+          baseUrl: provider.baseUrl, accountId: account.chatgptAccountId, accessToken: credentials.accessToken,
+          accountRecordId: account.id, customHeaders: {}, totalTimeoutMs: Math.min(provider.totalTimeoutMs, 30000),
+        }));
+      } else {
+        if (!provider.encryptedApiKey || !provider.apiKeyNonce) throw new GatewayError('invalid_request_error', 'Provider credentials are missing', { status: 501 });
+        const apiKey = decryptSecret({ ciphertext: provider.encryptedApiKey, nonce: provider.apiKeyNonce, version: provider.apiKeyVersion });
+        const headers = decryptCustomHeaders(provider.customHeadersEncrypted && provider.customHeadersNonce ? { ciphertext: provider.customHeadersEncrypted, nonce: provider.customHeadersNonce, version: 1 } : null);
+        discovered = await discoverProviderModels({ type: provider.type, baseUrl: provider.baseUrl, apiKey, customHeaders: headers, connectTimeoutMs: 5000, totalTimeoutMs: 30000 });
+      }
     } catch {
       discovered = [];
     }

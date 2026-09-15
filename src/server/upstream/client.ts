@@ -4,17 +4,21 @@ import type { Provider } from '../db/schema';
 import { decryptSecret, decryptCustomHeaders } from '../auth/crypto';
 import { GatewayError } from '../errors';
 import { buildHeaders, stripSlash } from '../providers/index';
+import { redactString } from '../security/redact';
+import { getCodexAccountForProvider, getCodexAccountById } from '../db/repositories/codex-accounts';
 import { debugUpstream, errorLine, formatError, truncate } from '../logging/debug';
 
 export interface UpstreamConfig {
-  type: 'openai' | 'anthropic';
+  type: 'openai' | 'anthropic' | 'codex';
   baseUrl: string;
-  apiKey: string;
+  apiKey?: string;
   customHeaders: Record<string, string>;
   connectTimeoutMs: number;
   firstTokenTimeoutMs: number;
   streamIdleTimeoutMs: number;
   totalTimeoutMs: number;
+  codexAccountId?: string;
+  accountRecordId?: string;
 }
 
 export interface UpstreamResult {
@@ -24,9 +28,22 @@ export interface UpstreamResult {
   upstreamRequestId: string | null;
 }
 
-export function providerToUpstreamConfig(p: Provider): UpstreamConfig {
+export function providerToUpstreamConfig(p: Provider, codexAccountId?: string): UpstreamConfig {
   let apiKey: string;
   let customHeaders: Record<string, string>;
+  if (p.type === 'codex') {
+    const account = codexAccountId ? getCodexAccountById(codexAccountId) : getCodexAccountForProvider(p.id);
+    if (!account) throw new GatewayError('authentication_error', 'No usable Codex account is configured', { status: 503 });
+    return {
+      type: 'codex', baseUrl: p.baseUrl, customHeaders: {},
+      connectTimeoutMs: p.connectTimeoutMs, firstTokenTimeoutMs: p.firstTokenTimeoutMs,
+      streamIdleTimeoutMs: p.streamIdleTimeoutMs, totalTimeoutMs: p.totalTimeoutMs,
+      codexAccountId: account.chatgptAccountId, accountRecordId: account.id,
+    };
+  }
+  if (!p.encryptedApiKey || !p.apiKeyNonce) {
+    throw new GatewayError('invalid_request_error', 'Provider credentials are missing', { status: 501 });
+  }
   try {
     apiKey = decryptSecret({ ciphertext: p.encryptedApiKey, nonce: p.apiKeyNonce, version: p.apiKeyVersion });
   } catch {
@@ -92,7 +109,7 @@ export async function callUpstreamNonStreaming(cfg: UpstreamConfig, url: string,
   try {
     const res = await fetch(url, {
       method: 'POST',
-      headers: { ...buildHeaders(cfg), 'content-type': 'application/json', accept: 'application/json' },
+      headers: { ...buildHeaders({ ...cfg, apiKey: cfg.apiKey ?? '' }), 'content-type': 'application/json', accept: 'application/json' },
       body: JSON.stringify(payload),
       signal: ctl.signal,
     });
@@ -140,7 +157,7 @@ function logUpstreamResponse(requestId: string, status: number, statusText: stri
     `upstreamRequestId=${extractUpstreamRequestId(headers) ?? 'null'}`,
   ]);
   if (status < 200 || status >= 300) {
-    errorLine(requestId, 'UPSTREAM ERROR BODY', [truncate(body, 4000)]);
+    errorLine(requestId, 'UPSTREAM ERROR BODY', [redactString(truncate(body, 4000))]);
   }
 }
 
@@ -170,7 +187,7 @@ export async function callUpstreamStreaming(
   try {
     const res = await fetch(url, {
       method: 'POST',
-      headers: { ...buildHeaders(cfg), 'content-type': 'application/json', accept: 'text/event-stream' },
+      headers: { ...buildHeaders({ ...cfg, apiKey: cfg.apiKey ?? '' }), 'content-type': 'application/json', accept: 'text/event-stream' },
       body: JSON.stringify(payload),
       signal: ctl.signal,
     });
@@ -188,39 +205,38 @@ export async function callUpstreamStreaming(
     const decoder = new TextDecoder();
     let buffer = '';
     let isFirst = true;
-    let done = false;
-    while (!done) {
-      const { value, done: streamDone } = await reader.read();
-      done = streamDone;
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      // Process complete SSE events (split on blank line)
+    let streamDone = false;
+    const processEvent = (rawEvent: string) => {
+      const lines = rawEvent.split(/\r?\n/);
+      let data = '';
+      let event = 'message';
+      for (const line of lines) {
+        if (line.startsWith('data:')) data = line.slice(5).trimStart();
+        else if (line.startsWith('event:')) event = line.slice(6).trimStart();
+      }
+      if (data === '[DONE]') return;
+      if (data) {
+        if (ttft === null) {
+          ttft = Date.now() - start;
+          if (firstTokenTimer) clearTimeout(firstTokenTimer);
+        }
+        resetIdle();
+        onChunk({ data, event }, isFirst);
+        isFirst = false;
+      }
+    };
+    while (!streamDone) {
+      const part = await reader.read();
+      streamDone = part.done;
+      buffer += decoder.decode(part.value ?? new Uint8Array(), { stream: streamDone });
       let idx: number;
-      while ((idx = buffer.indexOf('\n\n')) >= 0) {
-        const rawEvent = buffer.slice(0, idx);
-        buffer = buffer.slice(idx + 2);
-        const lines = rawEvent.split('\n');
-        let data = '';
-        let event = 'message';
-        for (const line of lines) {
-          if (line.startsWith('data:')) data = line.slice(5).trimStart();
-          else if (line.startsWith('event:')) event = line.slice(6).trimStart();
-        }
-        if (data === '[DONE]') {
-          done = true;
-          break;
-        }
-        if (data) {
-          if (ttft === null) {
-            ttft = Date.now() - start;
-            if (firstTokenTimer) clearTimeout(firstTokenTimer);
-          }
-          resetIdle();
-          onChunk({ data, event }, isFirst);
-          isFirst = false;
-        }
+      while ((idx = buffer.search(/\r?\n\r?\n/)) >= 0) {
+        const separatorLength = buffer[idx] === '\r' ? 4 : 2;
+        processEvent(buffer.slice(0, idx));
+        buffer = buffer.slice(idx + separatorLength);
       }
     }
+    if (buffer.trim()) processEvent(buffer.replace(/\r?\n$/, ''));
     return {
       headers: Object.fromEntries(res.headers.entries()),
       upstreamRequestId: extractUpstreamRequestId(res.headers),

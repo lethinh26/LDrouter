@@ -1,6 +1,6 @@
 {
   "name": "ldrouter",
-  "version": "1.16.3",
+  "version": "1.16.4",
   "description": "LateDev Router — lightweight self-hosted LLM gateway with admin UI",
   "type": "module",
   "license": "MIT",
@@ -14,6 +14,7 @@
   },
   "main": "dist/server/app.js",
   "bin": {
+    "latedev-router": "dist/cli.js",
     "ldrouter": "dist/cli.js"
   },
   "files": [
@@ -50,6 +51,9 @@
     "release:major": "pnpm verify && npm version major -m \"release: v%s\""
   },
   "dependencies": {
+    "@dnd-kit/core": "^6.3.1",
+    "@dnd-kit/modifiers": "^9.0.0",
+    "@dnd-kit/sortable": "^10.0.0",
     "@fastify/cookie": "^11.0.2",
     "@fastify/cors": "^10.0.2",
     "@fastify/helmet": "^13.0.1",

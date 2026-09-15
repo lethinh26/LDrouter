@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.16.4] - 2026-09-15
+
+### Added
+
+- Codex account pools are now part of `main`: native Codex OAuth providers, encrypted JSON/JSONL account import, token refresh/rotation, account-aware routing and fallback, model discovery, quota/usage panel, browser PKCE connect, and the Codex accounts UI.
+
+### Fixed
+
+- Admin sessions with a missing or expired CSRF row could not mutate anything (`Unable to acquire CSRF token`); the CSRF endpoint now re-issues a token for a valid session, and the admin client invalidates its cached token and retries once on an auth rejection.
+
 ## [1.16.3] - 2026-09-14
 
 ### Fixed
@@ -16,6 +26,48 @@ All notable changes to this project are documented here. The format follows
 - **Combo create/update no longer 500, leave orphans, or rename the public ID.** Uniqueness checked only `publicModelId` while `combos.slug` is its own UNIQUE column, duplicate members hit `UNIQUE(combo_id, model_id)`, and both operations ran outside a transaction — update deleting members before inserting the new ones. Saving the edit form unchanged also rewrote a public ID such as `smart` into `combo/smart`, breaking aliases and API keys. All uniqueness checks share one path, both operations are atomic, and the ID is never derived from the name.
 - **Image requests to image-capable models failed.** `/v1/responses` dropped `input_image` blocks, Anthropic inbound read URLs from `source.data`, and outbound Anthropic conversion emitted `{"type":"url","media_type","data"}` instead of `source.url`.
 - **Model capabilities are no longer guessed.** `inferOpenAICapabilities` wrote `image_input`, `structured_output`, and `reasoning` as `false` whenever a model name missed a substring heuristic, hard-rejecting `gpt-4o-2024-11-20`, `gemini-*`, `qwen-vl-*`, and `grok-*`. Unknown stays unknown; manual admin edits survive re-import.
+
+## [1.16.2] - 2026-09-14
+
+### Fixed
+
+- npm release failed with `E409 Conflict - Failed to save packument`: the package had been renamed to `latedev-router`, which the registry still holds as an empty package after all of its versions were unpublished, so no new version can be written under that name. The package name is back to `ldrouter` (the name that last published successfully); the CLI still exposes both `ldrouter` and `latedev-router` binaries.
+
+## [1.16.1] - 2026-09-13
+
+### Fixed
+
+- **Test connection** and **Import models** on the Codex accounts group always failed with `Gateway error`: the models request omitted the `client_version` query parameter the Codex endpoint requires, and the response was read from `models[].id` while the endpoint returns `models[].slug`, so discovery came back empty or errored.
+- Deleting a Codex provider failed with `Gateway error`: `codex_accounts.provider_id` is `ON DELETE RESTRICT`, so removing the provider last raised a raw SQLite constraint error. The provider delete now removes the provider and its Codex account pool in one transaction and reports how many accounts were deleted.
+
+## [1.16.0] - 2026-09-13
+
+### Added
+
+- Codex account pool UI: a dedicated Codex accounts group on the Providers page with expand/collapse, account filtering, and pagination — separate from the generic Add provider dialog, which no longer collects Codex credentials.
+- Codex quota panel showing the 5-hour and weekly windows with live reset countdowns, per-account and refresh-all usage refresh, weekly reset-credit count, and a **Reset quota** action that spends one credit.
+- Codex 5-hour window auto-start (opt-in per account): when a window is exhausted and its reset time has passed, the gateway sends one tiny ping so the next window opens immediately. One ping per reset minute, persisted so it survives restarts.
+- Codex model import dialog with search, Select All, and existing-model detection.
+- Connect OpenAI Codex: a browser-based PKCE flow that shows the authorize URL, waits for the loopback callback, and also accepts a pasted callback URL or bare authorization code. The verifier stays server-side and the authorization code is exchanged server-side, so neither ever appears in the UI.
+  - `GET /oauth/codex/callback` captures the Codex CLI loopback redirect (`http://localhost:1455/auth/callback`) and holds the code in memory against its `state`; the dialog polls `GET /api/admin/codex/oauth/:state` and enables **Connect** as soon as a code is captured. The page never echoes the code.
+- Drag-and-drop routing order for Codex accounts (`@dnd-kit/core`, `@dnd-kit/sortable`, `@dnd-kit/modifiers`), replacing the numeric priority prompt. Rows can also be reordered with the keyboard; the saved order is the router's fallback order.
+- `migrations/0006_codex_usage.sql`: usage snapshot, usage error, auto-start flag, and ping bookkeeping columns on `codex_accounts`.
+
+### Fixed
+
+- Codex account API returned `enabled` as SQLite `0`/`1` instead of a boolean, so the enable/disable control could show the wrong state.
+- Codex credential refresh/decrypt failures returned an opaque HTTP 500 with `Gateway error`; they now return a typed 401 naming the fix (re-import the account).
+- Codex model discovery threw a bare error without an HTTP status, so a 401 never triggered the refresh-and-retry path and surfaced as `Gateway error` instead of an auth failure.
+- **Delete** on a Codex account was a soft delete that left the encrypted credentials on disk; it is now a hard delete. Past request attempts are unaffected because their account reference is `ON DELETE SET NULL`.
+- The Codex account row rendered two identical Enable/Disable controls.
+
+## [1.15.0] - 2026-09-12
+
+### Added
+
+- Native Codex OAuth account import from redacted JSON, JSON arrays, wrapper objects, and JSONL, with provider-scoped deduplication and encrypted token storage.
+- Codex token refresh/rotation, bounded unauthorized retry, account health tracking, account-aware routing, and attempt attribution.
+- Codex provider setup, account import, refresh status, enable/disable, and safe test controls in the admin UI.
 
 ## [1.14.1] - 2026-09-12
 

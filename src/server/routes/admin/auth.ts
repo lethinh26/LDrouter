@@ -4,7 +4,9 @@ import argon2 from 'argon2';
 import { getDb, schema } from '../../db/index';
 import { recordAudit } from '../../db/repositories/audit';
 import { uuid, generateSessionToken, sha256Hex } from '../../auth/ids';
-import { requireAdminAuth } from '../../auth/middleware';
+import crypto from 'node:crypto';
+
+import { requireAdminAuth, csrfTokenForSession } from '../../auth/middleware';
 import { GatewayError } from '../../errors';
 
 const LoginBody = z.object({
@@ -82,6 +84,7 @@ export async function registerAuthRoutes(app: FastifyInstance): Promise<void> {
       ip: req.ip,
       userAgent: (req.headers['user-agent'] ?? '').toString().slice(0, 256),
     }).run();
+    db.insert(schema.csrfTokens).values({ id: uuid(), sessionId: id, token: crypto.randomBytes(32).toString('base64url'), expiresAt: sessionExpiry() }).run();
 
     db.update(schema.adminAccount).set({ lastLoginAt: new Date().toISOString() }).where(sql`id = ${account.id}`).run();
 
@@ -107,6 +110,8 @@ export async function registerAuthRoutes(app: FastifyInstance): Promise<void> {
     reply.clearCookie(SessionCookie, { path: '/' });
     return { ok: true };
   });
+
+  app.get('/api/admin/csrf', { preHandler: requireAdminAuth }, async (req) => ({ csrfToken: csrfTokenForSession(req.adminSessionId!) }));
 
   app.get('/api/admin/me', { preHandler: requireAdminAuth }, async (req) => {
     const account = req.adminAccount!;

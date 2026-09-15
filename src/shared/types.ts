@@ -161,6 +161,7 @@ export interface AttemptLog {
   providerName: string;
   modelId: string;
   modelPublicId: string;
+  codexAccountId?: string | null;
   startedAt: string;
   completedAt: string | null;
   statusCode: number | null;

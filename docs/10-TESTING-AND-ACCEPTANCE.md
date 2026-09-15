@@ -155,6 +155,8 @@ DB inspection confirms:
 
 ## Packaging acceptance
 
+Codex OAuth acceptance includes redacted JSON/JSONL import, provider-scoped identity deduplication, encrypted token storage, refresh/rotation, account-aware routing, CSRF-protected admin mutations, and safe error/log redaction. ZIP import and Codex CLI config-file generation/mutation are explicitly unsupported. The account test endpoint is intentionally HTTP 501 (`not_implemented`) until a real upstream account-test contract is available; it must not mutate account state or expose credentials.
+
 The following must succeed from a clean checkout:
 
 ```bash

@@ -155,4 +155,48 @@ None. The implementation follows the plan verbatim — exact imports, exact repl
 - **TDD cycle**: Red (2 expected failures) → Green (2 passes) → Full suite (54/54 pass). Clean cycle.
 - **The fix**: The old code only handled `body.setupMasterKey` and stashed it in `process.env` *after* config was cached, so provider creation (which reads `loadConfig().masterKey`) got `null` and returned 503. The new code uses `setConfigMasterKey()` to update the cached config object directly, then also sets `process.env` for subsequent `loadConfig()` calls. It also handles the case where neither env nor body provides a key by auto-generating a 32-byte base64 key and writing it to `master.key`.
 - **Security**: The file is written with mode `0o600` (owner read/write only). The key is 32 bytes of random data base64-encoded (44 chars), matching the existing pattern.
-- **Edge cases**: Existing `master.key` file is reused; env var takes precedence over both body and file; if `LATEDEV_MASTER_KEY` is already set, the whole block is skipped (no re-generation, no overwrite).
+- **Edge cases**: Existing `master.key` file is reused; env takes precedence over both body and file; if `LATEDEV_MASTER_KEY` is already set, the whole block is skipped (no re-generation, no overwrite).
+
+## Fix round 3 — credential error wording
+
+### Change
+
+- `src/server/routes/admin/providers.ts`: probe and discovery now return `Provider credentials are missing` for non-Codex providers without credentials, while preserving the Codex adapter message and HTTP 501 status.
+- `src/server/upstream/client.ts`: `providerToUpstreamConfig` now applies the same provider-specific message selection, preserving HTTP 501 status and avoiding credential decryption/logging.
+
+### Exact verification output
+
+```text
+$ pnpm exec vitest run tests/integration/model-test.test.ts tests/integration/gateway.test.ts
+ Test Files  2 passed (2)
+      Tests  19 passed (19)
+
+$ pnpm test
+ Test Files  25 passed (25)
+      Tests  126 passed (126)
+
+$ pnpm typecheck
+$ tsc -p tsconfig.json --noEmit
+
+$ git diff --check
+warning: in the working copy of '.claude/skills/gitnexus/gitnexus-cli/SKILL.md', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of '.claude/skills/gitnexus/gitnexus-debugging/SKILL.md', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of '.claude/skills/gitnexus/gitnexus-exploring/SKILL.md', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of '.claude/skills/gitnexus/gitnexus-guide/SKILL.md', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of '.claude/skills/gitnexus/gitnexus-impact-analysis/SKILL.md', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of '.claude/skills/gitnexus/gitnexus-refactoring/SKILL.md', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'AGENTS.md', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'AGENTS.md', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'CLAUDE.md', LF will be replaced by CRLF the next time Git touches it
+
+$ node .gitnexus/run.cjs detect_changes --scope unstaged --repo LDrouter --branch codex-oauth-json-import
+Changes: 8 files, 20 symbols
+Affected processes: 16
+Risk level: critical
+```
+
+### Status
+
+- Tests, typecheck, and diff check passed.
+- GitNexus impact analysis was run before editing: `providerToUpstreamConfig` and `registerProviderRoutes` both reported HIGH risk; the requested targeted edit proceeded without changing status behavior or secret handling.
+- GitNexus detect-changes reports pre-existing worktree scope as critical (8 files, 20 symbols, 16 processes); no commit was created.

@@ -1,6 +1,7 @@
 // Admin API routes (mounted at /api/admin/*). All require admin session auth.
 
 import type { FastifyInstance } from 'fastify';
+import { requireAdminAuth, requireAdminCsrf } from '../auth/middleware';
 import { registerSetupRoutes } from './admin/setup';
 import { registerAuthRoutes } from './admin/auth';
 import { registerProviderRoutes } from './admin/providers';
@@ -14,6 +15,7 @@ import { registerAuditRoutes } from './admin/audit';
 import { registerSettingsRoutes } from './admin/settings';
 import { registerBackupRoutes } from './admin/backup';
 import { registerDashboardRoutes } from './admin/dashboard';
+import { registerCodexRoutes, registerCodexOAuthCallbackRoute } from './admin/codex';
 
 export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
   // Setup routes are always reachable (used on first run).
@@ -27,8 +29,17 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     await registerAuthRoutes(instance);
   });
 
+  // The Codex OAuth loopback callback is hit by the browser's redirect, so it is public too.
+  await app.register(async (instance) => {
+    await registerCodexOAuthCallbackRoute(instance);
+  });
+
   // Authenticated admin routes
   await app.register(async (instance) => {
+    instance.addHook('preHandler', requireAdminAuth);
+    instance.addHook('preHandler', async (req) => {
+      if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) await requireAdminCsrf(req);
+    });
     await registerProviderRoutes(instance);
     await registerModelRoutes(instance);
     await registerComboRoutes(instance);
@@ -40,5 +51,6 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     await registerSettingsRoutes(instance);
     await registerBackupRoutes(instance);
     await registerDashboardRoutes(instance);
+    await registerCodexRoutes(instance);
   });
 }

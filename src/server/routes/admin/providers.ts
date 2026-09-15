@@ -2,7 +2,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { sql, eq } from 'drizzle-orm';
-import { getDb, schema } from '../../db/index';
+import { getDb, getRawDb, schema } from '../../db/index';
 import { requireAdminAuth } from '../../auth/middleware';
 import { recordAudit } from '../../db/repositories/audit';
 import { encryptSecret, decryptSecret, encryptCustomHeaders, decryptCustomHeaders, isMasterKeyConfigured } from '../../auth/crypto';
@@ -10,13 +10,17 @@ import { uuid, slugify } from '../../auth/ids';
 import { GatewayError } from '../../errors';
 import type { Provider } from '../../db/schema';
 import { probeProvider, discoverProviderModels, type DiscoveredModel, type ProbeResult } from '../../providers/index';
+import { probeCodex, codexModels } from '../../providers/codex';
+import { listCodexAccountSummaries } from '../../db/repositories/codex-accounts';
+import { codexCredentialError, withCodexCredentials } from '../../providers/codex-refresh';
+import { redactString } from '../../security/redact';
 
 const ProviderCreate = z.object({
   name: z.string().min(1).max(128),
   slug: z.string().min(1).max(64).optional(),
-  type: z.enum(['openai', 'anthropic']),
+  type: z.enum(['openai', 'anthropic', 'codex']),
   baseUrl: z.string().url().max(512),
-  apiKey: z.string().min(1).max(512),
+  apiKey: z.string().min(1).max(20000).optional(),
   customHeaders: z.record(z.string(), z.string()).optional(),
   enabled: z.boolean().optional(),
   connectTimeoutMs: z.number().int().min(100).max(60000).optional(),
@@ -72,12 +76,15 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
 
   app.post('/api/admin/providers', async (req) => {
     const body = ProviderCreate.parse(req.body);
+    if (body.type !== 'codex' && !body.apiKey) {
+      throw new GatewayError('invalid_request_error', 'API key is required for this provider type', { status: 400 });
+    }
     requireMasterKey(); // Need master key to encrypt new credentials
     const db = getDb();
     const slug = body.slug ? slugify(body.slug) : slugify(body.name);
     const dup = db.select().from(schema.providers).where(eq(schema.providers.slug, slug)).get();
     if (dup) throw new GatewayError('invalid_request_error', `Provider slug '${slug}' is already in use`, { status: 400 });
-    const enc = encryptSecret(body.apiKey);
+    const enc = body.apiKey ? encryptSecret(body.apiKey) : null;
     const headersEnc = body.customHeaders ? encryptCustomHeaders(body.customHeaders) : null;
     const id = uuid();
     db.insert(schema.providers).values({
@@ -86,9 +93,9 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
       slug,
       type: body.type,
       baseUrl: body.baseUrl,
-      encryptedApiKey: enc.ciphertext,
-      apiKeyNonce: enc.nonce,
-      apiKeyVersion: enc.version,
+      encryptedApiKey: enc?.ciphertext ?? null,
+      apiKeyNonce: enc?.nonce ?? null,
+      apiKeyVersion: enc?.version ?? 1,
       customHeadersEncrypted: headersEnc?.ciphertext ?? null,
       customHeadersNonce: headersEnc?.nonce ?? null,
       enabled: body.enabled ?? true,
@@ -150,9 +157,20 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
       recordAudit({ action: 'provider.soft_disable', success: true, targetType: 'provider', targetId: id, targetName: p.name, ip: req.ip });
       return { ok: true, softDisabled: true };
     }
-    db.delete(schema.providers).where(eq(schema.providers.id, id)).run();
-    recordAudit({ action: 'provider.delete', success: true, targetType: 'provider', targetId: id, targetName: p.name, ip: req.ip });
-    return { ok: true };
+    // A Codex provider owns its account pool. codex_accounts.provider_id is ON DELETE RESTRICT,
+    // so the accounts must go in the same transaction or the delete fails with a raw SQLite
+    // constraint error (which surfaces as an opaque 500 "Gateway error").
+    let codexAccountsDeleted = 0;
+    try {
+      getRawDb().transaction(() => {
+        codexAccountsDeleted = getRawDb().prepare('DELETE FROM codex_accounts WHERE provider_id=?').run(id).changes;
+        db.delete(schema.providers).where(eq(schema.providers.id, id)).run();
+      })();
+    } catch (error) {
+      throw new GatewayError('invalid_request_error', 'Provider is still referenced and cannot be deleted', { status: 409, cause: error });
+    }
+    recordAudit({ action: 'provider.delete', success: true, targetType: 'provider', targetId: id, targetName: p.name, ip: req.ip, metadata: { codexAccountsDeleted } });
+    return { ok: true, codexAccountsDeleted };
   });
 
   app.post('/api/admin/providers/:id/test', async (req) => {
@@ -160,6 +178,16 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
     const db = getDb();
     const p = db.select().from(schema.providers).where(eq(schema.providers.id, id)).get();
     if (!p) throw new GatewayError('invalid_request_error', 'Provider not found', { status: 404 });
+    if (p.type === 'codex') {
+      const account = listCodexAccountSummaries(p.id).find((candidate) => candidate.enabled && candidate.healthState !== 'down');
+      if (!account) throw new GatewayError('authentication_error', 'No eligible Codex account is configured', { status: 503 });
+      const row = getRawDb().prepare('SELECT chatgpt_account_id AS accountId FROM codex_accounts WHERE id=?').get(account.id) as { accountId: string | null } | undefined;
+      const result = await withCodexCredentials(account.id, async (credentials) => probeCodex({ baseUrl: p.baseUrl, accountId: row?.accountId ?? '', accessToken: credentials.accessToken, customHeaders: {}, totalTimeoutMs: Math.min(p.totalTimeoutMs, 20000) })).catch((error) => { throw codexCredentialError(error); });
+      db.update(schema.providers).set({ healthState: result.ok ? 'healthy' : 'down', updatedAt: new Date().toISOString() }).where(eq(schema.providers.id, id)).run();
+      recordAudit({ action: 'provider.test', success: result.ok, targetType: 'provider', targetId: id, targetName: p.name, ip: req.ip, metadata: { detail: redactString(result.detail) } });
+      return { ...result, detail: redactString(result.detail) };
+    }
+    if (!p.encryptedApiKey || !p.apiKeyNonce) throw new GatewayError('invalid_request_error', 'Provider credentials are missing', { status: 501 });
     const apiKey = decryptSecret({ ciphertext: p.encryptedApiKey, nonce: p.apiKeyNonce, version: p.apiKeyVersion });
     const headers = decryptCustomHeaders(p.customHeadersEncrypted && p.customHeadersNonce ? { ciphertext: p.customHeadersEncrypted, nonce: p.customHeadersNonce, version: 1 } : null);
     const result: ProbeResult = await probeProvider({
@@ -184,16 +212,25 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
     const db = getDb();
     const p = db.select().from(schema.providers).where(eq(schema.providers.id, id)).get();
     if (!p) throw new GatewayError('invalid_request_error', 'Provider not found', { status: 404 });
-    const apiKey = decryptSecret({ ciphertext: p.encryptedApiKey, nonce: p.apiKeyNonce, version: p.apiKeyVersion });
-    const headers = decryptCustomHeaders(p.customHeadersEncrypted && p.customHeadersNonce ? { ciphertext: p.customHeadersEncrypted, nonce: p.customHeadersNonce, version: 1 } : null);
-    const discovered: DiscoveredModel[] = await discoverProviderModels({
+    let discovered: DiscoveredModel[];
+    if (p.type === 'codex') {
+      const account = listCodexAccountSummaries(p.id).find((candidate) => candidate.enabled && candidate.healthState !== 'down');
+      if (!account) throw new GatewayError('authentication_error', 'No eligible Codex account is configured', { status: 503 });
+      const row = getRawDb().prepare('SELECT chatgpt_account_id AS accountId FROM codex_accounts WHERE id=?').get(account.id) as { accountId: string | null } | undefined;
+      discovered = await withCodexCredentials(account.id, async (credentials) => codexModels({ baseUrl: p.baseUrl, accountId: row?.accountId ?? '', accessToken: credentials.accessToken, customHeaders: {}, totalTimeoutMs: 30000 })).catch((error) => { throw codexCredentialError(error); });
+    } else {
+      if (!p.encryptedApiKey || !p.apiKeyNonce) throw new GatewayError('invalid_request_error', 'Provider credentials are missing', { status: 501 });
+      const apiKey = decryptSecret({ ciphertext: p.encryptedApiKey, nonce: p.apiKeyNonce, version: p.apiKeyVersion });
+      const headers = decryptCustomHeaders(p.customHeadersEncrypted && p.customHeadersNonce ? { ciphertext: p.customHeadersEncrypted, nonce: p.customHeadersNonce, version: 1 } : null);
+      discovered = await discoverProviderModels({
       type: p.type,
       baseUrl: p.baseUrl,
       apiKey,
       customHeaders: headers,
       connectTimeoutMs: 5000,
       totalTimeoutMs: 30000,
-    } as never);
+      } as never);
+    }
     const existing = db
       .select()
       .from(schema.models)

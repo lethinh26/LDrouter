@@ -1,7 +1,9 @@
 // Upstream provider adapters: OpenAI-compatible + Anthropic-compatible.
+export { probeCodex, codexModels } from './codex';
+export type { CodexProviderConfig } from './codex';
 
 export interface ProviderConfig {
-  type: 'openai' | 'anthropic';
+  type: 'openai' | 'anthropic' | 'codex';
   baseUrl: string;
   apiKey: string;
   customHeaders: Record<string, string>;
@@ -61,6 +63,7 @@ async function fetchWithTimeout(url: string, init: RequestInit, totalTimeoutMs: 
 
 export async function probeProvider(cfg: ProviderConfig): Promise<ProbeResult> {
   const start = Date.now();
+  if (cfg.type === 'codex') return { ok: false, detail: 'Codex providers require the Codex account adapter', latencyMs: 0 };
   try {
     const url = cfg.type === 'openai' ? `${stripSlash(cfg.baseUrl)}/v1/models` : `${stripSlash(cfg.baseUrl)}/v1/models`;
     const res = await fetchWithTimeout(url, { method: 'GET', headers: buildHeaders(cfg) }, cfg.totalTimeoutMs);
@@ -77,6 +80,7 @@ export async function probeProvider(cfg: ProviderConfig): Promise<ProbeResult> {
 }
 
 export async function discoverProviderModels(cfg: ProviderConfig): Promise<DiscoveredModel[]> {
+  if (cfg.type === 'codex') throw new Error('Codex providers require the Codex account adapter');
   if (cfg.type === 'openai') return discoverOpenAI(cfg);
   return discoverAnthropic(cfg);
 }
