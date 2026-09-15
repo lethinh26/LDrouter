@@ -68,6 +68,21 @@ describe('api client request shaping', () => {
     expect(mutationCalls).toBe(2);
   });
 
+  it('POST /api/admin/setup does NOT attempt to fetch a CSRF token (no session exists on first run)', async () => {
+    const calls: string[] = [];
+    let sentHeaders: Record<string, string> = {};
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      calls.push(url);
+      sentHeaders = { ...(init?.headers as Record<string, string> | undefined) };
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await api.post('/api/admin/setup', { username: 'admin', password: 'x'.repeat(12) });
+    expect(calls).toEqual(['/api/admin/setup']);
+    expect(sentHeaders['x-csrf-token']).toBeUndefined();
+  });
+
   it('DELETE without a body does NOT send content-type application/json', async () => {
     const fetchMock = mockFetch();
     vi.stubGlobal('fetch', fetchMock);

@@ -2,6 +2,10 @@
 
 const baseUrl = '';
 const csrfHeader = 'x-csrf-token';
+// Public POST endpoints: no admin session exists yet (login) or is not required
+// (first-run setup), so fetching /api/admin/csrf — which needs auth — would fail
+// with "Unable to acquire CSRF token".
+const CSRF_EXEMPT_PATHS = new Set(['/api/admin/login', '/api/admin/setup']);
 let csrfToken: string | null = null;
 let csrfRequest: Promise<string> | null = null;
 
@@ -36,7 +40,7 @@ async function request<T>(method: string, path: string, body?: unknown, init?: R
   const hasBody = body !== undefined;
   const headers: Record<string, string> = { ...(init?.headers as Record<string, string> | undefined) };
   if (hasBody && !headers['content-type']) headers['content-type'] = 'application/json';
-  if (method !== 'GET' && method !== 'HEAD' && path !== '/api/admin/login' && !headers[csrfHeader]) headers[csrfHeader] = await getCsrfToken();
+  if (method !== 'GET' && method !== 'HEAD' && !CSRF_EXEMPT_PATHS.has(path) && !headers[csrfHeader]) headers[csrfHeader] = await getCsrfToken();
   const res = await fetch(`${baseUrl}${path}`, {
     ...init,
     method,
@@ -49,7 +53,7 @@ async function request<T>(method: string, path: string, body?: unknown, init?: R
   } catch (error) {
     const authFailure = error instanceof ApiError && (error.status === 401 || error.status === 403) &&
       (error.type === 'authentication_error' || error.type === 'csrf_error');
-    if (retry && authFailure && method !== 'GET' && method !== 'HEAD' && path !== '/api/admin/login') {
+    if (retry && authFailure && method !== 'GET' && method !== 'HEAD' && !CSRF_EXEMPT_PATHS.has(path)) {
       csrfToken = null;
       return request<T>(method, path, body, init, false);
     }

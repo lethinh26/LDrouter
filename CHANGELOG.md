@@ -4,6 +4,12 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.16.5] - 2026-09-15
+
+### Fixed
+
+- First-run setup failed with `Unable to acquire CSRF token`. The admin client fetched a CSRF token before every mutation, but `GET /api/admin/csrf` requires an admin session, which does not exist yet on `/setup`. Public mutation endpoints (`/api/admin/login`, `/api/admin/setup`) are now exempt from the CSRF pre-fetch.
+
 ## [1.16.4] - 2026-09-15
 
 ### Added
