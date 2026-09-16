@@ -6,6 +6,7 @@ import { closeDb, getRawDb, openDb } from '../../src/server/db';
 import { resetConfigForTests, setConfigMasterKey } from '../../src/server/config';
 import { getCodexCredentials, upsertCodexAccount } from '../../src/server/db/repositories/codex-accounts';
 import { configureCodexOAuthRefreshClient, needsCodexRefresh, refreshCodexAccount, withCodexCredentials } from '../../src/server/providers/codex-refresh';
+import { CODEX_OAUTH } from '../../src/server/providers/codex-oauth';
 
 const record = (expiresAt: string, idToken: string | null = 'old-id') => ({ index: 0, email: 'user@example.com', workspaceId: 'workspace-1', chatgptAccountId: 'account-1', planType: 'plus', expiresAt, accessToken: 'old-access', refreshToken: 'old-refresh', idToken, identity: 'account:account-1' });
 
@@ -29,6 +30,25 @@ describe('Codex refresh lifecycle', () => {
     const account = { tokenExpiresAt: '2026-09-12T00:04:00.000Z' };
     expect(needsCodexRefresh(account, new Date('2026-09-12T00:00:00.000Z'))).toBe(true);
     expect(needsCodexRefresh({ tokenExpiresAt: '2026-09-12T01:00:00.000Z' }, new Date('2026-09-12T00:00:00.000Z'))).toBe(false);
+  });
+
+  it('sends client_id on the real refresh request, which the endpoint requires', async () => {
+    const { id } = setup('2026-09-12T00:01:00.000Z');
+    // No injected client this time: exercise defaultRefreshClient, the path production uses.
+    // Without client_id the endpoint answers 400 `Missing 'client_id'` and every expired token
+    // stays unusable, which is what surfaced to operators as an opaque refresh failure.
+    const fetchMock = vi.fn(async (_url: unknown, _init: { body: URLSearchParams }) => new Response(
+      JSON.stringify({ access_token: 'new-access', refresh_token: 'new-refresh', expires_in: 3600 }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    ));
+    vi.stubGlobal('fetch', fetchMock);
+    const result = await refreshCodexAccount(id, new Date('2026-09-12T00:00:00.000Z'));
+    expect(result).toMatchObject({ ok: true });
+    const body = fetchMock.mock.calls[0]?.[1].body as URLSearchParams;
+    expect(body.get('grant_type')).toBe('refresh_token');
+    expect(body.get('refresh_token')).toBe('old-refresh');
+    expect(body.get('client_id')).toBe(CODEX_OAUTH.clientId);
+    vi.unstubAllGlobals();
   });
 
   it('persists rotated refresh tokens and preserves an omitted id token', async () => {

@@ -1,4 +1,5 @@
 import { getCodexCredentials, getCodexAccountRefreshState, persistCodexRefresh, setCodexAccountHealth, type DecryptedCodexCredentials } from '../db/repositories/codex-accounts';
+import { CODEX_OAUTH } from './codex-oauth';
 import { GatewayError } from '../errors';
 
 /**
@@ -54,10 +55,12 @@ export function needsCodexRefresh(account: CodexRefreshAccount, now = new Date()
 }
 
 async function defaultRefreshClient(input: { refreshToken: string; signal: AbortSignal }): Promise<OAuthRefreshResponse> {
-  const response = await fetch('https://auth.openai.com/oauth/token', {
+  const response = await fetch(CODEX_OAUTH.tokenUrl, {
     method: 'POST',
     headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
-    body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: input.refreshToken }),
+    // `client_id` is required: without it the endpoint answers 400 `Missing 'client_id'`,
+    // which surfaced as an opaque refresh failure and left expired tokens unusable.
+    body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: input.refreshToken, client_id: CODEX_OAUTH.clientId }),
     signal: input.signal,
   });
   if (!response.ok) throw new Error(`oauth refresh http ${response.status}`);

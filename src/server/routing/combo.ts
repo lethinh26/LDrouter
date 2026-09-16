@@ -99,9 +99,12 @@ export function expandQoderAccountCandidates(candidate: CandidateModel, accounts
   return usable.map((account) => ({ ...candidate, qoderAccountId: account.id, qoderUserId: account.qoderUserId, selectionReason: 'qoder_account' }));
 }
 
-export function expandCodexAccountCandidates(candidate: CandidateModel, accounts: CodexAccountCandidate[], now = new Date()): CandidateModel[] {
+export function expandCodexAccountCandidates(candidate: CandidateModel, accounts: CodexAccountCandidate[]): CandidateModel[] {
   if (candidate.providerType !== 'codex') return [candidate];
-  const usable = accounts.filter((a) => a.enabled && (a.healthState === 'healthy' || a.healthState === 'unknown') && Date.parse(a.tokenExpiresAt) > now.getTime())
+  // No token-expiry filter here: `withCodexCredentials` refreshes before the upstream call, so an
+  // expired token is still routable. Gating on it rejected exactly the accounts most in need of a
+  // refresh, turning a recoverable state into "no available Codex account".
+  const usable = accounts.filter((a) => a.enabled && a.healthState !== 'down')
     .sort((a, b) => a.priority - b.priority || a.id.localeCompare(b.id));
   return usable.map((a) => ({ ...candidate, codexAccountId: a.id, codexChatgptAccountId: a.chatgptAccountId, selectionReason: 'codex_account' }));
 }

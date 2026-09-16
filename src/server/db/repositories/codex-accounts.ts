@@ -80,13 +80,15 @@ export function listCodexAccountsForProvider(providerId: string): Array<{ id: st
 }
 
 export function getCodexAccountForProvider(providerId: string): { id: string; chatgptAccountId: string } | null {
-  const row = listCodexAccountsForProvider(providerId).find((a) => a.enabled && (a.healthState === 'healthy' || a.healthState === 'unknown') && Date.parse(a.tokenExpiresAt) > Date.now());
+  const row = listCodexAccountsForProvider(providerId).find((a) => a.enabled && a.healthState !== 'down');
   return row?.chatgptAccountId ? { id: row.id, chatgptAccountId: row.chatgptAccountId } : null;
 }
 
 export function getCodexAccountById(id: string): { id: string; chatgptAccountId: string } | null {
-  const row = client().prepare(`SELECT id, chatgpt_account_id AS chatgptAccountId, enabled, health_state AS healthState, token_expires_at AS tokenExpiresAt FROM codex_accounts WHERE id=?`).get(id) as { id: string; chatgptAccountId: string | null; enabled: boolean; healthState: AccountRow['healthState']; tokenExpiresAt: string } | undefined;
-  if (!row || !row.enabled || !['healthy', 'unknown'].includes(row.healthState) || Date.parse(row.tokenExpiresAt) <= Date.now()) return null;
+  const row = client().prepare(`SELECT id, chatgpt_account_id AS chatgptAccountId, enabled, health_state AS healthState FROM codex_accounts WHERE id=?`).get(id) as { id: string; chatgptAccountId: string | null; enabled: boolean; healthState: AccountRow['healthState'] } | undefined;
+  // No token-expiry predicate: `withCodexCredentials` refreshes a stale token before the upstream
+  // call, so rejecting expired accounts here only blocked requests that were about to self-heal.
+  if (!row || !row.enabled || row.healthState === 'down') return null;
   return row.chatgptAccountId ? { id: row.id, chatgptAccountId: row.chatgptAccountId } : null;
 }
 

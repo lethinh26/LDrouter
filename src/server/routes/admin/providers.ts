@@ -18,7 +18,7 @@ const ProviderCreate = z.object({
   // Compatible providers still need name, endpoint, and credential up front (checked in the handler).
   name: z.string().min(1).max(128).optional(),
   slug: z.string().min(1).max(64).optional(),
-  type: z.enum(['openai', 'anthropic', 'codex']),
+  type: z.enum(['openai', 'anthropic', 'codex', 'qoder']),
   baseUrl: z.string().url().max(512).optional(),
   apiKey: z.string().min(1).max(20000).optional(),
   customHeaders: z.record(z.string(), z.string()).optional(),

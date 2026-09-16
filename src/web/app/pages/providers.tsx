@@ -30,9 +30,10 @@ const DEFAULT_BASE_URL: Record<'openai' | 'anthropic', string> = {
   openai: 'https://api.openai.com', anthropic: 'https://api.anthropic.com',
 };
 // Account-pool types are created with one click — the server owns name, slug, and base URL.
-const POOL_PROVIDERS = [{ type: 'codex' as const, label: 'Add Codex' }];
-// Reused from the old Codex branch of the create dialog, which no longer has a Codex mode.
-const POOL_HINT = 'Codex always talks to https://chatgpt.com — the OAuth backend does not exist on api.openai.com.';
+const POOL_PROVIDERS = [
+  { type: 'codex' as const, label: 'Add Codex', hint: 'Codex always talks to https://chatgpt.com — the OAuth backend does not exist on api.openai.com.' },
+  { type: 'qoder' as const, label: 'Add Qoder', hint: 'Qoder accounts authenticate with a PAT (pt-…) that you add after the provider exists.' },
+];
 
 
 export function Providers() {
@@ -136,7 +137,7 @@ export function Providers() {
             const existing = rows.find((row) => row.type === pool.type);
             return (
               <Button key={pool.type} variant="outline" disabled={!!existing || poolSubmitting === pool.type}
-                title={existing ? `${existing.name} already exists` : POOL_HINT}
+                title={existing ? `${existing.name} already exists` : pool.hint}
                 onClick={() => void addPoolProvider(pool.type)}>
                 <Plus className="mr-1 h-4 w-4" />{existing ? `${pool.label} (added)` : pool.label}
               </Button>

@@ -47,7 +47,24 @@ const codexRows = async () => {
   return getRawDb().prepare("SELECT id,name,slug,base_url,encrypted_api_key FROM providers WHERE type='codex'").all() as Array<{ id: string; name: string; slug: string; base_url: string; encrypted_api_key: string | null }>;
 };
 
+const qoderRows = async () => {
+  const { getRawDb } = await import('../../src/server/db');
+  return getRawDb().prepare("SELECT id,name,slug,base_url,encrypted_api_key FROM providers WHERE type='qoder'").all() as Array<{ id: string; name: string; slug: string; base_url: string; encrypted_api_key: string | null }>;
+};
+
 describe('one-click account-pool provider creation', () => {
+  it('creates a Qoder provider from its type alone (the Add Qoder button path)', async () => {
+    // The one-click button posts nothing but the type; the route's own request schema has to
+    // accept 'qoder' or the button 400s before the pool registry is ever reached.
+    const res = await post({ type: 'qoder' });
+    expect(res.status).toBe(200);
+    const body = await res.json() as { id: string; slug: string; name: string };
+    expect(body.slug).toBe('qoder');
+    const rows = await qoderRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ id: body.id, name: 'Qoder', slug: 'qoder', encrypted_api_key: null });
+  });
+
   it('creates a Codex provider from its type alone without storing an API key it is sent', async () => {
     // Spec §5.7: a pool type has no API-key field, so a key in the body must not be encrypted onto
     // the row. (`name`/`slug`/`baseUrl` stay request-overridable — see the fix report's ruling.)
