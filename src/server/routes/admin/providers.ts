@@ -93,8 +93,14 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
     const db = getDb();
     const slug = slugify(body.slug ?? name);
     const dup = db.select().from(schema.providers).where(eq(schema.providers.slug, slug)).get();
-    if (dup) throw new GatewayError('invalid_request_error', `Provider slug '${slug}' is already in use`, { status: 400 });
-    const enc = body.apiKey ? encryptSecret(body.apiKey) : null;
+    if (dup) {
+      // Pool path carries the code spec §5.7 names, so the UI can render "already added".
+      if (pool) throw new GatewayError('invalid_request_error', `A ${dup.name} provider already exists ('${dup.slug}')`, { status: 400, code: 'slug_taken' });
+      throw new GatewayError('invalid_request_error', `Provider slug '${slug}' is already in use`, { status: 400 });
+    }
+    // A pool type has no API-key field (spec §5.7): a key sent with `{type}` must not be encrypted
+    // onto the row.
+    const enc = !pool && body.apiKey ? encryptSecret(body.apiKey) : null;
     const headersEnc = body.customHeaders ? encryptCustomHeaders(body.customHeaders) : null;
     const id = uuid();
     db.insert(schema.providers).values({

@@ -90,6 +90,17 @@ export function getCodexAccountById(id: string): { id: string; chatgptAccountId:
   return row.chatgptAccountId ? { id: row.id, chatgptAccountId: row.chatgptAccountId } : null;
 }
 
+/**
+ * Plain column read — deliberately no eligibility predicate. A pool provider gates account
+ * selection itself (`firstEligible`), and a `degraded` or token-expired account is still usable:
+ * `withCodexCredentials` refreshes the token before the upstream call. Using `getCodexAccountById`
+ * here would reintroduce a second, stricter gate that the route this replaced never had.
+ */
+export function chatgptAccountIdOf(id: string): string | null {
+  const row = client().prepare('SELECT chatgpt_account_id AS chatgptAccountId FROM codex_accounts WHERE id=?').get(id) as { chatgptAccountId: string | null } | undefined;
+  return row?.chatgptAccountId ?? null;
+}
+
 export function listCodexAccountSummaries(providerId: string): CodexAccountDetail[] {
   const rows = client().prepare(`SELECT id,email,workspace_id AS workspaceId,chatgpt_account_id AS chatgptAccountId,plan_type AS planType,token_expires_at AS tokenExpiresAt,enabled,health_state AS healthState,last_refresh_at AS lastRefreshAt,priority,codex_autostart_enabled AS autostart,codex_usage_json AS usageJson,codex_usage_error AS usageError,codex_usage_updated_at AS usageUpdatedAt,last_pinged_reset_at AS lastPingedResetAt,last_ping_at AS lastPingAt,created_at AS createdAt,updated_at AS updatedAt FROM codex_accounts WHERE provider_id=? ORDER BY priority,id`).all(providerId) as Array<Parameters<typeof toCodexAccountSummaryRow>[0]>;
   return rows.map(toCodexAccountSummaryRow);

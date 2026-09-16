@@ -3,6 +3,7 @@ import { POOLED_PROVIDER_TYPES, getPooledProvider, pooledProviderDefaults } from
 
 vi.mock('../../src/server/db/repositories/codex-accounts', () => ({
   listCodexAccountSummaries: vi.fn(() => [{ id: 'acct-1', enabled: true, healthState: 'healthy' }]),
+  chatgptAccountIdOf: vi.fn(() => 'chatgpt-acct-1'),
 }));
 vi.mock('../../src/server/providers/codex', () => ({
   probeCodex: vi.fn(async () => ({ ok: true, detail: 'Connected (200)', latencyMs: 5, modelCount: 3 })),
@@ -34,5 +35,15 @@ describe('account-pool provider registry', () => {
     const { listCodexAccountSummaries } = await import('../../src/server/db/repositories/codex-accounts');
     vi.mocked(listCodexAccountSummaries).mockReturnValueOnce([]);
     await expect(getPooledProvider('codex')!.probe({ id: 'p', baseUrl: 'https://chatgpt.com', totalTimeoutMs: 1000 })).rejects.toThrow('No eligible account');
+  });
+
+  it('passes the stored chatgpt account id to the upstream call', async () => {
+    // Account selection is the only gate; the id is an unconditional column read, so an account the
+    // old `getCodexAccountById` would have rejected (degraded / expired token) still reaches upstream.
+    const { probeCodex } = await import('../../src/server/providers/codex');
+    const { chatgptAccountIdOf } = await import('../../src/server/db/repositories/codex-accounts');
+    await getPooledProvider('codex')!.probe({ id: 'p', baseUrl: 'https://chatgpt.com', totalTimeoutMs: 1000 });
+    expect(vi.mocked(probeCodex).mock.calls[0]?.[0]).toMatchObject({ accountId: 'chatgpt-acct-1', accountRecordId: 'acct-1' });
+    expect(vi.mocked(chatgptAccountIdOf)).toHaveBeenCalledWith('acct-1');
   });
 });

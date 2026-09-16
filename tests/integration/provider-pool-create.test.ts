@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -34,25 +34,67 @@ beforeAll(async () => {
   csrf = (getRawDb().prepare('SELECT token FROM csrf_tokens WHERE session_id=?').get(session.id) as { token: string }).token;
 });
 
+afterEach(() => vi.unstubAllGlobals());
+
 afterAll(async () => { await app.close(); (await import('../../src/server/db')).closeDb(); fs.rmSync(dataDir, { recursive: true, force: true }); });
 
+const codexRows = async () => {
+  const { getRawDb } = await import('../../src/server/db');
+  return getRawDb().prepare("SELECT id,name,slug,base_url,encrypted_api_key FROM providers WHERE type='codex'").all() as Array<{ id: string; name: string; slug: string; base_url: string; encrypted_api_key: string | null }>;
+};
+
 describe('one-click account-pool provider creation', () => {
-  it('creates a Codex provider from its type alone', async () => {
-    const res = await post({ type: 'codex' });
+  it('creates a Codex provider from its type alone without storing an API key it is sent', async () => {
+    // Spec §5.7: a pool type has no API-key field, so a key in the body must not be encrypted onto
+    // the row. (`name`/`slug`/`baseUrl` stay request-overridable — see the fix report's ruling.)
+    const res = await post({ type: 'codex', apiKey: 'sk-should-not-be-stored' });
     expect(res.status).toBe(200);
     const body = await res.json() as { id: string; slug: string };
     expect(body.slug).toBe('codex');
-    const { getRawDb } = await import('../../src/server/db');
-    const row = getRawDb().prepare('SELECT name,type,base_url,encrypted_api_key FROM providers WHERE id=?').get(body.id);
-    expect(row).toEqual({ name: 'Codex', type: 'codex', base_url: 'https://chatgpt.com', encrypted_api_key: null });
+    const rows = await codexRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toEqual({ id: body.id, name: 'Codex', slug: 'codex', base_url: 'https://chatgpt.com', encrypted_api_key: null });
   });
 
-  it('rejects a second pool provider of the same type with a naming error', async () => {
+  it('rejects a second pool provider of the same type with slug_taken naming the existing provider', async () => {
     const res = await post({ type: 'codex' });
     expect(res.status).toBe(400);
-    const body = await res.json() as { error: { message: string } };
-    expect(body.error.message).toContain('already in use');
-    expect(body.error.message).toContain('codex');
+    const error = await res.json() as { error: { message: string; code: string } };
+    expect(error.error.code).toBe('slug_taken');
+    expect(error.error.message).toContain('Codex'); // names the provider that already exists
+    // Nothing was inserted by the rejected request.
+    expect(await codexRows()).toHaveLength(1);
+  });
+
+  it('passes a degraded account id to the upstream call instead of 503ing and marking the provider down', async () => {
+    const { getRawDb } = await import('../../src/server/db');
+    const providerId = (await codexRows())[0]!.id;
+    const { upsertCodexAccount, setCodexAccountHealth } = await import('../../src/server/db/repositories/codex-accounts');
+    const accountId = upsertCodexAccount(providerId, {
+      index: 0, email: 'degraded@example.com', workspaceId: 'ws-1', chatgptAccountId: 'acct-degraded', planType: 'plus',
+      expiresAt: '2030-01-01T00:00:00.000Z', accessToken: 'access-degraded', refreshToken: 'refresh-degraded', idToken: null,
+      identity: 'account:acct-degraded',
+    }).id;
+    // `degraded` is refreshable, not a reason to refuse: the old route read the column unconditionally.
+    setCodexAccountHealth(accountId, 'degraded');
+
+    const passthrough = globalThis.fetch;
+    const seen: Array<string | null> = [];
+    vi.stubGlobal('fetch', (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (!url.startsWith('https://chatgpt.com/')) return passthrough(input, init);
+      seen.push(new Headers(init?.headers).get('chatgpt-account-id'));
+      return Promise.resolve(new Response(JSON.stringify({ models: [{ slug: 'gpt-5-codex' }] }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    });
+
+    const test = await fetch(`${baseUrl}/api/admin/providers/${providerId}/test`, { method: 'POST', headers: { 'content-type': 'application/json', cookie, 'x-csrf-token': csrf }, body: '{}' });
+    expect(test.status).toBe(200);
+    const discover = await fetch(`${baseUrl}/api/admin/providers/${providerId}/discover`, { method: 'POST', headers: { 'content-type': 'application/json', cookie, 'x-csrf-token': csrf }, body: '{}' });
+    expect(discover.status).toBe(200);
+
+    expect(seen).toEqual(['acct-degraded', 'acct-degraded']);
+    const health = getRawDb().prepare('SELECT health_state AS healthState FROM providers WHERE id=?').get(providerId) as { healthState: string };
+    expect(health.healthState).toBe('healthy');
   });
 
   it('still requires base URL and API key for a compatible provider', async () => {

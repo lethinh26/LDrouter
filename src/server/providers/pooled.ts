@@ -2,7 +2,7 @@
 // dedicated table, not one API key on the provider row. The registry keeps the
 // per-type probe/discover/account branches out of the provider CRUD route.
 import { GatewayError } from '../errors';
-import { listCodexAccountSummaries, getCodexAccountById } from '../db/repositories/codex-accounts';
+import { listCodexAccountSummaries, chatgptAccountIdOf } from '../db/repositories/codex-accounts';
 import { probeCodex, codexModels, CODEX_BASE_URL } from './codex';
 import { withCodexCredentials, codexCredentialError } from './codex-refresh';
 import type { DiscoveredModel, ProbeResult } from './index';
@@ -39,11 +39,12 @@ const codexStrategy: PooledProvider = {
   accountsTable: 'codex_accounts',
   listAccounts: (providerId) => listCodexAccountSummaries(providerId),
   // `firstEligible` is the single eligibility gate (matching the route it replaces); the account id
-  // is a lookup, not a second gate — an imported account without a chatgpt_account_id is still
-  // probed, and the upstream answers honestly. Returning 503 here instead would skip the audit.
+  // is a plain lookup, not a second gate — an imported account without a chatgpt_account_id is still
+  // probed, and a degraded or token-expired account is still refreshable, so the upstream answers
+  // honestly instead of the route short-circuiting to 503 (which would also skip the audit write).
   probe: async (provider) => {
     const account = firstEligible(codexStrategy.listAccounts(provider.id));
-    const accountId = getCodexAccountById(account.id)?.chatgptAccountId ?? '';
+    const accountId = chatgptAccountIdOf(account.id) ?? '';
     return withCodexCredentials(account.id, (credentials) => probeCodex({
       baseUrl: provider.baseUrl, accountId, accessToken: credentials.accessToken,
       accountRecordId: account.id, customHeaders: {}, totalTimeoutMs: Math.min(provider.totalTimeoutMs, 20_000),
@@ -51,7 +52,7 @@ const codexStrategy: PooledProvider = {
   },
   discover: async (provider) => {
     const account = firstEligible(codexStrategy.listAccounts(provider.id));
-    const accountId = getCodexAccountById(account.id)?.chatgptAccountId ?? '';
+    const accountId = chatgptAccountIdOf(account.id) ?? '';
     return withCodexCredentials(account.id, (credentials) => codexModels({
       baseUrl: provider.baseUrl, accountId, accessToken: credentials.accessToken,
       accountRecordId: account.id, customHeaders: {}, totalTimeoutMs: Math.min(provider.totalTimeoutMs, 30_000),
