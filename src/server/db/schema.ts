@@ -105,7 +105,7 @@ export const providers = sqliteTable(
     id: text('id').primaryKey(),
     name: text('name').notNull(),
     slug: text('slug').notNull().unique(),
-    type: text('type', { enum: ['openai', 'anthropic', 'codex'] }).notNull(),
+    type: text('type', { enum: ['openai', 'anthropic', 'codex', 'qoder'] }).notNull(),
     baseUrl: text('base_url').notNull(),
     encryptedApiKey: text('encrypted_api_key'),
     apiKeyNonce: text('api_key_nonce'),
@@ -174,6 +174,42 @@ export const codexAccounts = sqliteTable(
     providerEnabledPriorityIdx: index('idx_codex_account_provider_enabled_priority').on(t.providerId, t.enabled, t.priority),
     providerEmailIdx: index('idx_codex_account_provider_email').on(t.providerId, t.email),
     providerChatgptIdx: index('idx_codex_account_provider_chatgpt').on(t.providerId, t.chatgptAccountId),
+  })
+);
+
+// ============================================================================
+// Qoder accounts
+// ============================================================================
+
+export const qoderAccounts = sqliteTable(
+  'qoder_accounts',
+  {
+    id: text('id').primaryKey(),
+    providerId: text('provider_id').notNull().references(() => providers.id, { onDelete: 'restrict' }),
+    label: text('label'),
+    email: text('email'),
+    qoderUserId: text('qoder_user_id').notNull(),
+    machineId: text('machine_id').notNull(),
+    encryptedPat: text('encrypted_pat').notNull(),
+    patNonce: text('pat_nonce').notNull(),
+    patVersion: integer('pat_version').notNull().default(1),
+    encryptedJobToken: text('encrypted_job_token').notNull(),
+    jobTokenNonce: text('job_token_nonce').notNull(),
+    jobTokenVersion: integer('job_token_version').notNull().default(1),
+    jobTokenExpiresAt: text('job_token_expires_at').notNull(),
+    catalogJson: text('catalog_json'),
+    catalogFetchedAt: text('catalog_fetched_at'),
+    enabled: integer('enabled', { mode: 'boolean' }).notNull().default(true),
+    healthState: text('health_state', { enum: ['healthy', 'degraded', 'down', 'unknown'] }).notNull().default('unknown'),
+    lastError: text('last_error'),
+    consecutiveFailures: integer('consecutive_failures').notNull().default(0),
+    priority: integer('priority').notNull().default(0),
+    createdAt: text('created_at').notNull().default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ','now'))`),
+    updatedAt: text('updated_at').notNull().default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ','now'))`),
+  },
+  (t) => ({
+    providerEnabledPriorityIdx: index('idx_qoder_account_provider_enabled_priority').on(t.providerId, t.enabled, t.priority),
+    providerUserIdx: index('idx_qoder_account_provider_user').on(t.providerId, t.qoderUserId),
   })
 );
 
@@ -406,6 +442,7 @@ export const requestAttempts = sqliteTable(
     providerId: text('provider_id').notNull(),
     modelId: text('model_id').notNull(),
     codexAccountId: text('codex_account_id').references(() => codexAccounts.id, { onDelete: 'set null' }),
+    qoderAccountId: text('qoder_account_id').references(() => qoderAccounts.id, { onDelete: 'set null' }),
     startedAt: text('started_at').notNull(),
     completedAt: text('completed_at'),
     statusCode: integer('status_code'),
@@ -428,6 +465,7 @@ export const requestAttempts = sqliteTable(
     requestIdx: index('idx_attempt_request').on(t.requestId, t.attemptNumber),
     providerModelIdx: index('idx_attempt_provider_model').on(t.providerId, t.modelId, t.startedAt),
     codexAccountIdx: index('idx_attempt_codex_account').on(t.codexAccountId, t.startedAt),
+    qoderAccountIdx: index('idx_attempt_qoder_account').on(t.qoderAccountId, t.startedAt),
   })
 );
 
@@ -561,6 +599,7 @@ export const schemaMigrations = sqliteTable('schema_migrations', {
 // Convenience type re-exports
 export type Provider = typeof providers.$inferSelect;
 export type CodexAccount = typeof codexAccounts.$inferSelect;
+export type QoderAccount = typeof qoderAccounts.$inferSelect;
 export type Model = typeof models.$inferSelect;
 export type Combo = typeof combos.$inferSelect;
 export type ComboMember = typeof comboMembers.$inferSelect;

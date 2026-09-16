@@ -9,7 +9,7 @@ import { getCodexAccountForProvider, getCodexAccountById } from '../db/repositor
 import { debugUpstream, errorLine, formatError, truncate } from '../logging/debug';
 
 export interface UpstreamConfig {
-  type: 'openai' | 'anthropic' | 'codex';
+  type: 'openai' | 'anthropic' | 'codex' | 'qoder';
   baseUrl: string;
   apiKey?: string;
   customHeaders: Record<string, string>;
