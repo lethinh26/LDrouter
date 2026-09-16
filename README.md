@@ -20,6 +20,7 @@ Lightweight self-hosted LLM gateway with a polished admin UI. Presents stable Op
 - Prometheus `/metrics`, structured logs, graceful shutdown
 - One distributable npm package, multi-stage Dockerfile, Docker Compose
 - Native Codex OAuth account pools with encrypted JSON/JSONL import, refresh/rotation, account-aware routing, and admin management
+- Native Qoder account pools driven by personal access tokens, with encrypted storage, live model-catalog discovery, and account-aware routing
 
 ## Quick start
 
@@ -63,6 +64,22 @@ The import endpoint requires the normal admin session and CSRF token (`x-csrf-to
 ZIP upload and automatic Codex CLI config-file generation/mutation are not included in this release. LateDev Router does not modify Codex CLI files.
 
 The account panel shows the 5-hour and weekly quota windows with reset countdowns, per-account and bulk usage refresh, weekly reset credits, an opt-in 5-hour window auto-start, and a **Test** control that probes the upstream account without exposing tokens. Routing order is set by dragging rows; the saved order is the fallback order the router uses. **Delete** is permanent and erases the stored encrypted credentials — past request logs are kept but lose the account reference.
+
+### Qoder setup
+
+Qoder providers use a personal access token (PAT) instead of an API key. Create one at `https://qoder.com/account/integrations`; it starts with `pt-`.
+
+1. Set `LATEDEV_MASTER_KEY` before adding a token. It encrypts both the PAT and the derived job token at rest.
+2. In **Providers**, click **Add Qoder**. The server creates the provider with its fixed endpoint — there is no base URL or API key to fill in.
+3. In the Qoder account panel, click **Add token** and paste the PAT, or **Import tokens** to paste/upload a list: one token per line, a JSON array of strings, an `{ "accounts": [...] }` wrapper, or JSONL of strings/objects (`token`, `pt_token`, `personal_token`, `access_token`; optional `label`/`name`/`email`). Only `pt-` tokens are accepted — a `dt-` device token or a `jt-` job token is rejected with that reason rather than failing later upstream.
+
+Adding a token exchanges it immediately for a short-lived job token and fetches the model list; inference then runs against `api2.qoder.sh` using that job token. The PAT is kept so a new job token can always be minted — the operator never has to touch it again. If the token works but the model list cannot be fetched, the account is still stored (health `unknown`, with the error recorded) so you can retry with **Catalog**.
+
+Because the gateway serves model discovery from that live catalog, a new account has no routable models until its first successful fetch. Use **Import models** on the provider row to pull the discovered models in.
+
+**Operational caveat:** a revoked or expired PAT is a durable failure. The account is marked `down` with "personal access token rejected — replace it" and routing skips it; nothing retries it forever. Re-add the account with a fresh token. Deleting an account is permanent and erases the stored encrypted PAT — past request logs are kept but lose the account reference.
+
+The panel shows the masked user id, job-token expiry, when the catalog was last fetched, health, and an enabled toggle. Routing order is set by dragging rows, exactly as with Codex.
 
 ## Environment variables
 

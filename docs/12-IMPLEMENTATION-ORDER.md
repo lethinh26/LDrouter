@@ -51,6 +51,17 @@ Write security tests immediately.
 
 Build the Providers/Models UI in parallel with stable admin endpoints.
 
+## Phase 3.5 — Qoder account pools
+
+- `qoder` added to the provider type union in TypeScript and in the SQL CHECK constraint (migration `0007_qoder_accounts.sql`, a `providers` table rebuild)
+- `qoder_accounts` table plus `request_attempts.qoder_account_id`
+- COSY request signing, `Encode=1` body obfuscation, context-tier escalation, and the SSE envelope reader
+- PAT → job-token exchange with a live model-catalog fetch, coalesced per account
+- account-pool routing: one candidate per eligible account, `degraded` still eligible, health written back on auth and quota failures
+- admin API and the Qoder panel/import dialog on the providers page
+
+Depends on Phase 3 (provider CRUD and the pool-provider seam) and Phase 6 (routing) being in place.
+
 ## Phase 4 — Gateway key security and limits
 
 - `ld-` key generation
