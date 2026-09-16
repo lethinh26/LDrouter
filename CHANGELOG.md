@@ -4,6 +4,21 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.17.0] - 2026-09-17
+
+### Added
+
+- **Qoder provider.** Qoder joins OpenAI, Anthropic and Codex as a first-class provider type, backed by personal access tokens (`pt-…`) that are exchanged for short-lived job tokens and stored encrypted. It brings a per-account pool with drag-to-reorder routing priority, live model-catalog import, an account health panel, bulk token import, and the signed (COSY) streaming and non-streaming chat client, including context-tier selection and the `Encode=1` body encoding.
+
+### Fixed
+
+- **Codex requests never satisfied the backend contract.** Every call answered `502 Codex upstream HTTP 400`: the backend requires `store: false` and `stream: true` verbatim. Non-streaming requests are now served by merging the upstream stream, which also restores tool calls — `response.completed` always carries `output: []`, so they are only observable on `response.output_item.done` and were previously dropped silently on both paths.
+- **Expired Codex tokens could never be refreshed.** Routing and the account lookup rejected an account whose access token had expired, even though credentials are refreshed before use, so a healthy account stopped carrying traffic once its token aged out. The refresh client also omitted `client_id`, making every refresh fail on the backend side. Both are fixed and the account now recovers on the next request.
+- **Codex rejected three optional parameters.** `max_output_tokens`, `temperature` and `top_p` each answered `400 Unsupported parameter`, so any client that set `max_tokens` against a `codex/` model failed — including the Models-page Test button, which always sets it. They are no longer forwarded; `instructions`, `tools` and `reasoning` still are.
+- **Several admin actions failed with `403 CSRF token required`.** The model Test button, database backup create/restore, and the first-run database import called `fetch` directly instead of the shared client, so they carried no CSRF header while every authenticated admin mutation requires one. They now use a CSRF-aware wrapper; the first-run import is the deliberate exception, since no admin session exists yet.
+- **The first-run database import was unreachable.** `POST /api/admin/backup/restore` answered `401 Login required` on a fresh instance, because its exemption from auth ran alongside the other admin modules' hooks on a shared scope, and a `preHandler` cannot cancel a later one. Backup routes now register in their own scope.
+- **The Qoder account enable/disable button appeared dead.** The toggle wrote to the server correctly but never re-read the list, so the row kept showing its previous state. Test and Catalog had the same gap.
+
 ## [1.16.5] - 2026-09-15
 
 ### Fixed
