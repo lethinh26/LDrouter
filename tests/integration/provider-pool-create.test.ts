@@ -18,6 +18,10 @@ const post = (body: unknown) => fetch(`${baseUrl}/api/admin/providers`, {
   method: 'POST', headers: { 'content-type': 'application/json', cookie, 'x-csrf-token': csrf }, body: JSON.stringify(body),
 });
 
+const patch = (body: unknown) => fetch(`${baseUrl}/api/admin/providers`, {
+  method: 'PATCH', headers: { 'content-type': 'application/json', cookie, 'x-csrf-token': csrf }, body: JSON.stringify(body),
+});
+
 beforeAll(async () => {
   const { buildApp } = await import('../../src/server/app');
   app = await buildApp();
@@ -95,6 +99,17 @@ describe('one-click account-pool provider creation', () => {
     expect(seen).toEqual(['acct-degraded', 'acct-degraded']);
     const health = getRawDb().prepare('SELECT health_state AS healthState FROM providers WHERE id=?').get(providerId) as { healthState: string };
     expect(health.healthState).toBe('healthy');
+  });
+
+  it('refuses to store an API key PATCHed onto a pool provider', async () => {
+    // Same §5.7 invariant as the create path, one call path over: a pool type has no API-key field,
+    // so PATCH must leave encrypted_api_key/api_key_nonce/api_key_version untouched.
+    const providerId = (await codexRows())[0]!.id;
+    const res = await patch({ id: providerId, apiKey: 'sk-patched-onto-a-pool-provider' });
+    expect(res.status).toBe(200);
+    const { getRawDb } = await import('../../src/server/db');
+    const stored = getRawDb().prepare('SELECT encrypted_api_key AS key, api_key_nonce AS nonce FROM providers WHERE id=?').get(providerId) as { key: string | null; nonce: string | null };
+    expect(stored).toEqual({ key: null, nonce: null });
   });
 
   it('still requires base URL and API key for a compatible provider', async () => {

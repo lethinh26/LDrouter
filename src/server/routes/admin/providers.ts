@@ -134,9 +134,12 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
     const p = db.select().from(schema.providers).where(eq(schema.providers.id, body.id)).get();
     if (!p) throw new GatewayError('invalid_request_error', 'Provider not found', { status: 404 });
     const update: Partial<typeof schema.providers.$inferInsert> = { updatedAt: new Date().toISOString() };
+    // A pool type has no API-key field (spec §5.7). Same rule as the create path: skip the whole
+    // encryption block, so an existing key on the row is not disturbed either.
+    const pool = getPooledProvider(p.type);
     if (body.name) update.name = body.name;
     if (body.slug) update.slug = slugify(body.slug);
-    if (body.baseUrl) update.baseUrl = getPooledProvider(p.type)?.defaults.baseUrl ?? body.baseUrl;
+    if (body.baseUrl) update.baseUrl = pool?.defaults.baseUrl ?? body.baseUrl;
     if (body.enabled !== undefined) update.enabled = body.enabled;
     if (body.connectTimeoutMs !== undefined) update.connectTimeoutMs = body.connectTimeoutMs;
     if (body.firstTokenTimeoutMs !== undefined) update.firstTokenTimeoutMs = body.firstTokenTimeoutMs;
@@ -145,7 +148,7 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
     if (body.maxRetries !== undefined) update.maxRetries = body.maxRetries;
     if (body.cbFailureThreshold !== undefined) update.cbFailureThreshold = body.cbFailureThreshold;
     if (body.cbCooldownSeconds !== undefined) update.cbCooldownSeconds = body.cbCooldownSeconds;
-    if (body.apiKey) {
+    if (body.apiKey && !pool) {
       const enc = encryptSecret(body.apiKey);
       update.encryptedApiKey = enc.ciphertext;
       update.apiKeyNonce = enc.nonce;
