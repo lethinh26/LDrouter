@@ -85,6 +85,28 @@ describe('Qoder SSE envelope reader', () => {
     expect(r.text).toBe('obj');
   });
 
+  it('ends on usage-only termination when a delta frame carries usage without a finish_reason', () => {
+    // Regression: the delta path used to require BOTH pendingFinish and pendingUsage, so this
+    // shape left the stream open forever. Assert without finish() — calling finish() first
+    // would flushPending() and make the broken code pass.
+    const r = reader();
+    r.push(frame({ id: 'c1', choices: [{ index: 0, delta: { content: 'hi' } }], usage: { prompt_tokens: 3, completion_tokens: 1 } }));
+    expect(r.terminal()).toBe(true);
+    const last = JSON.parse(r.chunks.at(-1)!) as { choices: Array<{ finish_reason: string; delta: object }>; usage: { prompt_tokens: number } };
+    expect(last.choices[0]!.finish_reason).toBe('stop');
+    expect(last.choices[0]!.delta).toEqual({});
+    expect(last.usage.prompt_tokens).toBe(3);
+    expect(r.text).toBe('hi');
+    expect(r.finishReason).toBe('stop'); // accessor reports the value we actually emitted
+  });
+
+  it('does not overwrite a real upstream finish_reason in the accessor', () => {
+    const r = reader();
+    r.push(frame({ id: 'c1', choices: [{ index: 0, delta: { content: 'x', finish_reason: 'length' } }], usage: { prompt_tokens: 2, completion_tokens: 1 } }));
+    expect(r.terminal()).toBe(true);
+    expect(r.finishReason).toBe('length');
+  });
+
   it('preserves a non-stop finish reason across the coalesce', () => {
     const r = reader();
     r.push(frame({ id: 'c1', choices: [{ index: 0, delta: { tool_calls: [{ id: 't1', function: { name: 'f', arguments: '{}' } }], finish_reason: 'tool_calls' } }] }));

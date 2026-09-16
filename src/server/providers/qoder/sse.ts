@@ -139,17 +139,23 @@ export class QoderEnvelopeReader {
       // Forward the upstream finish reason verbatim; a `tool_calls` finish must survive
       // the coalesce, so never coerce it to 'stop' here.
       if (finish) { this.finishForwarded = true; this.pendingFinish = finish; this.finishReason = finish; }
-      if (this.pendingFinish && this.pendingUsage) { this.emitTerminal(); return; }
+      this.endOnUsage();
       return;
     }
 
     if (finish) { this.pendingFinish = finish; this.finishReason = finish; }
-    // A usage frame terminates the stream even when no finish_reason was ever seen:
-    // usage arriving is itself the end-of-stream signal.
-    if (this.pendingUsage) {
-      if (!this.pendingFinish) this.pendingFinish = 'stop';
-      this.emitTerminal();
-    }
+    this.endOnUsage();
+  }
+
+  /**
+   * A usage frame terminates the stream even when no finish_reason was ever seen: usage
+   * arriving is itself the end-of-stream signal. Shared by both entry paths so they cannot
+   * drift apart. When both are present the coalesce still happens in emitTerminal().
+   */
+  private endOnUsage(): void {
+    if (!this.pendingUsage) return;
+    if (!this.pendingFinish) this.pendingFinish = 'stop';
+    this.emitTerminal();
   }
 
   private emit(chunk: Record<string, unknown>): void {
@@ -158,6 +164,10 @@ export class QoderEnvelopeReader {
 
   private emitTerminal(): void {
     if (this.pendingFinish || this.pendingUsage) {
+      // We only reach here with finishReason still null when we synthesized 'stop' ourselves
+      // (usage-only termination). The accessor must report what went on the wire; a real
+      // upstream reason is always recorded alongside pendingFinish and is never overwritten.
+      if (!this.finishReason) this.finishReason = 'stop';
       this.usage = this.pendingUsage ?? this.usage;
       this.chunks.push(JSON.stringify({
         id: this.meta.id ?? `qoder-${Date.now()}`,
