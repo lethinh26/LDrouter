@@ -3,6 +3,7 @@ import {
   codexHeaders,
   codexModels,
   codexRequest,
+  codexRequestPayload,
   codexResponseToCanonical,
   codexStreamEventToCanonical,
   probeCodex,
@@ -16,6 +17,40 @@ afterEach(() => vi.unstubAllGlobals());
 const config = (): CodexProviderConfig => ({
   baseUrl: 'https://chatgpt.com', accountId: 'acct-1', accessToken: 'access-secret',
   customHeaders: {}, totalTimeoutMs: 10_000,
+});
+
+describe('codexRequestPayload', () => {
+  const req = (extra: Partial<import('../../src/server/routing/capabilities').CanonicalRequest> = {}) => ({
+    model: 'codex/gpt-5.5',
+    messages: [{ role: 'user' as const, content: [{ type: 'text' as const, text: 'hi' }] }],
+    stream: true,
+    ...extra,
+  });
+
+  it('always sends store:false and stream:true', () => {
+    const payload = codexRequestPayload(req());
+    expect(payload.store).toBe(false);
+    expect(payload.stream).toBe(true);
+    expect(payload.model).toBe('codex/gpt-5.5');
+  });
+
+  // The Codex backend answers 400 'Unsupported parameter: <name>' for each of these. Verified live
+  // against chatgpt.com; the Models-page Test button failed with exactly this before the fix.
+  it.each(['max_output_tokens', 'temperature', 'top_p'])('never forwards %s', (param) => {
+    const payload = codexRequestPayload(req({ maxOutputTokens: 256, temperature: 0.7, topP: 0.9 }));
+    expect(payload).not.toHaveProperty(param);
+  });
+
+  it('keeps the parameters the backend does accept', () => {
+    const payload = codexRequestPayload(req({
+      system: 'be terse',
+      tools: [{ name: 'get_weather', description: 'w', inputSchema: { type: 'object' } }],
+      reasoning: { effort: 'low' },
+    }));
+    expect(payload.instructions).toBe('be terse');
+    expect(payload.reasoning).toEqual({ effort: 'low' });
+    expect(payload.tools).toEqual([{ type: 'function', name: 'get_weather', description: 'w', parameters: { type: 'object' } }]);
+  });
 });
 
 describe('Codex upstream adapter', () => {

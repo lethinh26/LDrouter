@@ -110,7 +110,9 @@ export function codexRequestPayload(req: CanonicalRequest, targetModel = req.mod
   }).filter(Boolean) }));
   const payload: Record<string, unknown> = { model: targetModel, input, ...CODEX_REQUIRED_FLAGS };
   if (req.system) payload.instructions = req.system;
-  if (req.maxOutputTokens !== undefined) payload.max_output_tokens = req.maxOutputTokens;
+  // max_output_tokens, temperature and top_p are NOT forwarded: the Codex backend rejects each
+  // with 400 "Unsupported parameter" (verified live against chatgpt.com). The Codex CLI omits them
+  // too, so a client that sets max_tokens on a codex/ model still gets a working request.
   if (req.tools?.length) payload.tools = req.tools.map((tool) => ({ type: 'function', name: tool.name, description: tool.description, parameters: tool.inputSchema }));
   if (req.reasoning?.effort) payload.reasoning = { effort: req.reasoning.effort };
   return payload;
