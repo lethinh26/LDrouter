@@ -3,11 +3,15 @@
 // per-type probe/discover/account branches out of the provider CRUD route.
 import { GatewayError } from '../errors';
 import { listCodexAccountSummaries, chatgptAccountIdOf } from '../db/repositories/codex-accounts';
+import { listQoderAccountSummaries } from '../db/repositories/qoder-accounts';
 import { probeCodex, codexModels, CODEX_BASE_URL } from './codex';
 import { withCodexCredentials, codexCredentialError } from './codex-refresh';
+import { probeQoder, qoderModels } from './qoder/client';
+import { withQoderCredentials } from './qoder/credentials';
+import { QODER_INFERENCE_BASE } from './qoder/constants';
 import type { DiscoveredModel, ProbeResult } from './index';
 
-export const POOLED_PROVIDER_TYPES = ['codex'] as const;
+export const POOLED_PROVIDER_TYPES = ['codex', 'qoder'] as const;
 export type PooledProviderType = (typeof POOLED_PROVIDER_TYPES)[number];
 
 export interface PooledAccountSummary { id: string; enabled: boolean; healthState: string }
@@ -60,7 +64,35 @@ const codexStrategy: PooledProvider = {
   },
 };
 
-const STRATEGIES: Record<PooledProviderType, PooledProvider> = { codex: codexStrategy };
+const qoderStrategy: PooledProvider = {
+  defaults: { name: 'Qoder', slug: 'qoder', baseUrl: QODER_INFERENCE_BASE },
+  accountsTable: 'qoder_accounts',
+  listAccounts: (providerId) => listQoderAccountSummaries(providerId),
+  // Same contract as Codex: `firstEligible` is the single eligibility gate, and the probe goes
+  // through the credential seam so a stale job token is refreshed before the upstream is asked.
+  probe: async (provider) => {
+    const account = firstEligible(qoderStrategy.listAccounts(provider.id));
+    return withQoderCredentials(account.id, (config) => probeQoder({ ...config, accountRecordId: account.id, totalTimeoutMs: Math.min(provider.totalTimeoutMs, 20_000) }))
+      .catch((error) => { throw qoderCredentialError(error); });
+  },
+  discover: async (provider) => {
+    const account = firstEligible(qoderStrategy.listAccounts(provider.id));
+    return withQoderCredentials(account.id, (config) => {
+      if (!config.catalog) throw new GatewayError('invalid_request_error', 'Qoder model catalog is empty — the account has no usable models', { status: 400, code: 'model_config_not_cached' });
+      return Promise.resolve(qoderModels(config.catalog));
+    }).catch((error) => { throw qoderCredentialError(error); });
+  },
+};
+
+/** Qoder fixes credential failures by replacing the PAT, not by re-saving a provider API key. */
+function qoderCredentialError(error: unknown): unknown {
+  if (error instanceof GatewayError) return error;
+  const code = error instanceof Error ? error.message : '';
+  if (code === 'account_not_found') return new GatewayError('invalid_request_error', 'Qoder account not found', { status: 404 });
+  return error;
+}
+
+const STRATEGIES: Record<PooledProviderType, PooledProvider> = { codex: codexStrategy, qoder: qoderStrategy };
 /** null for types the registry does not own (openai / anthropic-compatible keep the generic path). */
 export function getPooledProvider(type: string): PooledProvider | null {
   return (STRATEGIES as Record<string, PooledProvider>)[type] ?? null;

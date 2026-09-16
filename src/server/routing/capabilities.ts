@@ -98,6 +98,7 @@ export type RejectionReason =
   | 'combo_disabled'
   | 'member_disabled'
   | 'codex_account_unavailable'
+  | 'qoder_account_unavailable'
   | 'streaming'
   | 'tools'
   | 'structured_output'
@@ -135,6 +136,7 @@ const NON_CAPABILITY_TEXT: Partial<Record<RejectionReason, string>> = {
   combo_disabled: 'combo disabled',
   member_disabled: 'disabled in this combo',
   codex_account_unavailable: 'no available Codex account',
+  qoder_account_unavailable: 'no enabled Qoder account is available — check the account group',
 };
 
 const REASON_TEXT: Record<RejectionReason, string> = {

@@ -89,6 +89,9 @@ export async function registerModelRoutes(app: FastifyInstance): Promise<void> {
     const { codexModels } = await import('../../providers/codex');
     const { getCodexAccountById, listCodexAccountSummaries } = await import('../../db/repositories/codex-accounts');
     const { withCodexCredentials } = await import('../../providers/codex-refresh');
+    const { withQoderCredentials } = await import('../../providers/qoder/credentials');
+    const { qoderModels } = await import('../../providers/qoder/client');
+    const { listQoderAccountSummaries } = await import('../../db/repositories/qoder-accounts');
     let discovered: Array<{ upstreamId: string; displayName: string; capabilities: Record<string, unknown> }>;
     try {
       if (provider.type === 'codex') {
@@ -99,6 +102,14 @@ export async function registerModelRoutes(app: FastifyInstance): Promise<void> {
           baseUrl: provider.baseUrl, accountId: account.chatgptAccountId, accessToken: credentials.accessToken,
           accountRecordId: account.id, customHeaders: {}, totalTimeoutMs: Math.min(provider.totalTimeoutMs, 30000),
         }));
+      } else if (provider.type === 'qoder') {
+        // The catalog is fetched live from the first eligible account; no manual model list.
+        const summary = listQoderAccountSummaries(provider.id).find((candidate) => candidate.enabled && candidate.healthState !== 'down');
+        if (!summary) throw new GatewayError('authentication_error', 'No eligible Qoder account is configured', { status: 503 });
+        discovered = await withQoderCredentials(summary.id, (config) => {
+          if (!config.catalog) throw new GatewayError('invalid_request_error', 'Qoder model catalog is empty — replace the personal access token', { status: 400, code: 'model_config_not_cached' });
+          return Promise.resolve(qoderModels(config.catalog));
+        });
       } else {
         if (!provider.encryptedApiKey || !provider.apiKeyNonce) throw new GatewayError('invalid_request_error', 'Provider credentials are missing', { status: 501 });
         const apiKey = decryptSecret({ ciphertext: provider.encryptedApiKey, nonce: provider.apiKeyNonce, version: provider.apiKeyVersion });

@@ -6,6 +6,7 @@ import { GatewayError } from '../errors';
 import { buildHeaders, stripSlash } from '../providers/index';
 import { redactString } from '../security/redact';
 import { getCodexAccountForProvider, getCodexAccountById } from '../db/repositories/codex-accounts';
+import { findEligibleQoderAccount } from '../db/repositories/qoder-accounts';
 import { debugUpstream, errorLine, formatError, truncate } from '../logging/debug';
 
 export interface UpstreamConfig {
@@ -18,6 +19,8 @@ export interface UpstreamConfig {
   streamIdleTimeoutMs: number;
   totalTimeoutMs: number;
   codexAccountId?: string;
+  qoderUserId?: string;
+  qoderAccountRecordId?: string;
   accountRecordId?: string;
 }
 
@@ -39,6 +42,18 @@ export function providerToUpstreamConfig(p: Provider, codexAccountId?: string): 
       connectTimeoutMs: p.connectTimeoutMs, firstTokenTimeoutMs: p.firstTokenTimeoutMs,
       streamIdleTimeoutMs: p.streamIdleTimeoutMs, totalTimeoutMs: p.totalTimeoutMs,
       codexAccountId: account.chatgptAccountId, accountRecordId: account.id,
+    };
+  }
+  if (p.type === 'qoder') {
+    // Account-pool provider: no API key on the row. The runner normally overrides the account
+    // from the expanded candidate; this resolves the first eligible one for direct callers.
+    const account = findEligibleQoderAccount(p.id);
+    if (!account) throw new GatewayError('authentication_error', 'No usable Qoder account is configured', { status: 503 });
+    return {
+      type: 'qoder', baseUrl: p.baseUrl, customHeaders: {},
+      connectTimeoutMs: p.connectTimeoutMs, firstTokenTimeoutMs: p.firstTokenTimeoutMs,
+      streamIdleTimeoutMs: p.streamIdleTimeoutMs, totalTimeoutMs: p.totalTimeoutMs,
+      qoderUserId: account.qoderUserId, qoderAccountRecordId: account.id,
     };
   }
   if (!p.encryptedApiKey || !p.apiKeyNonce) {

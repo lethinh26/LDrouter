@@ -5,8 +5,11 @@ import { eq } from 'drizzle-orm';
 import { GatewayError } from '../errors';
 import { resolveRequestedModel, unwrapAlias } from '../routing/resolver';
 import { bareModelName, deriveRequiredCapabilities, describeRejections, firstMissingCapability, type CanonicalRequest, type RejectedMember, type RejectionReason, type RequiredCapabilities } from '../routing/capabilities';
-import { loadCombo, selectCandidates, orderCandidates, shouldFallback, expandCodexAccountCandidates, type ComboPlan, type CandidateModel } from '../routing/combo';
+import { loadCombo, selectCandidates, orderCandidates, shouldFallback, expandCodexAccountCandidates, expandQoderAccountCandidates, type ComboPlan, type CandidateModel } from '../routing/combo';
 import { listCodexAccountsForProvider, setCodexAccountHealth } from '../db/repositories/codex-accounts';
+import { listQoderAccountsForProvider, setQoderAccountHealth } from '../db/repositories/qoder-accounts';
+import { qoderAttemptFailure, qoderCredentialsFor } from '../providers/qoder/credentials';
+import { callQoderNonStreaming, callQoderStreaming } from '../providers/qoder/client';
 import { getEffectiveState, isOpen, recordSuccess, recordFailure, halfOpenProbeAllowed } from '../routing/circuit';
 import { checkRpm, checkTpm, acquireConcurrent, releaseConcurrent } from '../routing/ratelimit';
 import { checkDailyMonthly, consumeUsage } from '../routing/quota';
@@ -65,6 +68,7 @@ export interface AttemptOutcome {
   partialResponse: boolean;
   selectionReason: string;
   codexAccountId?: string;
+  qoderAccountId?: string;
   failureReason: string | null;
   sanitizedError: string | null;
   upstreamRequestId: string | null;
@@ -203,7 +207,9 @@ export class GatewayRunner {
         }
         candidates = orderCandidates(comboPlan, filtered).flatMap((candidate) => {
           const provider = getDb().select().from(schema.providers).where(eq(schema.providers.id, candidate.providerId)).get();
-          return provider?.type === 'codex' ? expandCodexAccountCandidates(candidate, listCodexAccountsForProvider(provider.id)) : [candidate];
+          if (provider?.type === 'codex') return expandCodexAccountCandidates(candidate, listCodexAccountsForProvider(provider.id));
+          if (provider?.type === 'qoder') return expandQoderAccountCandidates(candidate, listQoderAccountsForProvider(provider.id));
+          return [candidate];
         });
         debugHttp(ctx.requestId, 'CANDIDATES ORDERED', [
           `mode=${comboPlan.mode}`,
@@ -310,6 +316,7 @@ export class GatewayRunner {
           partialResponse: false,
           selectionReason: candidate.selectionReason ?? selectionReasons[0] ?? 'direct',
           codexAccountId: candidate.codexAccountId,
+          qoderAccountId: candidate.qoderAccountId,
           failureReason: null,
           sanitizedError: null,
           upstreamRequestId: null,
@@ -344,6 +351,7 @@ export class GatewayRunner {
           resultFinishReason = out.result.finishReason;
           recordSuccess(provider.id);
           if (candidate.codexAccountId) setCodexAccountHealth(candidate.codexAccountId, 'healthy');
+          if (candidate.qoderAccountId) setQoderAccountHealth(candidate.qoderAccountId, 'healthy');
           getDb().update(schema.providers).set({ healthState: 'healthy', updatedAt: new Date().toISOString() }).where(eq(schema.providers.id, provider.id)).run();
           attempts.push(attempt);
           sentToClient = (out as { streamStarted?: boolean }).streamStarted ?? false;
@@ -379,6 +387,7 @@ export class GatewayRunner {
           if (isUpstreamHealthFailure(err)) {
             recordFailure(provider.id, provider.cbFailureThreshold, provider.cbCooldownSeconds);
             if (candidate.codexAccountId) setCodexAccountHealth(candidate.codexAccountId, 'down', redactString(err.message));
+            if (candidate.qoderAccountId) setQoderAccountHealth(candidate.qoderAccountId, 'down', redactString(err.message));
             getDb().update(schema.providers).set({ healthState: 'down', updatedAt: new Date().toISOString() }).where(eq(schema.providers.id, provider.id)).run();
           }
           if (shouldRetry && i + 1 < maxAttempts) {
@@ -472,6 +481,7 @@ export class GatewayRunner {
       upstreamAvailable: m.upstreamAvailable,
       circuitOpen: isOpen(m.providerId),
       capabilities: caps as never,
+      providerType: p.type,
     };
     if (!m.enabled) return { candidates: [], rejected: reject(m.publicModelId, 'model_disabled') };
     if (!m.upstreamAvailable) return { candidates: [], rejected: reject(m.publicModelId, 'upstream_unavailable') };
@@ -493,6 +503,11 @@ export class GatewayRunner {
       if (expanded.length === 0) return { candidates: [], rejected: reject(m.publicModelId, 'codex_account_unavailable') };
       return { candidates: expanded, rejected: [] };
     }
+    if (p.type === 'qoder') {
+      const expanded = expandQoderAccountCandidates(candidate, listQoderAccountsForProvider(p.id));
+      if (expanded.length === 0) return { candidates: [], rejected: reject(m.publicModelId, 'qoder_account_unavailable') };
+      return { candidates: expanded, rejected: [] };
+    }
     return { candidates: [candidate], rejected: [] };
   }
 
@@ -501,6 +516,7 @@ export class GatewayRunner {
     const models = db.select().from(schema.models).all();
     const providers = db.select().from(schema.providers).all();
     const providerEnabled = new Map(providers.map((p) => [p.id, p.enabled]));
+    const providerType = new Map(providers.map((p) => [p.id, p.type as string]));
     // Deliberately unfiltered: every combo member must reach selectCandidates so
     // it can report WHY it was skipped. Pre-filtering here erased the model rows
     // and turned every distinct reason into "model not found".
@@ -513,6 +529,7 @@ export class GatewayRunner {
       upstreamAvailable: m.upstreamAvailable,
       circuitOpen: isOpen(m.providerId),
       capabilities: safeJson(m.capabilitiesJson) as never,
+      providerType: providerType.get(m.providerId),
     }));
   }
 
@@ -542,6 +559,20 @@ export class GatewayRunner {
     if (cfg.type === 'codex') {
       const out = await callCodexNonStreaming({ baseUrl: cfg.baseUrl, accountId: cfg.codexAccountId ?? '', accountRecordId: cfg.accountRecordId, customHeaders: cfg.customHeaders, totalTimeoutMs: cfg.totalTimeoutMs }, { ...req.canonical, model: upstreamModel });
       return { statusCode: out.status, ttftMs: null, upstreamRequestId: out.upstreamRequestId, usage: out.usage, result: { text: out.text, toolCalls: out.toolCalls, finishReason: out.finishReason } };
+    }
+    if (cfg.type === 'qoder') {
+      const accountRecordId = candidate.qoderAccountId ?? cfg.qoderAccountRecordId;
+      if (!accountRecordId) throw new GatewayError('upstream_unavailable', 'No Qoder account is available for this request', { status: 503, code: 'qoder_account_unavailable' });
+      try {
+        const { config } = await qoderCredentialsFor(accountRecordId);
+        const out = await callQoderNonStreaming(
+          { ...config, accountRecordId, name: config.label ?? undefined, email: config.email, totalTimeoutMs: cfg.totalTimeoutMs },
+          { ...req.canonical, model: upstreamModel },
+        );
+        return { statusCode: out.status, ttftMs: null, upstreamRequestId: out.upstreamRequestId, usage: out.usage, result: { text: out.text, toolCalls: out.toolCalls, finishReason: out.finishReason } };
+      } catch (error) {
+        return qoderAttemptFailure(accountRecordId, error) as never;
+      }
     }
     let call: UpstreamCall;
     if (cfg.type === 'openai') {
@@ -728,6 +759,31 @@ export class GatewayRunner {
         pipe.end();
         if (!usage.total) usage.total = usage.input + usage.output;
         return { statusCode: meta.status, ttftMs: events.length ? Date.now() - streamStartTs : null, upstreamRequestId: meta.upstreamRequestId, usage, result: { text: textBuf, toolCalls: toolBuf, finishReason } };
+      }
+      if (cfg.type === 'qoder') {
+        const accountRecordId = candidate.qoderAccountId ?? cfg.qoderAccountRecordId;
+        if (!accountRecordId) throw new GatewayError('upstream_unavailable', 'No Qoder account is available for this request', { status: 503, code: 'qoder_account_unavailable' });
+        let firstQoderChunk = true;
+        let qoderTtftMs: number | null = null;
+        try {
+          const { config } = await qoderCredentialsFor(accountRecordId);
+          const out = await callQoderStreaming(
+            { ...config, accountRecordId, name: config.label ?? undefined, email: config.email, totalTimeoutMs: cfg.totalTimeoutMs },
+            { ...req.canonical, model: upstreamModel },
+            // Qoder already emits OpenAI-shaped chunks, so they pipe through unchanged.
+            (chunk) => {
+              if (firstQoderChunk) { qoderTtftMs = Date.now() - streamStartTs; firstQoderChunk = false; }
+              chunkHandler({ data: chunk.data }, false);
+            },
+          );
+          if (!headWritten) writeHead();
+          pipe.write('data: [DONE]\n\n');
+          pipe.end();
+          if (!usage.total) usage.total = usage.input + usage.output;
+          return { statusCode: out.status, ttftMs: qoderTtftMs, upstreamRequestId: out.upstreamRequestId, usage, result: { text: out.text, toolCalls: out.toolCalls, finishReason: out.finishReason } };
+        } catch (error) {
+          return qoderAttemptFailure(accountRecordId, error) as never;
+        }
       }
       const url = cfg.type === 'openai' ? upstreamUrl(cfg, '/v1/chat/completions') : upstreamUrl(cfg, '/v1/messages');
       const payload = cfg.type === 'openai' ? canonicalToOpenAIRequest(req.canonical, upstreamModel) : canonicalToAnthropicRequest(req.canonical, upstreamModel);
@@ -984,6 +1040,7 @@ export class GatewayRunner {
         providerId: a.providerId,
         modelId: a.modelId,
         codexAccountId: a.codexAccountId ?? null,
+        qoderAccountId: a.qoderAccountId ?? null,
         startedAt: a.startedAt,
         completedAt: a.completedAt,
         statusCode: a.statusCode,

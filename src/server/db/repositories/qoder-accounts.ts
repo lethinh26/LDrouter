@@ -144,6 +144,12 @@ export function getQoderAccountRefreshState(id: string): { jobTokenExpiresAt: st
   return row ?? null;
 }
 
+/** Identity of one account by its own id (the pool-wide lookups are keyed by provider). */
+export function getQoderAccountDetailById(id: string): QoderAccountDetail | null {
+  const row = getRawDb().prepare(`SELECT ${SUMMARY_COLUMNS} FROM qoder_accounts WHERE id=?`).get(id) as SummaryRow | undefined;
+  return row ? { ...toQoderAccountSummary(row), qoderUserId: row.qoderUserId, machineId: row.machineId } : null;
+}
+
 function persistQoderAccount(providerId: string, record: NormalizedQoderRecord, existingId?: string): string {
   const raw = getRawDb();
   const pat = encryptSecret(record.personalToken);

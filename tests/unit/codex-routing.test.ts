@@ -17,11 +17,11 @@ describe('Codex account routing', () => {
     { id: 'c', chatgptAccountId: 'chat-c', enabled: true, healthState: 'unknown', tokenExpiresAt: '2000-01-01T00:00:00.000Z', priority: 2 },
   ];
   it('filters unusable accounts and preserves priority order', () => {
-    const result = expandCodexAccountCandidates({ modelId: 'm', publicModelId: 'codex/gpt', providerId: 'p', enabled: true, upstreamAvailable: true, circuitOpen: false, capabilities: {} }, accounts, new Date('2026-01-01T00:00:00.000Z'));
+    const result = expandCodexAccountCandidates({ modelId: 'm', publicModelId: 'codex/gpt', providerId: 'p', enabled: true, upstreamAvailable: true, circuitOpen: false, capabilities: {}, providerType: 'codex' }, accounts, new Date('2026-01-01T00:00:00.000Z'));
     expect(result.map((x) => x.codexAccountId)).toEqual(['a']);
   });
   it('does not expand non-Codex candidates', () => {
-    const candidate = { modelId: 'm', publicModelId: 'openai/gpt', providerId: 'p', enabled: true, upstreamAvailable: true, circuitOpen: false, capabilities: {} } as const;
+    const candidate = { modelId: 'm', publicModelId: 'openai/gpt', providerId: 'p', enabled: true, upstreamAvailable: true, circuitOpen: false, capabilities: {}, providerType: 'openai' } as const;
     expect(expandCodexAccountCandidates(candidate, accounts)).toEqual([candidate]);
   });
 

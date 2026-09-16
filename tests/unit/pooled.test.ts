@@ -15,12 +15,41 @@ vi.mock('../../src/server/providers/codex-refresh', () => ({
   codexCredentialError: vi.fn((e: unknown) => e),
 }));
 
+vi.mock('../../src/server/db/repositories/qoder-accounts', () => ({
+  listQoderAccountSummaries: vi.fn(() => [{ id: 'qacct-1', enabled: true, healthState: 'healthy' }]),
+}));
+vi.mock('../../src/server/providers/qoder/client', () => ({
+  probeQoder: vi.fn(async () => ({ ok: true, detail: 'Connected (catalog loaded)', latencyMs: 7, modelCount: 2 })),
+  qoderModels: vi.fn(() => [{ upstreamId: 'qmodel_38max', displayName: 'Qwen3.8-Max', capabilities: { chat: true } }]),
+}));
+vi.mock('../../src/server/providers/qoder/credentials', () => ({
+  withQoderCredentials: vi.fn(async (_id: string, fn: (c: unknown) => unknown) => fn({ qoderUserId: 'u1', jobToken: 'jt-1', machineId: 'm1', catalog: { entries: new Map(), fetchedAt: '' }, email: null, label: null })),
+}));
+
 describe('account-pool provider registry', () => {
   it('claims only account-pool types', () => {
     expect(POOLED_PROVIDER_TYPES).toContain('codex');
+    expect(POOLED_PROVIDER_TYPES).toContain('qoder');
     expect(getPooledProvider('openai')).toBeNull();
     expect(getPooledProvider('anthropic')).toBeNull();
     expect(getPooledProvider('codex')).not.toBeNull();
+    expect(getPooledProvider('qoder')).not.toBeNull();
+  });
+
+  it('owns the Qoder provider defaults', () => {
+    expect(pooledProviderDefaults('qoder')).toEqual({ name: 'Qoder', slug: 'qoder', baseUrl: 'https://api2.qoder.sh' });
+  });
+
+  it('lists Qoder accounts through the Qoder strategy', async () => {
+    expect(getPooledProvider('qoder')?.listAccounts('provider-1')).toEqual([{ id: 'qacct-1', enabled: true, healthState: 'healthy' }]);
+    const { listQoderAccountSummaries } = await import('../../src/server/db/repositories/qoder-accounts');
+    expect(vi.mocked(listQoderAccountSummaries)).toHaveBeenCalledWith('provider-1');
+  });
+
+  it('fails closed when a Qoder provider has no eligible account', async () => {
+    const { listQoderAccountSummaries } = await import('../../src/server/db/repositories/qoder-accounts');
+    vi.mocked(listQoderAccountSummaries).mockReturnValueOnce([]);
+    await expect(getPooledProvider('qoder')!.probe({ id: 'p', baseUrl: 'https://api2.qoder.sh', totalTimeoutMs: 1000 })).rejects.toThrow('No eligible account');
   });
 
   it('owns the provider defaults of an account-pool type', () => {

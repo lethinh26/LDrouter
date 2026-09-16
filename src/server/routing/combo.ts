@@ -60,6 +60,9 @@ export interface CandidateModel {
   capabilities: ModelCapabilitiesInput;
   codexAccountId?: string;
   codexChatgptAccountId?: string;
+  qoderAccountId?: string;
+  qoderUserId?: string;
+  providerType?: string;
   selectionReason?: string;
 }
 
@@ -72,8 +75,32 @@ export interface CodexAccountCandidate {
   priority: number;
 }
 
+export interface QoderAccountCandidate {
+  id: string;
+  qoderUserId: string;
+  enabled: boolean;
+  healthState: string;
+  priority: number;
+}
+
+/**
+ * One Qoder candidate per eligible account so account-level fallback works without touching the
+ * combo plan. Keyed off the resolved provider type, never a hardcoded slug prefix.
+ *
+ * A `degraded` account stays eligible: it is a warning (last migration of a billing/quota block),
+ * not a verdict — the runner retries it and the upstream answers honestly. Only `down` and
+ * `disabled` are excluded.
+ */
+export function expandQoderAccountCandidates(candidate: CandidateModel, accounts: QoderAccountCandidate[]): CandidateModel[] {
+  if (candidate.providerType !== 'qoder') return [candidate];
+  const usable = accounts
+    .filter((account) => account.enabled && account.healthState !== 'down')
+    .sort((a, b) => a.priority - b.priority || a.id.localeCompare(b.id));
+  return usable.map((account) => ({ ...candidate, qoderAccountId: account.id, qoderUserId: account.qoderUserId, selectionReason: 'qoder_account' }));
+}
+
 export function expandCodexAccountCandidates(candidate: CandidateModel, accounts: CodexAccountCandidate[], now = new Date()): CandidateModel[] {
-  if (!candidate.publicModelId.startsWith('codex/')) return [candidate];
+  if (candidate.providerType !== 'codex') return [candidate];
   const usable = accounts.filter((a) => a.enabled && (a.healthState === 'healthy' || a.healthState === 'unknown') && Date.parse(a.tokenExpiresAt) > now.getTime())
     .sort((a, b) => a.priority - b.priority || a.id.localeCompare(b.id));
   return usable.map((a) => ({ ...candidate, codexAccountId: a.id, codexChatgptAccountId: a.chatgptAccountId, selectionReason: 'codex_account' }));

@@ -32,7 +32,7 @@ export interface QoderProviderConfig {
   jobToken: string;
   machineId: string;
   name?: string;
-  email?: string;
+  email?: string | null;
   totalTimeoutMs: number;
   catalog: QoderCatalog | null;
 }
@@ -169,7 +169,7 @@ function signedInit(cfg: QoderProviderConfig, payload: Record<string, unknown>, 
         'accept-encoding': 'identity',
         'x-model-key': modelKey,
         'x-model-source': String((payload.model_config as Record<string, unknown> | undefined)?.source ?? 'system'),
-        ...buildCosyHeaders(encoded, QODER_CHAT_URL, { userId: cfg.qoderUserId, authToken: cfg.jobToken, name: cfg.name, email: cfg.email, machineId: cfg.machineId }),
+        ...buildCosyHeaders(encoded, QODER_CHAT_URL, { userId: cfg.qoderUserId, authToken: cfg.jobToken, name: cfg.name, email: cfg.email ?? undefined, machineId: cfg.machineId }),
       },
       body: encoded as unknown as BodyInit,
     },
@@ -181,7 +181,10 @@ async function openSignedStream(
   req: CanonicalRequest,
   deps: QoderDeps,
 ): Promise<{ response: Response; reader: QoderEnvelopeReader; status: number; upstreamRequestId: string | null }> {
-  const modelKey = req.model.split('/').slice(1).join('/');
+  // Accept both a public id (`qoder/qmodel_38max`) and the bare upstream key the runner passes.
+  // Qoder model keys never contain a slash, so the last segment is the key either way — taking it
+  // unconditionally is what makes this idempotent instead of stripping a prefix that may be gone.
+  const modelKey = req.model.split('/').pop() ?? req.model;
   const { payload } = qoderRequestPayload(req, modelKey, cfg.catalog);
   const { init } = signedInit(cfg, payload, modelKey);
   const controller = new AbortController();
