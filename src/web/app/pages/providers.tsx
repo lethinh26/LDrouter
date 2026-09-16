@@ -24,12 +24,15 @@ interface Provider {
   enabled: boolean; health: string; modelCount: number;
 }
 
-const EMPTY = { name: '', slug: '', type: 'openai' as 'openai' | 'anthropic' | 'codex', baseUrl: 'https://api.openai.com', apiKey: '', customHeaders: '', enabled: true };
-// Codex uses the ChatGPT backend, not api.openai.com; prefill so operators do not guess.
-const CODEX_BASE_URL = 'https://chatgpt.com';
-const DEFAULT_BASE_URL: Record<'openai' | 'anthropic' | 'codex', string> = {
-  openai: 'https://api.openai.com', anthropic: 'https://api.anthropic.com', codex: CODEX_BASE_URL,
+const EMPTY = { name: '', slug: '', type: 'openai' as 'openai' | 'anthropic', baseUrl: 'https://api.openai.com', apiKey: '', customHeaders: '', enabled: true };
+const DEFAULT_BASE_URL: Record<'openai' | 'anthropic', string> = {
+  openai: 'https://api.openai.com', anthropic: 'https://api.anthropic.com',
 };
+// Account-pool types are created with one click — the server owns name, slug, and base URL.
+const POOL_PROVIDERS = [{ type: 'codex' as const, label: 'Add Codex' }];
+// Reused from the old Codex branch of the create dialog, which no longer has a Codex mode.
+const POOL_HINT = 'Codex always talks to https://chatgpt.com — the OAuth backend does not exist on api.openai.com.';
+
 
 export function Providers() {
   const [rows, setRows] = useState<Provider[]>([]);
@@ -38,12 +41,13 @@ export function Providers() {
   const [submitting, setSubmitting] = useState(false);
   const [testingId, setTestingId] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
-  const [editForm, setEditForm] = useState<typeof EMPTY>(EMPTY);
+  // The edit dialog may open on a pool provider, so it keeps the full type union.
+  const [editForm, setEditForm] = useState<Omit<typeof EMPTY, 'type'> & { type: Provider['type'] }>(EMPTY);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [deleteSubmitting, setDeleteSubmitting] = useState(false);
   const [discoverProvider, setDiscoverProvider] = useState<Provider | null>(null);
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
-  const requiresApiKey = form.type !== 'codex';
+  const [poolSubmitting, setPoolSubmitting] = useState<string | null>(null);
 
   const reload = async () => {
     try {
@@ -61,14 +65,26 @@ export function Providers() {
         try { customHeaders = JSON.parse(form.customHeaders); }
         catch { throw new Error('Custom headers must be valid JSON object'); }
       }
-      await api.post('/api/admin/providers', { name: form.name, slug: form.slug || undefined, type: form.type, baseUrl: form.baseUrl, apiKey: form.type === 'codex' ? undefined : form.apiKey, customHeaders, enabled: form.enabled });
-      toast.success(form.type === 'codex' ? 'Codex provider created — add accounts next' : 'Provider created');
+      await api.post('/api/admin/providers', { name: form.name, slug: form.slug || undefined, type: form.type, baseUrl: form.baseUrl, apiKey: form.apiKey, customHeaders, enabled: form.enabled });
+      toast.success('Provider created');
       setOpen(false);
       setForm(EMPTY);
-      const result = await api.get<{ providers: Provider[] }>('/api/admin/providers');
-      setRows(result.providers);
+      void reload();
     } catch (e) { toast.error((e as Error).message); }
     finally { setSubmitting(false); }
+  };
+
+  const addPoolProvider = async (type: 'codex') => {
+    setPoolSubmitting(type);
+    try {
+      await api.post('/api/admin/providers', { type });
+      toast.success(`${type === 'codex' ? 'Codex' : type} provider created — add accounts next`);
+      const result = await api.get<{ providers: Provider[] }>('/api/admin/providers');
+      setRows(result.providers);
+      const created = result.providers.find((row) => row.type === type);
+      if (created) setExpanded((current) => ({ ...current, [created.id]: true }));
+    } catch (e) { toast.error((e as Error).message); }
+    finally { setPoolSubmitting(null); }
   };
 
   const test = async (id: string) => {
@@ -114,41 +130,48 @@ export function Providers() {
   return (
     <div>
       <PageHeader title="Providers" description="Upstream LLM providers and their credentials" actions={
-        <Dialog open={open} onOpenChange={setOpen}>
-          <DialogTrigger asChild><Button><Plus className="mr-1 h-4 w-4" /> Add provider</Button></DialogTrigger>
-          <DialogContent>
-            <DialogHeader>
-              <DialogTitle>New provider</DialogTitle>
-              <DialogDescription>{requiresApiKey ? 'API-key or compatible endpoint.' : 'Codex providers authenticate through imported ChatGPT accounts — no API key is stored.'}</DialogDescription>
-            </DialogHeader>
-            <div className="space-y-3">
-              <div><Label htmlFor="provider-name">Name</Label><Input id="provider-name" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></div>
-              <div><Label htmlFor="provider-slug">Slug (optional)</Label><Input id="provider-slug" value={form.slug} onChange={(e) => setForm({ ...form, slug: e.target.value })} /></div>
-              <div><Label>Type</Label>
-                <Select value={form.type} onValueChange={(v) => setForm((current) => ({ ...current, type: v as 'openai' | 'anthropic' | 'codex', baseUrl: DEFAULT_BASE_URL[v as 'openai' | 'anthropic' | 'codex'], apiKey: v === 'codex' ? '' : current.apiKey }))}>
-                  <SelectTrigger><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="openai">OpenAI-compatible</SelectItem>
-                    <SelectItem value="anthropic">Anthropic-compatible</SelectItem>
-                    <SelectItem value="codex">Codex OAuth</SelectItem>
-                  </SelectContent>
-                </Select>
+        <div className="flex gap-2">
+          {POOL_PROVIDERS.map((pool) => {
+            const existing = rows.find((row) => row.type === pool.type);
+            return (
+              <Button key={pool.type} variant="outline" disabled={!!existing || poolSubmitting === pool.type}
+                title={existing ? `${existing.name} already exists` : POOL_HINT}
+                onClick={() => void addPoolProvider(pool.type)}>
+                <Plus className="mr-1 h-4 w-4" />{existing ? `${pool.label} (added)` : pool.label}
+              </Button>
+            );
+          })}
+          <Dialog open={open} onOpenChange={setOpen}>
+            <DialogTrigger asChild><Button>Add compatible provider</Button></DialogTrigger>
+            <DialogContent>
+              <DialogHeader>
+                <DialogTitle>New provider</DialogTitle>
+                <DialogDescription>API-key or compatible endpoint.</DialogDescription>
+              </DialogHeader>
+              <div className="space-y-3">
+                <div><Label htmlFor="provider-name">Name</Label><Input id="provider-name" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></div>
+                <div><Label htmlFor="provider-slug">Slug (optional)</Label><Input id="provider-slug" value={form.slug} onChange={(e) => setForm({ ...form, slug: e.target.value })} /></div>
+                <div><Label>Type</Label>
+                  <Select value={form.type} onValueChange={(v) => setForm((current) => ({ ...current, type: v as 'openai' | 'anthropic', baseUrl: DEFAULT_BASE_URL[v as 'openai' | 'anthropic'] }))}>
+                    <SelectTrigger><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="openai">OpenAI-compatible</SelectItem>
+                      <SelectItem value="anthropic">Anthropic-compatible</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div><Label htmlFor="provider-base-url">Base URL</Label><Input id="provider-base-url" value={form.baseUrl} onChange={(e) => setForm({ ...form, baseUrl: e.target.value })} /></div>
+                <div><Label htmlFor="provider-api-key">API key</Label><Input id="provider-api-key" type="password" value={form.apiKey} onChange={(e) => setForm({ ...form, apiKey: e.target.value })} /></div>
+                <div><Label htmlFor="provider-headers">Custom headers (JSON)</Label><Input id="provider-headers" value={form.customHeaders} onChange={(e) => setForm({ ...form, customHeaders: e.target.value })} placeholder='{"X-Org":"acme"}' /></div>
+                <div className="flex items-center gap-2"><Switch checked={form.enabled} onCheckedChange={(v) => setForm({ ...form, enabled: v })} /><Label>Enabled</Label></div>
               </div>
-              {form.type === 'codex'
-                ? <p className="rounded-md border border-dashed p-3 text-xs text-muted-foreground">Codex always talks to <code>https://chatgpt.com</code> — the OAuth backend does not exist on <code>api.openai.com</code>.</p>
-                : <div><Label htmlFor="provider-base-url">Base URL</Label><Input id="provider-base-url" value={form.baseUrl} onChange={(e) => setForm({ ...form, baseUrl: e.target.value })} /></div>}
-              {requiresApiKey
-                ? <div><Label htmlFor="provider-api-key">API key</Label><Input id="provider-api-key" type="password" value={form.apiKey} onChange={(e) => setForm({ ...form, apiKey: e.target.value })} /></div>
-                : <p className="rounded-md border border-dashed p-3 text-xs text-muted-foreground">After creating this provider, use <span className="font-medium">Import accounts</span> on its row to add Codex OAuth credentials.</p>}
-              <div><Label htmlFor="provider-headers">Custom headers (JSON)</Label><Input id="provider-headers" value={form.customHeaders} onChange={(e) => setForm({ ...form, customHeaders: e.target.value })} placeholder='{"X-Org":"acme"}' /></div>
-              <div className="flex items-center gap-2"><Switch checked={form.enabled} onCheckedChange={(v) => setForm({ ...form, enabled: v })} /><Label>Enabled</Label></div>
-            </div>
-            <DialogFooter>
-              <Button variant="outline" onClick={() => setOpen(false)}>Cancel</Button>
-              <Button disabled={submitting || !form.name || (requiresApiKey && !form.apiKey)} onClick={submit}>{submitting ? 'Creating…' : requiresApiKey ? 'Create' : 'Create and add accounts'}</Button>
-            </DialogFooter>
-          </DialogContent>
-        </Dialog>
+              <DialogFooter>
+                <Button variant="outline" onClick={() => setOpen(false)}>Cancel</Button>
+                <Button disabled={submitting || !form.name || !form.apiKey} onClick={submit}>{submitting ? 'Creating…' : 'Create'}</Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
+        </div>
       } />
       <Card>
         <CardHeader><CardTitle className="text-base">All providers</CardTitle><CardDescription>{rows.length} total</CardDescription></CardHeader>
