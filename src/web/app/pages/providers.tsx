@@ -17,10 +17,11 @@ import { api } from '../../lib/api';
 import { toast } from 'sonner';
 import { ChevronDown, ChevronRight, Download, Play, Plus, Trash2, UserPlus } from 'lucide-react';
 import { CodexUsagePanel } from '../../components/codex-usage-panel';
+import { QoderAccountsPanel } from '../../components/qoder-accounts-panel';
 import { CodexDiscoverDialog } from '../../components/codex-discover-dialog';
 
 interface Provider {
-  id: string; name: string; slug: string; type: 'openai' | 'anthropic' | 'codex'; baseUrl: string;
+  id: string; name: string; slug: string; type: 'openai' | 'anthropic' | 'codex' | 'qoder'; baseUrl: string;
   enabled: boolean; health: string; modelCount: number;
 }
 
@@ -74,11 +75,11 @@ export function Providers() {
     finally { setSubmitting(false); }
   };
 
-  const addPoolProvider = async (type: 'codex') => {
+  const addPoolProvider = async (type: 'codex' | 'qoder') => {
     setPoolSubmitting(type);
     try {
       await api.post('/api/admin/providers', { type });
-      toast.success(`${type === 'codex' ? 'Codex' : type} provider created — add accounts next`);
+      toast.success(`${type === 'codex' ? 'Codex' : 'Qoder'} provider created — add accounts next`);
       const result = await api.get<{ providers: Provider[] }>('/api/admin/providers');
       setRows(result.providers);
       const created = result.providers.find((row) => row.type === type);
@@ -201,7 +202,7 @@ export function Providers() {
                   <TableCell>{p.enabled ? 'Yes' : 'No'}</TableCell>
                   <TableCell className="text-right">
                     <div className="flex justify-end gap-1">
-                      {p.type === 'codex' && (
+                      {(p.type === 'codex' || p.type === 'qoder') && (
                         <>
                           <Button size="sm" variant={expanded[p.id] ? 'secondary' : 'outline'} aria-expanded={!!expanded[p.id]} onClick={() => setExpanded((current) => ({ ...current, [p.id]: !current[p.id] }))}>
                             {expanded[p.id] ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
@@ -220,6 +221,13 @@ export function Providers() {
                   <TableRow>
                     <TableCell colSpan={7} className="bg-muted/30">
                       <CodexUsagePanel providerId={p.id} providerName={p.name} />
+                    </TableCell>
+                  </TableRow>
+                )}
+                {p.type === 'qoder' && expanded[p.id] && (
+                  <TableRow>
+                    <TableCell colSpan={7} className="bg-muted/30">
+                      <QoderAccountsPanel providerId={p.id} providerName={p.name} />
                     </TableCell>
                   </TableRow>
                 )}
