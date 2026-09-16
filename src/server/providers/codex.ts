@@ -95,13 +95,20 @@ export async function codexModels(cfg: CodexProviderConfig): Promise<DiscoveredM
   } finally { ctl.cancel(); }
 }
 
+/**
+ * The Codex backend rejects any request that does not set both flags verbatim:
+ * `{"detail":"Store must be set to false"}` / `{"detail":"Stream must be set to true"}`.
+ * Upstream always streams; non-streaming callers merge the stream below.
+ */
+const CODEX_REQUIRED_FLAGS = { store: false, stream: true } as const;
+
 export function codexRequestPayload(req: CanonicalRequest, targetModel = req.model): Record<string, unknown> {
   const input = req.messages.map((message) => ({ role: message.role, content: message.content.map((block) => {
     if (block.type === 'text') return { type: 'input_text', text: block.text ?? '' };
     if (block.type === 'image' && (block.image?.url || block.image?.base64)) return { type: 'input_image', image_url: block.image?.url ?? `data:${block.image?.mimeType ?? 'image/png'};base64,${block.image?.base64}` };
     return null;
   }).filter(Boolean) }));
-  const payload: Record<string, unknown> = { model: targetModel, input, stream: req.stream };
+  const payload: Record<string, unknown> = { model: targetModel, input, ...CODEX_REQUIRED_FLAGS };
   if (req.system) payload.instructions = req.system;
   if (req.maxOutputTokens !== undefined) payload.max_output_tokens = req.maxOutputTokens;
   if (req.tools?.length) payload.tools = req.tools.map((tool) => ({ type: 'function', name: tool.name, description: tool.description, parameters: tool.inputSchema }));
@@ -131,8 +138,18 @@ export function codexResponseToCanonical(body: Record<string, unknown>, requeste
   return { model: requestedModel, text, toolCalls: tools, finishReason: typeof body.status === 'string' ? body.status : null, usage: u };
 }
 
-export function codexStreamEventToCanonical(event: Record<string, unknown>): { text: string; isLast: boolean; usage?: CodexCanonicalResult['usage']; finishReason?: string | null } {
+export function codexStreamEventToCanonical(event: Record<string, unknown>): { text: string; isLast: boolean; usage?: CodexCanonicalResult['usage']; finishReason?: string | null; toolCall?: CodexCanonicalResult['toolCalls'][number] } {
   if (event.type === 'response.output_text.delta') return { text: typeof event.delta === 'string' ? event.delta : '', isLast: false };
+  if (event.type === 'response.output_item.done') {
+    // `response.completed` always carries `output: []`, so function calls are only
+    // observable here — this is what lets a non-streaming merge see tool calls.
+    const item = event.item && typeof event.item === 'object' ? event.item as Record<string, unknown> : {};
+    if (item.type !== 'function_call') return { text: '', isLast: false };
+    const raw = item.arguments;
+    let input: unknown = raw ?? {};
+    if (typeof raw === 'string') { try { input = JSON.parse(raw); } catch { input = raw; } }
+    return { text: '', isLast: false, toolCall: { id: String(item.call_id ?? item.id ?? ''), name: String(item.name ?? ''), input } };
+  }
   if (event.type === 'response.completed') {
     const response = event.response && typeof event.response === 'object' ? event.response as Record<string, unknown> : {};
     return { text: '', isLast: true, usage: usage(response.usage), finishReason: typeof response.status === 'string' ? response.status : null };
@@ -146,16 +163,19 @@ async function responseError(response: Response): Promise<Error & { status: numb
 }
 
 export async function callCodexNonStreaming(cfg: CodexProviderConfig, req: CanonicalRequest): Promise<CodexCanonicalResult & { status: number; upstreamRequestId: string | null }> {
-  const call = async (tokenCfg: CodexProviderConfig) => {
-    const ctl = timeout(tokenCfg.totalTimeoutMs);
-    try {
-      const response = await fetch(codexRequest(tokenCfg, '/responses'), { method: 'POST', headers: codexHeaders(tokenCfg), body: JSON.stringify(codexRequestPayload(req)), signal: ctl.signal });
-      if (!response.ok) throw await responseError(response);
-      return { ...codexResponseToCanonical(await response.json() as Record<string, unknown>, req.model), status: response.status, upstreamRequestId: response.headers.get('x-request-id') };
-    } finally { ctl.cancel(); }
-  };
-  if (cfg.accountRecordId) return withCodexCredentials(cfg.accountRecordId, (credentials) => call({ ...cfg, accessToken: credentials.accessToken }));
-  return call(cfg);
+  // The Codex backend rejects `stream:false`, so a non-streaming caller merges the
+  // stream itself instead of asking upstream for a single JSON body.
+  let text = '';
+  const toolCalls: CodexCanonicalResult['toolCalls'] = [];
+  let finishReason: string | null = null;
+  let usage: CodexCanonicalResult['usage'] = { input: 0, output: 0, total: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 };
+  const meta = await callCodexStreaming(cfg, req, (event) => {
+    text += event.text;
+    if (event.toolCall) toolCalls.push(event.toolCall);
+    if (event.usage) usage = event.usage;
+    if (event.isLast && event.finishReason !== undefined) finishReason = event.finishReason;
+  });
+  return { model: req.model, text, toolCalls, finishReason, usage, status: meta.status, upstreamRequestId: meta.upstreamRequestId };
 }
 
 export async function callCodexStreaming(cfg: CodexProviderConfig, req: CanonicalRequest, onEvent: (event: ReturnType<typeof codexStreamEventToCanonical>) => void): Promise<{ status: number; upstreamRequestId: string | null }> {

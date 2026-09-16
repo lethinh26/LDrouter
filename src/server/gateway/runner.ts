@@ -747,7 +747,7 @@ export class GatewayRunner {
         const events: Array<ReturnType<typeof import('../providers/codex').codexStreamEventToCanonical>> = [];
         let firstCodexEvent = true;
         const meta = await callCodexStreaming({ baseUrl: cfg.baseUrl, accountId: cfg.codexAccountId ?? '', accountRecordId: cfg.accountRecordId, customHeaders: cfg.customHeaders, totalTimeoutMs: cfg.totalTimeoutMs }, { ...req.canonical, model: upstreamModel }, (event) => {
-          if (event.text || event.isLast) {
+          if (event.text || event.isLast || event.toolCall) {
             events.push(event);
             if (event.usage) Object.assign(usage, event.usage);
             chunkHandler({ data: codexStreamEventToClient(req.protocol, event, upstreamModel, ctx.requestId) }, firstCodexEvent);
@@ -1186,19 +1186,23 @@ function usageFromCache(u: { input: number; output: number; cacheRead: number; c
 // Map Codex's native response events to the public protocol stream shape.
 export function codexStreamEventToClient(
   protocol: 'openai' | 'anthropic',
-  event: { text: string; isLast: boolean },
+  event: { text: string; isLast: boolean; toolCall?: { id: string; name: string; input: unknown } },
   model: string,
   requestId: string,
 ): string {
   if (protocol === 'openai') {
+    const delta = event.toolCall
+      ? { tool_calls: [{ index: 0, id: event.toolCall.id, type: 'function', function: { name: event.toolCall.name, arguments: JSON.stringify(event.toolCall.input) } }] }
+      : event.isLast ? {} : { content: event.text };
     return JSON.stringify({
       id: `chatcmpl-${requestId}`,
       object: 'chat.completion.chunk',
       created: Math.floor(Date.now() / 1000),
       model,
-      choices: [{ index: 0, delta: event.isLast ? {} : { content: event.text }, finish_reason: event.isLast ? 'stop' : null }],
+      choices: [{ index: 0, delta, finish_reason: event.isLast ? 'stop' : null }],
     });
   }
+  if (event.toolCall) return JSON.stringify({ type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: event.toolCall.id, name: event.toolCall.name, input: event.toolCall.input } });
   return JSON.stringify(event.isLast
     ? { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: 0 } }
     : { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: event.text } });

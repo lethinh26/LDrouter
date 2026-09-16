@@ -7,8 +7,13 @@ const cfg: CodexProviderConfig = { baseUrl: 'https://chatgpt.com', accountId: 'a
 const request = { model: 'gpt-5-codex', messages: [{ role: 'user' as const, content: [{ type: 'text' as const, text: 'hello' }] }], stream: false };
 
 describe('Codex upstream HTTP', () => {
-  it('sends canonical requests and maps a response', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ id: 'r1', model: 'gpt-5-codex', output: [{ type: 'message', content: [{ type: 'output_text', text: 'hello' }] }] }), { status: 200, headers: { 'x-request-id': 'up-1' } }));
+  it('always sends store:false + stream:true, and merges a non-streaming caller from the stream', async () => {
+    const body = new ReadableStream({ start(controller) {
+      controller.enqueue(new TextEncoder().encode('data: {"type":"response.output_text.delta","delta":"hello"}\n\n'));
+      controller.enqueue(new TextEncoder().encode('data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":2,"output_tokens":3}}}\n\n'));
+      controller.close();
+    } });
+    const fetchMock = vi.fn().mockResolvedValue(new Response(body, { status: 200, headers: { 'x-request-id': 'up-1' } }));
     vi.stubGlobal('fetch', fetchMock);
     const result = await callCodexNonStreaming(cfg, request);
     expect(fetchMock.mock.calls[0]?.[0]).toBe('https://chatgpt.com/backend-api/codex/responses');
@@ -18,9 +23,24 @@ describe('Codex upstream HTTP', () => {
     expect(headers['chatgpt-account-id']).toBe('a1');
     expect(headers.originator).toBe('codex_cli_rs');
     expect(headers['openai-beta']).toBe('responses=experimental');
-    expect(JSON.parse(String(init.body))).toMatchObject({ model: 'gpt-5-codex', stream: false });
+    // The Codex backend 400s unless both flags are exactly this; a request asking
+    // for stream:false still goes upstream streaming and is merged here.
+    expect(JSON.parse(String(init.body))).toMatchObject({ model: 'gpt-5-codex', stream: true, store: false });
     expect(result.text).toBe('hello');
+    expect(result.usage).toMatchObject({ input: 2, output: 3, total: 5 });
     expect(result.upstreamRequestId).toBe('up-1');
+  });
+
+  it('merges tool calls from output_item.done, since response.completed carries an empty output', async () => {
+    const body = new ReadableStream({ start(controller) {
+      controller.enqueue(new TextEncoder().encode('data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{\\"city\\":\\"Hanoi\\"}"}}\n\n'));
+      controller.enqueue(new TextEncoder().encode('data: {"type":"response.completed","response":{"status":"completed","output":[]}}\n\n'));
+      controller.close();
+    } });
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(body, { status: 200 })));
+    const result = await callCodexNonStreaming(cfg, request);
+    expect(result.toolCalls).toEqual([{ id: 'call_1', name: 'get_weather', input: { city: 'Hanoi' } }]);
+    expect(result.finishReason).toBe('completed');
   });
 
   it('forwards response deltas as they arrive without buffering', async () => {
