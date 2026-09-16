@@ -2,7 +2,10 @@
 import { afterEach, beforeAll } from 'vitest';
 
 const mutationMethods = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
-const nativeFetch = globalThis.fetch;
+// setupFiles re-run for every test file, but globalThis is shared across files in the same fork
+// (singleFork: true). Re-reading globalThis.fetch would wrap the previous file's wrapper, so
+// capture the pristine implementation the first time and reuse it.
+const nativeFetch = (globalThis as { __nativeFetch?: typeof fetch }).__nativeFetch ?? globalThis.fetch;
 
 
 async function fetchWithAdminCsrf(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
@@ -25,6 +28,11 @@ async function fetchWithAdminCsrf(input: RequestInfo | URL, init?: RequestInit):
 }
 
 globalThis.fetch = fetchWithAdminCsrf;
+
+// Escape hatch: this wrapper silently supplies a CSRF token for every admin mutation, so a test
+// that needs to observe the real 401/403 surface must bypass it. Use
+// `(globalThis as { __nativeFetch?: typeof fetch }).__nativeFetch`.
+(globalThis as { __nativeFetch?: typeof fetch }).__nativeFetch = nativeFetch;
 
 beforeAll(() => {
   // Force a deterministic TZ for date math

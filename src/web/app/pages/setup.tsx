@@ -86,6 +86,9 @@ export function Setup() {
               setImporting(true);
               try {
                 const backup = JSON.parse(await importFile.text());
+                // Deliberately a bare fetch: on first run there is no admin session, so
+                // fetchWithCsrf's token pre-fetch would fail. The server exempts this path until
+                // setup is complete.
                 const res = await fetch('/api/admin/backup/restore', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ backup, passphrase: importPassphrase }) });
                 if (!res.ok) throw new Error((await res.json())?.error?.message ?? 'Import failed');
                 toast.success('Database imported');

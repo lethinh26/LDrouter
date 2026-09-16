@@ -6,7 +6,7 @@ import path from 'node:path';
 import zlib from 'node:zlib';
 import crypto from 'node:crypto';
 import { getDb, closeDb, openDb, schema } from '../../db/index';
-import { requireAdminAuth } from '../../auth/middleware';
+import { requireAdminAuth, requireAdminCsrf } from '../../auth/middleware';
 import { sha256Hex } from '../../auth/ids';
 import { recordAudit } from '../../db/repositories/audit';
 import { loadConfig, setConfigMasterKey } from '../../config/index';
@@ -71,9 +71,13 @@ function assertDatabaseUsable(expectedSchemaVersion: number): void {
 }
 
 export async function registerBackupRoutes(app: FastifyInstance): Promise<void> {
+  // This module is registered in its own scope (routes/admin.ts) precisely so this is the only
+  // auth hook on the backup routes. A preHandler cannot cancel a later one, so the first-run
+  // import exemption must not sit alongside another admin module's requireAdminAuth.
   app.addHook('preHandler', async (req, reply) => {
     if (req.url === '/api/admin/backup/restore' && !getSettings().setupComplete) return;
-    return requireAdminAuth(req, reply);
+    await requireAdminAuth(req, reply);
+    if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) await requireAdminCsrf(req);
   });
 
   app.post('/api/admin/backup/create', async (req, reply) => {

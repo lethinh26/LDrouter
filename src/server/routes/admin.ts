@@ -50,9 +50,15 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     await registerStatsRoutes(instance);
     await registerAuditRoutes(instance);
     await registerSettingsRoutes(instance);
-    await registerBackupRoutes(instance);
     await registerDashboardRoutes(instance);
     await registerCodexRoutes(instance);
     await registerQoderRoutes(instance);
+  });
+
+  // Backup routes get their own scope. The first-run import (setup.tsx) must be reachable before
+  // any admin account exists, but this scope's parent runs the other admin modules' auth hooks,
+  // and a preHandler cannot short-circuit a later one — so the exemption has to be the only hook.
+  await app.register(async (instance) => {
+    await registerBackupRoutes(instance);
   });
 }

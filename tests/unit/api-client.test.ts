@@ -1,6 +1,6 @@
 // Unit: admin web API client — request shaping.
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { api } from '@web/lib/api';
+import { api, fetchWithCsrf } from '@web/lib/api';
 
 const jsonResponse = { ok: true };
 
@@ -91,5 +91,40 @@ describe('api client request shaping', () => {
     const headers = (init.headers ?? {}) as Record<string, string>;
     expect(headers['content-type']).toBeUndefined();
     expect(init.body).toBeUndefined();
+  });
+
+  // fetchWithCsrf serves callers that need the raw Response (SSE, blobs). Those call sites used to
+  // call globalThis.fetch directly and were rejected 403 because no CSRF header was attached.
+  it('fetchWithCsrf attaches the CSRF token and preserves the caller headers', async () => {
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => _url.endsWith('/api/admin/csrf')
+      ? new Response(JSON.stringify({ csrfToken: 'tok' }), { status: 200 })
+      : new Response('stream', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const res = await fetchWithCsrf('/api/admin/models/m1/test-stream', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+    });
+    expect(await res.text()).toBe('stream');
+    const init = fetchMock.mock.calls.at(-1)![1] as RequestInit;
+    const headers = init.headers as Record<string, string>;
+    // The token is cached module-wide from an earlier case, so assert it is attached, not its value.
+    expect(headers['x-csrf-token']).toBeTruthy();
+    expect(headers['content-type']).toBe('application/json');
+    expect(init.body).toBe('{}');
+    expect(init.credentials).toBe('include');
+  });
+
+  it('fetchWithCsrf retries once with a fresh token after a 403', async () => {
+    let mutations = 0;
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => {
+      if (_url.endsWith('/api/admin/csrf')) return new Response(JSON.stringify({ csrfToken: 'tok' }), { status: 200 });
+      mutations += 1;
+      return mutations === 1 ? new Response('nope', { status: 403 }) : new Response('ok', { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const res = await fetchWithCsrf('/api/admin/backup/create', { method: 'POST' });
+    expect(await res.text()).toBe('ok');
+    expect(mutations).toBe(2);
   });
 });

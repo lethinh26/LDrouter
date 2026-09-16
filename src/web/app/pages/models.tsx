@@ -9,7 +9,7 @@ import { Badge } from '../../components/ui/badge';
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from '../../components/ui/dialog';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../../components/ui/select';
 import { Checkbox } from '../../components/ui/checkbox';
-import { api } from '../../lib/api';
+import { api, fetchWithCsrf } from '../../lib/api';
 import { toast } from 'sonner';
 import { Download, Trash2, FlaskConical, Loader2, Search, X, SlidersHorizontal } from 'lucide-react';
 
@@ -163,12 +163,11 @@ export function Models() {
 
     try {
       // Fetch SSE stream from the test-stream endpoint.
-      // NB: `fetch` is shadowed by the local "Fetch models" helper, so use
-      // globalThis.fetch to reach the browser's fetch.
-      const res = await globalThis.fetch(`/api/admin/models/${id}/test-stream`, {
+      // NB: `fetch` is shadowed by the local "Fetch models" helper, so go through the CSRF-aware
+      // wrapper from lib/api instead of the bare global (which would be rejected 403).
+      const res = await fetchWithCsrf(`/api/admin/models/${id}/test-stream`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        credentials: 'include',
         body: '{}', // Must send empty object to satisfy Fastify's JSON parser
       });
       if (!res.ok) {

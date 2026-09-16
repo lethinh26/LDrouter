@@ -10,7 +10,7 @@ import { Button } from '../../components/ui/button';
 import { Badge } from '../../components/ui/badge';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../../components/ui/select';
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger } from '../../components/ui/alert-dialog';
-import { api } from '../../lib/api';
+import { api, fetchWithCsrf } from '../../lib/api';
 import { toast } from 'sonner';
 import { CheckCircle2, Download, Loader2, Bell, Volume2 } from 'lucide-react';
 import { useNotificationPrefs, saveNotificationPrefs, loadNotificationPrefs } from '../../lib/notification-settings';
@@ -347,7 +347,7 @@ export function Settings() {
               </div>
               <Button disabled={backupPassphrase.length !== 6 || backupPassphrase !== backupPassphraseConfirm} onClick={async () => {
                 try {
-                  const res = await fetch('/api/admin/backup/create', { method: 'POST', credentials: 'include', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ passphrase: backupPassphrase }) });
+                  const res = await fetchWithCsrf('/api/admin/backup/create', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ passphrase: backupPassphrase }) });
                   if (!res.ok) throw new Error('Backup failed');
                   const blob = await res.blob();
                   const url = URL.createObjectURL(blob);
@@ -389,7 +389,7 @@ export function Settings() {
                       if (!file) return;
                       try {
                         const backup = JSON.parse(await file.text());
-                        const res = await fetch('/api/admin/backup/restore', { method: 'POST', credentials: 'include', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ backup, passphrase: restorePassphrase }) });
+                        const res = await fetchWithCsrf('/api/admin/backup/restore', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ backup, passphrase: restorePassphrase }) });
                         if (!res.ok) throw new Error((await res.json())?.error?.message ?? 'Restore failed');
                         toast.success('Restored. Reloading…');
                         setPendingRestoreFile(null);

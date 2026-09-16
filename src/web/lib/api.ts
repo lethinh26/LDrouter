@@ -81,6 +81,21 @@ async function upload<T>(path: string, form: FormData, retry = true): Promise<T>
   }
 }
 
+/**
+ * fetch with the admin CSRF header, for callers that need the raw Response (SSE streams, blobs)
+ * instead of the parsed JSON that `api.*` returns. Credentials are included. Retries once with a
+ * fresh token on 403: a long-lived session can rotate the token out from under a cached value.
+ */
+export async function fetchWithCsrf(path: string, init?: RequestInit, retry = true): Promise<Response> {
+  const headers = { ...(init?.headers as Record<string, string> | undefined), [csrfHeader]: await getCsrfToken() };
+  const res = await fetch(`${baseUrl}${path}`, { ...init, headers, credentials: 'include' });
+  if (retry && res.status === 403) {
+    csrfToken = null;
+    return fetchWithCsrf(path, init, false);
+  }
+  return res;
+}
+
 export const api = {
   get: <T>(path: string, init?: RequestInit) => request<T>('GET', path, undefined, init),
   post: <T>(path: string, body?: unknown, init?: RequestInit) => request<T>('POST', path, body, init),
