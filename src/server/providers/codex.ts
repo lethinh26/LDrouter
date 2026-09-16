@@ -27,6 +27,13 @@ const base = (url: string) => url.replace(/\/$/, '');
  */
 export const CODEX_CLIENT_VERSION = '0.144.6';
 
+/**
+ * The Codex OAuth backend only exists on chatgpt.com — `api.openai.com/backend-api/codex/*`
+ * answers 404. The base URL is therefore not user-configurable: a stored value pointing
+ * anywhere else makes discovery and routing fail with an opaque 404.
+ */
+export const CODEX_BASE_URL = 'https://chatgpt.com';
+
 /** Shape the Codex models endpoint returns; only the identifier and label are used. */
 interface CodexModelEntry {
   slug?: string; id?: string; model?: string; name?: string;
@@ -34,7 +41,9 @@ interface CodexModelEntry {
 }
 
 export function codexRequest(cfg: CodexProviderConfig, path: string): string {
-  return `${base(cfg.baseUrl)}/backend-api/codex${path.startsWith('/') ? path : `/${path}`}`;
+  // Always chatgpt.com: the Codex OAuth backend does not exist on api.openai.com,
+  // so a stored base URL pointing elsewhere yields an opaque 404. See CODEX_BASE_URL.
+  return `${base(CODEX_BASE_URL)}/backend-api/codex${path.startsWith('/') ? path : `/${path}`}`;
 }
 
 export function codexHeaders(cfg: CodexProviderConfig, accept = 'application/json'): Record<string, string> {

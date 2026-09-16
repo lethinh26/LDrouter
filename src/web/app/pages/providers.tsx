@@ -134,7 +134,9 @@ export function Providers() {
                   </SelectContent>
                 </Select>
               </div>
-              <div><Label htmlFor="provider-base-url">Base URL</Label><Input id="provider-base-url" value={form.baseUrl} onChange={(e) => setForm({ ...form, baseUrl: e.target.value })} /></div>
+              {form.type === 'codex'
+                ? <p className="rounded-md border border-dashed p-3 text-xs text-muted-foreground">Codex always talks to <code>https://chatgpt.com</code> — the OAuth backend does not exist on <code>api.openai.com</code>.</p>
+                : <div><Label htmlFor="provider-base-url">Base URL</Label><Input id="provider-base-url" value={form.baseUrl} onChange={(e) => setForm({ ...form, baseUrl: e.target.value })} /></div>}
               {requiresApiKey
                 ? <div><Label htmlFor="provider-api-key">API key</Label><Input id="provider-api-key" type="password" value={form.apiKey} onChange={(e) => setForm({ ...form, apiKey: e.target.value })} /></div>
                 : <p className="rounded-md border border-dashed p-3 text-xs text-muted-foreground">After creating this provider, use <span className="font-medium">Import accounts</span> on its row to add Codex OAuth credentials.</p>}
@@ -224,10 +226,12 @@ export function Providers() {
                   </SelectContent>
               </Select>
             </div>
-            <div><Label>Base URL</Label><Input value={editForm.baseUrl} onChange={(e) => setEditForm({ ...editForm, baseUrl: e.target.value })} /></div>
             {editForm.type === 'codex'
               ? <p className="rounded-md border border-dashed p-3 text-xs text-muted-foreground"><UserPlus className="mr-1 inline h-3 w-3" /> Codex credentials live in the account pool — manage them from the Accounts panel.</p>
-              : <div><Label>API key (leave empty to keep current)</Label><Input type="password" value={editForm.apiKey} onChange={(e) => setEditForm({ ...editForm, apiKey: e.target.value })} /></div>}
+              : <>
+                  <div><Label>Base URL</Label><Input value={editForm.baseUrl} onChange={(e) => setEditForm({ ...editForm, baseUrl: e.target.value })} /></div>
+                  <div><Label>API key (leave empty to keep current)</Label><Input type="password" value={editForm.apiKey} onChange={(e) => setEditForm({ ...editForm, apiKey: e.target.value })} /></div>
+                </>}
             <div><Label>Custom headers (JSON)</Label><Input value={editForm.customHeaders} onChange={(e) => setEditForm({ ...editForm, customHeaders: e.target.value })} placeholder='{"X-Org":"acme"}' /></div>
             <div className="flex items-center gap-2"><Switch checked={editForm.enabled} onCheckedChange={(v) => setEditForm({ ...editForm, enabled: v })} /><Label>Enabled</Label></div>
           </div>

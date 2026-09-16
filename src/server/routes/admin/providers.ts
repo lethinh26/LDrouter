@@ -10,7 +10,7 @@ import { uuid, slugify } from '../../auth/ids';
 import { GatewayError } from '../../errors';
 import type { Provider } from '../../db/schema';
 import { probeProvider, discoverProviderModels, type DiscoveredModel, type ProbeResult } from '../../providers/index';
-import { probeCodex, codexModels } from '../../providers/codex';
+import { probeCodex, codexModels, CODEX_BASE_URL } from '../../providers/codex';
 import { listCodexAccountSummaries } from '../../db/repositories/codex-accounts';
 import { codexCredentialError, withCodexCredentials } from '../../providers/codex-refresh';
 import { redactString } from '../../security/redact';
@@ -92,7 +92,7 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
       name: body.name,
       slug,
       type: body.type,
-      baseUrl: body.baseUrl,
+      baseUrl: body.type === 'codex' ? CODEX_BASE_URL : body.baseUrl,
       encryptedApiKey: enc?.ciphertext ?? null,
       apiKeyNonce: enc?.nonce ?? null,
       apiKeyVersion: enc?.version ?? 1,
@@ -120,7 +120,7 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
     const update: Partial<typeof schema.providers.$inferInsert> = { updatedAt: new Date().toISOString() };
     if (body.name) update.name = body.name;
     if (body.slug) update.slug = slugify(body.slug);
-    if (body.baseUrl) update.baseUrl = body.baseUrl;
+    if (body.baseUrl) update.baseUrl = p.type === 'codex' ? CODEX_BASE_URL : body.baseUrl;
     if (body.enabled !== undefined) update.enabled = body.enabled;
     if (body.connectTimeoutMs !== undefined) update.connectTimeoutMs = body.connectTimeoutMs;
     if (body.firstTokenTimeoutMs !== undefined) update.firstTokenTimeoutMs = body.firstTokenTimeoutMs;

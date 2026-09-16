@@ -247,4 +247,25 @@ describe('authenticated Codex admin HTTP API', () => {
     expect(raw.prepare('SELECT COUNT(*) AS n FROM providers WHERE id=?').get('codex-del-probe')).toEqual({ n: 0 });
     expect(raw.prepare('SELECT COUNT(*) AS n FROM codex_accounts WHERE provider_id=?').get('codex-del-probe')).toEqual({ n: 0 });
   });
+
+  it('stores chatgpt.com as the base URL for Codex providers regardless of the request', async () => {
+    // Regression: codex1 on production was created with base_url=https://api.openai.com,
+    // so /backend-api/codex/models answered 404 while the identical local provider worked.
+    const { getRawDb } = await import('../../src/server/db');
+    const raw = getRawDb();
+    const created = await fetch(`${baseUrl}/api/admin/providers`, {
+      method: 'POST', headers: { ...jsonHeaders(), 'x-csrf-token': csrf },
+      body: JSON.stringify({ name: 'Codex baseurl', slug: 'codex-baseurl-probe', type: 'codex', baseUrl: 'https://api.openai.com' }),
+    });
+    expect(created.status).toBe(200);
+    expect(raw.prepare('SELECT base_url AS u FROM providers WHERE slug=?').get('codex-baseurl-probe')).toEqual({ u: 'https://chatgpt.com' });
+
+    // A later edit must not be able to point it back at the wrong host.
+    const id = (await created.json() as { id: string }).id;
+    await fetch(`${baseUrl}/api/admin/providers`, {
+      method: 'PATCH', headers: { ...jsonHeaders(), 'x-csrf-token': csrf },
+      body: JSON.stringify({ id, baseUrl: 'https://api.openai.com' }),
+    });
+    expect(raw.prepare('SELECT base_url AS u FROM providers WHERE id=?').get(id)).toEqual({ u: 'https://chatgpt.com' });
+  });
 });

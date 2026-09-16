@@ -30,6 +30,13 @@ describe('Codex upstream adapter', () => {
     expect(codexRequest(config(), '/responses')).toBe('https://chatgpt.com/backend-api/codex/responses');
   });
 
+  it('ignores a stored base URL that does not host the Codex backend', () => {
+    // Regression: providers created before Codex gained a default carried
+    // https://api.openai.com, which 404s on /backend-api/codex/*.
+    const legacy = { ...config(), baseUrl: 'https://api.openai.com' };
+    expect(codexRequest(legacy, '/models')).toBe('https://chatgpt.com/backend-api/codex/models');
+  });
+
   it('discovers models from the Codex model endpoint without importing them', async () => {
     // Real upstream shape: models are keyed by `slug`, not `id`.
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
