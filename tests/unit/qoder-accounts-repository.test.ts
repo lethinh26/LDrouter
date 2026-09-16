@@ -73,7 +73,7 @@ describe('Qoder account repository', () => {
     expect(maskQoderValue('user-1')).toBe('us…-1');
     expect(maskQoderValue('user-1234567890')).toBe('user…7890');
     const summary = toQoderAccountSummary({
-      id: 'x', label: null, email: null, qoderUserId: 'user-1234567890', machineId: 'm',
+      id: 'x', providerId: 'qp', label: null, email: null, qoderUserId: 'user-1234567890', machineId: 'm',
       enabled: 1, healthState: 'unknown', priority: 0, jobTokenExpiresAt: JOB_TOKEN_EXPIRES_AT,
       catalogFetchedAt: null, lastError: null, consecutiveFailures: 0, createdAt: 'a', updatedAt: 'b',
     });

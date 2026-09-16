@@ -3,6 +3,7 @@
 // nothing here ever returns them in a summary.
 import { decryptSecret, encryptSecret } from '../../auth/crypto';
 import { uuid } from '../../auth/ids';
+import { createHash } from 'node:crypto';
 import { getRawDb } from '../index';
 
 export interface DecryptedQoderCredentials {
@@ -47,6 +48,7 @@ export interface QoderAccountSummary {
 }
 
 export interface QoderAccountDetail extends QoderAccountSummary {
+  providerId: string;
   qoderUserId: string;
   machineId: string;
 }
@@ -74,7 +76,7 @@ export function identityFromQoderRecord(record: NormalizedQoderRecord): QoderIde
 }
 
 const SUMMARY_COLUMNS =
-  'id,label,email,qoder_user_id AS qoderUserId,machine_id AS machineId,enabled,health_state AS healthState,priority,job_token_expires_at AS jobTokenExpiresAt,catalog_fetched_at AS catalogFetchedAt,last_error AS lastError,consecutive_failures AS consecutiveFailures,created_at AS createdAt,updated_at AS updatedAt';
+  'id,provider_id AS providerId,label,email,qoder_user_id AS qoderUserId,machine_id AS machineId,enabled,health_state AS healthState,priority,job_token_expires_at AS jobTokenExpiresAt,catalog_fetched_at AS catalogFetchedAt,last_error AS lastError,consecutive_failures AS consecutiveFailures,created_at AS createdAt,updated_at AS updatedAt';
 
 type SummaryRow = Omit<QoderAccountDetail, 'enabled' | 'qoderUserIdMasked'> & { enabled: boolean | number };
 
@@ -108,7 +110,7 @@ export function listQoderAccountsForProvider(providerId: string): QoderAccountDe
   const rows = getRawDb()
     .prepare(`SELECT ${SUMMARY_COLUMNS} FROM qoder_accounts WHERE provider_id=? ORDER BY priority,id`)
     .all(providerId) as SummaryRow[];
-  return rows.map((row) => ({ ...toQoderAccountSummary(row), qoderUserId: row.qoderUserId, machineId: row.machineId }));
+  return rows.map((row) => ({ ...toQoderAccountSummary(row), providerId: row.providerId, qoderUserId: row.qoderUserId, machineId: row.machineId }));
 }
 
 export function findEligibleQoderAccount(providerId: string): QoderAccountCandidate | null {
@@ -121,6 +123,22 @@ export function findEligibleQoderAccount(providerId: string): QoderAccountCandid
     .get(providerId) as { id: string; qoderUserId: string; enabled: number; healthState: string; priority: number } | undefined;
   if (!row) return null;
   return { id: row.id, qoderUserId: row.qoderUserId, enabled: Boolean(row.enabled), healthState: row.healthState, priority: row.priority };
+}
+
+/**
+ * Match an imported PAT against existing rows. The PAT is the identity: the same token re-imported
+ * must update its account rather than create a duplicate. Rows are compared by decrypting each
+ * stored PAT (a handful at most) because the plaintext digest cannot be stored — that would make
+ * the token recoverable from the database.
+ */
+export function findQoderAccountForImport(providerId: string, personalToken: string): string | null {
+  const target = createHash('sha256').update(personalToken, 'utf8').digest('hex');
+  const rows = getRawDb().prepare('SELECT id FROM qoder_accounts WHERE provider_id=?').all(providerId) as Array<{ id: string }>;
+  for (const row of rows) {
+    const digest = createHash('sha256').update(getQoderCredentials(row.id).personalToken, 'utf8').digest('hex');
+    if (digest === target) return row.id;
+  }
+  return null;
 }
 
 export function getQoderCredentials(id: string): DecryptedQoderCredentials {
@@ -147,7 +165,7 @@ export function getQoderAccountRefreshState(id: string): { jobTokenExpiresAt: st
 /** Identity of one account by its own id (the pool-wide lookups are keyed by provider). */
 export function getQoderAccountDetailById(id: string): QoderAccountDetail | null {
   const row = getRawDb().prepare(`SELECT ${SUMMARY_COLUMNS} FROM qoder_accounts WHERE id=?`).get(id) as SummaryRow | undefined;
-  return row ? { ...toQoderAccountSummary(row), qoderUserId: row.qoderUserId, machineId: row.machineId } : null;
+  return row ? { ...toQoderAccountSummary(row), providerId: row.providerId, qoderUserId: row.qoderUserId, machineId: row.machineId } : null;
 }
 
 function persistQoderAccount(providerId: string, record: NormalizedQoderRecord, existingId?: string): string {

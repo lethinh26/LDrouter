@@ -16,6 +16,7 @@ import { registerSettingsRoutes } from './admin/settings';
 import { registerBackupRoutes } from './admin/backup';
 import { registerDashboardRoutes } from './admin/dashboard';
 import { registerCodexRoutes, registerCodexOAuthCallbackRoute } from './admin/codex';
+import { registerQoderRoutes } from './admin/qoder';
 
 export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
   // Setup routes are always reachable (used on first run).
@@ -52,5 +53,6 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     await registerBackupRoutes(instance);
     await registerDashboardRoutes(instance);
     await registerCodexRoutes(instance);
+    await registerQoderRoutes(instance);
   });
 }
