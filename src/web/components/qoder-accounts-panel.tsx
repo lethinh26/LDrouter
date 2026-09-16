@@ -167,8 +167,9 @@ export function QoderAccountsPanel({ providerId, providerName }: { providerId: s
                         account={account}
                         now={now}
                         busy={busyId === account.id}
-                        onToggle={(enabled) => void act(account, enabled ? 'Enabled' : 'Disabled', () => api.patch(`/api/admin/qoder/accounts/${account.id}`, { enabled }))}
+                        onToggle={(enabled) => void act(account, enabled ? 'Enabled' : 'Disabled', () => api.patch(`/api/admin/qoder/accounts/${account.id}`, { enabled })).then(() => load())}
                         onDelete={() => void act(account, 'Deleted', () => api.del(`/api/admin/qoder/accounts/${account.id}`)).then(() => load())}
+                        onChanged={() => void load()}
                       />
                     ))}
                   </TableBody>
@@ -219,10 +220,12 @@ interface RowProps {
   busy: boolean;
   onToggle: (enabled: boolean) => void;
   onDelete: () => void;
+  /** Re-read the account list: Test/Catalog change server-side fields this row renders. */
+  onChanged: () => void;
 }
 
 /** One account row. Separate because useSortable is a hook and must run per row. */
-function SortableAccountRow({ account, now, busy, onToggle, onDelete }: RowProps) {
+function SortableAccountRow({ account, now, busy, onToggle, onDelete, onChanged }: RowProps) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: account.id, disabled: busy });
   const label = account.label || account.email || account.qoderUserIdMasked || account.id;
 
@@ -252,11 +255,11 @@ function SortableAccountRow({ account, now, busy, onToggle, onDelete }: RowProps
       <TableCell className="text-right">
         <div className="flex justify-end gap-1">
           <Button size="sm" variant="outline" disabled={busy} onClick={() => void (async () => {
-            try { const r = await api.post<{ ok: boolean; detail: string; modelCount: number | null }>(`/api/admin/qoder/accounts/${account.id}/test`); toast[r.ok ? 'success' : 'error'](`${label}: ${r.detail}${r.modelCount === null ? '' : ` (${r.modelCount} models)`}`); }
+            try { const r = await api.post<{ ok: boolean; detail: string; modelCount: number | null }>(`/api/admin/qoder/accounts/${account.id}/test`); toast[r.ok ? 'success' : 'error'](`${label}: ${r.detail}${r.modelCount === null ? '' : ` (${r.modelCount} models)`}`); onChanged(); }
             catch (e) { toast.error((e as Error).message || 'Test failed'); }
           })()}>Test</Button>
           <Button size="sm" variant="outline" disabled={busy} onClick={() => void (async () => {
-            try { const r = await api.post<{ modelCount: number }>(`/api/admin/qoder/accounts/${account.id}/catalog`); toast.success(`${label}: ${r.modelCount} models`); }
+            try { const r = await api.post<{ modelCount: number }>(`/api/admin/qoder/accounts/${account.id}/catalog`); toast.success(`${label}: ${r.modelCount} models`); onChanged(); }
             catch (e) { toast.error((e as Error).message || 'Catalog refresh failed'); }
           })()}>Catalog</Button>
           <Button size="sm" variant="ghost" aria-label={`Delete ${label}`} disabled={busy} onClick={() => { if (window.confirm(`Delete the Qoder account ${label}? The stored token is removed permanently.`)) onDelete(); }}><Trash2 className="h-3 w-3" /></Button>
