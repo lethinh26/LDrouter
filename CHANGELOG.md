@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.17.1] - 2026-09-17
+
+### Added
+
+- **Combo members are ordered by drag and drop.** The combo create/edit dialog lists members as sortable rows (`@dnd-kit`, the same interaction as the Codex and Qoder account pools): drag the handle — or reorder with the keyboard — and the row order becomes the saved priority, `position` 0 being tried first in fallback mode and leading the rotation in weighted round-robin.
+
+### Fixed
+
+- **`GET /api/admin/combos/:id` returned members in SQLite row order instead of priority order**, so a reordered combo could reopen showing the previous sequence. Members are now sorted by `position`.
+
 ## [1.17.0] - 2026-09-17
 
 ### Added

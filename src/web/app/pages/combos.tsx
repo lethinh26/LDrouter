@@ -12,11 +12,20 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '.
 import { Switch } from '../../components/ui/switch';
 import { api } from '../../lib/api';
 import { toast } from 'sonner';
-import { Plus, Edit, Trash2, Search, X } from 'lucide-react';
+import { Plus, Edit, Trash2, Search, X, GripVertical } from 'lucide-react';
+import { DndContext, KeyboardSensor, PointerSensor, closestCenter, useSensor, useSensors, type DragEndEvent } from '@dnd-kit/core';
+import { restrictToParentElement, restrictToVerticalAxis } from '@dnd-kit/modifiers';
+import { SortableContext, arrayMove, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable';
+import { cn } from '../../lib/utils';
 
 interface Combo { id: string; name: string; slug: string; publicModelId: string; mode: string; enabled: boolean; memberCount: number; healthyMemberCount: number; }
 interface ComboDetail extends Combo { members: Array<{ id: string; modelId: string; publicModelId: string; displayName: string; providerSlug: string; position: number; weight: number; enabled: boolean }>; }
 interface ModelRow { id: string; publicModelId: string; displayName: string; }
+interface MemberForm { id?: string; modelId: string; position: number; weight: number; enabled: boolean }
+
+// Priority is the array order: index 0 is tried first in fallback mode and leads
+// the rotation in weighted round-robin.
+const reindex = (members: MemberForm[]) => members.map((m, i) => ({ ...m, position: i }));
 
 export function Combos() {
   const [combos, setCombos] = useState<Combo[]>([]);
@@ -26,7 +35,7 @@ export function Combos() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [editing, setEditing] = useState(false);
-  const [form, setForm] = useState({ name: '', slug: '', mode: 'fallback' as 'fallback' | 'weighted_round_robin', enabled: true, members: [] as Array<{ modelId: string; weight: number; position: number; enabled: boolean }> });
+  const [form, setForm] = useState({ name: '', slug: '', mode: 'fallback' as 'fallback' | 'weighted_round_robin', enabled: true, members: [] as MemberForm[] });
   const [editForm, setEditForm] = useState({ name: '', slug: '', mode: 'fallback' as 'fallback' | 'weighted_round_robin', enabled: true, members: [] as typeof form.members });
 
   const reload = async () => {
@@ -38,13 +47,6 @@ export function Combos() {
     setModels(m.models);
   };
   useEffect(() => { void reload(); }, []);
-
-  const addMember = (modelId: string) => {
-    setForm((f) => ({ ...f, members: [...f.members, { modelId, weight: 1, position: f.members.length, enabled: true }] }));
-  };
-  const removeMember = (idx: number) => {
-    setForm((f) => ({ ...f, members: f.members.filter((_, i) => i !== idx).map((m, i) => ({ ...m, position: i })) }));
-  };
 
   const submit = async () => {
     if (form.members.length === 0) { toast.error('Add at least one member'); return; }
@@ -92,11 +94,8 @@ export function Combos() {
     finally { setEditing(false); }
   };
 
-  const addEditMember = (modelId: string) => {
-    setEditForm((f) => ({ ...f, members: [...f.members, { modelId, weight: 1, position: f.members.length, enabled: true }] }));
-  };
-  const removeEditMember = (idx: number) => {
-    setEditForm((f) => ({ ...f, members: f.members.filter((_, i) => i !== idx).map((m, i) => ({ ...m, position: i })) }));
+  const addMember = (modelId: string) => {
+    setEditForm((f) => ({ ...f, members: reindex([...f.members, { modelId, weight: 1, position: f.members.length, enabled: true }]) }));
   };
 
   const del = async (id: string) => {
@@ -126,17 +125,14 @@ export function Combos() {
               </div>
               <div className="flex items-center gap-2"><Switch checked={form.enabled} onCheckedChange={(v) => setForm({ ...form, enabled: v })} /><Label>Enabled</Label></div>
               <div>
-                <Label>Members</Label>
+                <Label>Members — priority order · drag to reorder</Label>
                 <MemberPicker models={models} addedIds={form.members.map((m) => m.modelId)} onAdd={addMember} />
-                <div className="mt-2 space-y-1">
-                  {form.members.map((m, i) => (
-                    <div key={i} className="flex items-center gap-2 rounded border p-2 text-sm">
-                      <span className="font-mono text-xs">{models.find((x) => x.id === m.modelId)?.publicModelId}</span>
-                      <Input type="number" min={1} value={m.weight} onChange={(e) => { const v = Number(e.target.value); setForm((f) => ({ ...f, members: f.members.map((mm, j) => j === i ? { ...mm, weight: v } : mm) })); }} className="w-20" />
-                      <Button size="sm" variant="outline" onClick={() => removeMember(i)}>Remove</Button>
-                    </div>
-                  ))}
-                </div>
+                <MemberList
+                  className="mt-2"
+                  members={form.members}
+                  label={(m) => models.find((x) => x.id === m.modelId)?.publicModelId ?? m.modelId}
+                  onChange={(members) => setForm((f) => ({ ...f, members }))}
+                />
               </div>
             </div>
             <DialogFooter>
@@ -193,17 +189,14 @@ export function Combos() {
             </div>
             <div className="flex items-center gap-2"><Switch checked={editForm.enabled} onCheckedChange={(v) => setEditForm({ ...editForm, enabled: v })} /><Label>Enabled</Label></div>
             <div>
-              <Label>Members</Label>
-              <MemberPicker models={models} addedIds={editForm.members.map((m) => m.modelId)} onAdd={addEditMember} />
-              <div className="mt-2 space-y-1">
-                {editForm.members.map((m, i) => (
-                  <div key={i} className="flex items-center gap-2 rounded border p-2 text-sm">
-                    <span className="font-mono text-xs">{models.find((x) => x.id === m.modelId)?.publicModelId}</span>
-                    <Input type="number" min={1} value={m.weight} onChange={(e) => { const v = Number(e.target.value); setEditForm((f) => ({ ...f, members: f.members.map((mm, j) => j === i ? { ...mm, weight: v } : mm) })); }} className="w-20" />
-                    <Button size="sm" variant="outline" onClick={() => removeEditMember(i)}>Remove</Button>
-                  </div>
-                ))}
-              </div>
+              <Label>Members — priority order · drag to reorder</Label>
+              <MemberPicker models={models} addedIds={editForm.members.map((m) => m.modelId)} onAdd={addMember} />
+              <MemberList
+                className="mt-2"
+                members={editForm.members}
+                label={(m) => models.find((x) => x.id === m.modelId)?.publicModelId ?? m.modelId}
+                onChange={(members) => setEditForm((f) => ({ ...f, members }))}
+              />
             </div>
           </div>
           <DialogFooter>
@@ -212,6 +205,76 @@ export function Combos() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+    </div>
+  );
+}
+
+// Drag-sortable member rows: the row order IS the routing priority that gets saved
+// as member.position (0 = highest priority), like the Codex account pool.
+function MemberList({ members, label, onChange, className }: {
+  members: MemberForm[];
+  label: (member: MemberForm) => string;
+  onChange: (members: MemberForm[]) => void;
+  className?: string;
+}) {
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+  );
+  if (members.length === 0) return <p className={cn('text-xs text-muted-foreground', className)}>No members yet — add at least one.</p>;
+  const onDragEnd = ({ active, over }: DragEndEvent) => {
+    if (!over || active.id === over.id) return;
+    onChange(reindex(arrayMove(members, Number(active.id), Number(over.id))));
+  };
+  return (
+    <DndContext sensors={sensors} collisionDetection={closestCenter} modifiers={[restrictToVerticalAxis, restrictToParentElement]} onDragEnd={onDragEnd}>
+      <SortableContext items={members.map((_, i) => i)} strategy={verticalListSortingStrategy}>
+        <div className={cn('space-y-1', className)}>
+          {members.map((m, i) => (
+            <MemberRow
+              key={m.id ?? m.modelId}
+              index={i}
+              member={m}
+              label={label(m)}
+              onWeight={(weight) => onChange(members.map((mm, j) => (j === i ? { ...mm, weight } : mm)))}
+              onRemove={() => onChange(reindex(members.filter((_, j) => j !== i)))}
+            />
+          ))}
+        </div>
+      </SortableContext>
+    </DndContext>
+  );
+}
+
+/** One member row. Separate because useSortable is a hook and must run per row. */
+function MemberRow({ index, member, label, onWeight, onRemove }: {
+  index: number;
+  member: MemberForm;
+  label: string;
+  onWeight: (weight: number) => void;
+  onRemove: () => void;
+}) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: index });
+  return (
+    <div
+      ref={setNodeRef}
+      style={{ transform: transform ? `translate3d(${transform.x}px, ${transform.y}px, 0)` : undefined, transition }}
+      className={cn('flex items-center gap-2 rounded border p-2 text-sm', isDragging && 'relative z-10 bg-muted/60 shadow-sm')}
+    >
+      <button
+        type="button"
+        {...attributes}
+        {...listeners}
+        aria-label={`Reorder ${label}`}
+        title="Drag to change priority"
+        className="cursor-grab touch-none rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground active:cursor-grabbing"
+      >
+        <GripVertical className="h-4 w-4" />
+      </button>
+      <span className="w-5 text-xs tabular-nums text-muted-foreground">{index + 1}</span>
+      <span className="flex-1 font-mono text-xs">{label}</span>
+      <Input type="number" min={1} value={member.weight} onChange={(e) => onWeight(Number(e.target.value))} className="w-20" aria-label={`Weight for ${label}`} />
+      <Button size="sm" variant="outline" onClick={onRemove}>Remove</Button>
     </div>
   );
 }

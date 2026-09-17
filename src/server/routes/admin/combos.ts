@@ -133,7 +133,10 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
     const db = getDb();
     const c = db.select().from(schema.combos).where(eq(schema.combos.id, id)).get();
     if (!c) throw new GatewayError('invalid_request_error', 'Combo not found', { status: 404 });
-    const members = db.select().from(schema.comboMembers).where(eq(schema.comboMembers.comboId, id)).all();
+    // The admin UI shows (and drag-reorders) members by priority, so return them
+    // in position order rather than relying on SQLite row order.
+    const members = db.select().from(schema.comboMembers).where(eq(schema.comboMembers.comboId, id)).all()
+      .sort((a, b) => a.position - b.position);
     const models = db.select().from(schema.models).all();
     const modelMap = new Map(models.map((m) => [m.id, m]));
     return {

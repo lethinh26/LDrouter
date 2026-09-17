@@ -163,4 +163,13 @@ describe('admin combo edit', () => {
     expect(res.status).toBe(400);
     expect((await detail(created.id)).members).toHaveLength(2);
   });
+
+  it('persists drag-and-drop priority as member order', async () => {
+    // Exactly what the drag UI sends: the same members, re-indexed by row order.
+    const created = await (await create({ name: 'draggable', members: [member(modelA, 0), member(modelB, 1)] })).json();
+    expect((await detail(created.id)).members.map((m) => m.modelId)).toEqual([modelA, modelB]);
+    const moved = await patch({ id: created.id, members: [member(modelB, 0), member(modelA, 1)] });
+    expect(moved.status).toBe(200);
+    expect((await detail(created.id)).members.map((m) => m.modelId)).toEqual([modelB, modelA]);
+  });
 });
