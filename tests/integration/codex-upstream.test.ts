@@ -7,6 +7,58 @@ const cfg: CodexProviderConfig = { baseUrl: 'https://chatgpt.com', accountId: 'a
 const request = { model: 'gpt-5-codex', messages: [{ role: 'user' as const, content: [{ type: 'text' as const, text: 'hello' }] }], stream: false };
 
 describe('Codex upstream HTTP', () => {
+  /**
+   * Regression: every follow-up turn in a conversation answered `502 Codex upstream HTTP 400`,
+   * while the first message worked. The backend rejects `input_text` on an assistant turn
+   * ("Invalid value: 'input_text'. Supported values are: 'output_text' and 'refusal'") — verified
+   * live against chatgpt.com. A plain chat request carries the previous answer in its history,
+   * so this hit every second message.
+   */
+  it('sends an assistant turn as output_text, and user turns as input_text', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ output: [], usage: {} }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    await callCodexNonStreaming(cfg, {
+      model: 'gpt-5.6-terra',
+      stream: false,
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'hello' }] },
+        { role: 'assistant', content: [{ type: 'text', text: 'Hello! How can I help you today?' }] },
+        { role: 'user', content: [{ type: 'text', text: 'bạn là model gì' }] },
+      ],
+    });
+    const body = JSON.parse(String((fetchMock.mock.calls[0]?.[1] as RequestInit).body));
+    expect(body.input).toEqual([
+      { role: 'user', content: [{ type: 'input_text', text: 'hello' }] },
+      { role: 'assistant', content: [{ type: 'output_text', text: 'Hello! How can I help you today?' }] },
+      { role: 'user', content: [{ type: 'input_text', text: 'bạn là model gì' }] },
+    ]);
+    expect(JSON.stringify(body.input)).not.toContain('"input_text","text":"Hello!');
+  });
+
+  /**
+   * Tool calls are top-level items upstream, never content blocks: a `function_call` inside
+   * `content` is rejected with "Supported values are: 'input_text', 'input_image', …".
+   */
+  it('sends tool calls and results as flat function_call / function_call_output items', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ output: [], usage: {} }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    await callCodexNonStreaming(cfg, {
+      model: 'gpt-5.6-terra',
+      stream: false,
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'weather in Hanoi?' }] },
+        { role: 'assistant', content: [{ type: 'tool_use', toolUse: { id: 'call_1', name: 'get_weather', input: { city: 'Hanoi' } } }] },
+        { role: 'tool', content: [{ type: 'tool_result', toolResult: { toolUseId: 'call_1', content: '{"tempC":31}' } }] },
+      ],
+    });
+    const body = JSON.parse(String((fetchMock.mock.calls[0]?.[1] as RequestInit).body));
+    expect(body.input).toEqual([
+      { role: 'user', content: [{ type: 'input_text', text: 'weather in Hanoi?' }] },
+      { type: 'function_call', call_id: 'call_1', name: 'get_weather', arguments: '{"city":"Hanoi"}' },
+      { type: 'function_call_output', call_id: 'call_1', output: '{"tempC":31}' },
+    ]);
+  });
+
   it('always sends store:false + stream:true, and merges a non-streaming caller from the stream', async () => {
     const body = new ReadableStream({ start(controller) {
       controller.enqueue(new TextEncoder().encode('data: {"type":"response.output_text.delta","delta":"hello"}\n\n'));
@@ -56,6 +108,17 @@ describe('Codex upstream HTTP', () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({ error: 'Bearer tok', refresh_token: 'refresh-secret' }), { status: 400 })));
     await expect(callCodexNonStreaming(cfg, request)).rejects.toThrow('Codex upstream HTTP 400');
     await expect(callCodexNonStreaming(cfg, request)).rejects.not.toThrow('refresh-secret');
+  });
+
+  it('includes the upstream explanation in the thrown error', async () => {
+    // Without this the operator only sees "HTTP 400" and has to re-derive the cause by hand.
+    // mockImplementation, not mockResolvedValue: a Response body is single-use and a real fetch returns a fresh one.
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(() => Promise.resolve(new Response(JSON.stringify({
+      error: { message: "Invalid value: 'input_text'. Supported values are: 'output_text' and 'refusal'.", type: 'invalid_request_error', param: 'input[1].content[0]', code: 'invalid_value' },
+    }), { status: 400 }))));
+    const error = await callCodexNonStreaming(cfg, request).catch((e: Error) => e);
+    expect((error as Error).message).toContain("Invalid value: 'input_text'");
+    expect((error as Error).message).toContain('param input[1].content[0]');
   });
 
   it('accepts CRLF separators and dispatches an unterminated final event at EOF', async () => {

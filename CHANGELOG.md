@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.17.2] - 2026-09-17
+
+### Fixed
+
+- **Every second message to a `codex/` model failed with `502 Codex upstream HTTP 400`.** The Responses `input` array was built with one content block type for all roles: assistant history went upstream as `input_text`, which the backend rejects ("Invalid value: 'input_text'. Supported values are: 'output_text' and 'refusal'"). The first message of a conversation worked because it carries no assistant turn; every follow-up carries the previous answer, so chat, combo and agent traffic died from the second turn onward. Assistant prose is now sent as `output_text`. Verified live against chatgpt.com with a two-turn conversation (both turns 200).
+- **Tool history was rejected the same way.** `function_call` and `function_call_output` are top-level `input` items on the Responses API, never content blocks — a call nested in `content` answers `400 invalid_value` listing the permitted block types. Tool calls and their results are now emitted as flat items correlated by `call_id`.
+- **`Codex upstream HTTP 400` said nothing about the cause.** The upstream error body, which names the offending field (`param input[i].content[j]`), was discarded. It is now included in the thrown message, secret-redacted and truncated.
+
 ## [1.17.1] - 2026-09-17
 
 ### Added

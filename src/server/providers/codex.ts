@@ -1,4 +1,5 @@
 import { withCodexCredentials, refreshCodexAccount } from './codex-refresh';
+import { redactString, redactValue } from '../security/redact';
 import type { CanonicalRequest } from '../routing/capabilities';
 import type { DiscoveredModel, ProbeResult } from './index';
 
@@ -103,11 +104,7 @@ export async function codexModels(cfg: CodexProviderConfig): Promise<DiscoveredM
 const CODEX_REQUIRED_FLAGS = { store: false, stream: true } as const;
 
 export function codexRequestPayload(req: CanonicalRequest, targetModel = req.model): Record<string, unknown> {
-  const input = req.messages.map((message) => ({ role: message.role, content: message.content.map((block) => {
-    if (block.type === 'text') return { type: 'input_text', text: block.text ?? '' };
-    if (block.type === 'image' && (block.image?.url || block.image?.base64)) return { type: 'input_image', image_url: block.image?.url ?? `data:${block.image?.mimeType ?? 'image/png'};base64,${block.image?.base64}` };
-    return null;
-  }).filter(Boolean) }));
+  const input = codexInputItems(req.messages);
   const payload: Record<string, unknown> = { model: targetModel, input, ...CODEX_REQUIRED_FLAGS };
   if (req.system) payload.instructions = req.system;
   // max_output_tokens, temperature and top_p are NOT forwarded: the Codex backend rejects each
@@ -116,6 +113,66 @@ export function codexRequestPayload(req: CanonicalRequest, targetModel = req.mod
   if (req.tools?.length) payload.tools = req.tools.map((tool) => ({ type: 'function', name: tool.name, description: tool.description, parameters: tool.inputSchema }));
   if (req.reasoning?.effort) payload.reasoning = { effort: req.reasoning.effort };
   return payload;
+}
+
+type CodexInputItem = Record<string, unknown>;
+
+/**
+ * Translate canonical messages into the Responses `input` array.
+ *
+ * The backend is strict about which item shapes are legal and rejects the rest
+ * with `400 invalid_value`, naming the offending `input[i]` path:
+ *  - a text block on an assistant turn must be `output_text`; `input_text` is
+ *    rejected ("Invalid value: 'input_text'. Supported values are: 'output_text'
+ *    and 'refusal'"). So a plain chat follow-up — history contains an assistant
+ *    turn — failed while the first message of a conversation worked.
+ *  - tool calls and their results are NOT content blocks: a `function_call`
+ *    inside `content` is rejected ("Supported values are: 'input_text',
+ *    'input_image', …"). They are top-level items, `function_call` and
+ *    `function_call_output`, correlated by `call_id`.
+ * Verified live against chatgpt.com.
+ */
+export function codexInputItems(messages: CanonicalRequest['messages']): CodexInputItem[] {
+  const items: CodexInputItem[] = [];
+  for (const message of messages) {
+    const content: CodexInputItem[] = [];
+    const flushMessage = () => {
+      if (content.length > 0) items.push({ role: message.role, content: [...content] });
+      content.length = 0;
+    };
+    for (const block of message.content) {
+      if (block.type === 'text') {
+        // Assistant prose is "output" from the API's point of view; everything else is input.
+        content.push(message.role === 'assistant' ? { type: 'output_text', text: block.text ?? '' } : { type: 'input_text', text: block.text ?? '' });
+        continue;
+      }
+      if (block.type === 'image' && (block.image?.url || block.image?.base64)) {
+        content.push({ type: 'input_image', image_url: block.image?.url ?? `data:${block.image?.mimeType ?? 'image/png'};base64,${block.image?.base64}` });
+        continue;
+      }
+      if (block.type === 'tool_use' && block.toolUse) {
+        // Top-level item, so the message wrapping the call is emitted first.
+        flushMessage();
+        items.push({
+          type: 'function_call',
+          call_id: block.toolUse.id,
+          name: block.toolUse.name,
+          arguments: typeof block.toolUse.input === 'string' ? block.toolUse.input : JSON.stringify(block.toolUse.input ?? {}),
+        });
+        continue;
+      }
+      if (block.type === 'tool_result' && block.toolResult) {
+        flushMessage();
+        items.push({
+          type: 'function_call_output',
+          call_id: block.toolResult.toolUseId,
+          output: typeof block.toolResult.content === 'string' ? block.toolResult.content : JSON.stringify(block.toolResult.content ?? ''),
+        });
+      }
+    }
+    flushMessage();
+  }
+  return items;
 }
 
 function usage(value: unknown): CodexCanonicalResult['usage'] {
@@ -160,7 +217,19 @@ export function codexStreamEventToCanonical(event: Record<string, unknown>): { t
 }
 
 async function responseError(response: Response): Promise<Error & { status: number }> {
-  const error = Object.assign(new Error(`Codex upstream HTTP ${response.status}`), { status: response.status });
+  // The backend explains every rejection (`{"error":{"message":"Invalid value: ...","param":"input[1].content[0]"}}`).
+  // Without it an operator only sees "HTTP 400" and has to re-derive the cause by hand.
+  let detail = '';
+  try {
+    const parsed = JSON.parse(await response.text()) as Record<string, unknown> & { error?: { message?: unknown; param?: unknown }; detail?: unknown };
+    const message = typeof parsed.error?.message === 'string' ? parsed.error.message : typeof parsed.detail === 'string' ? parsed.detail : null;
+    // redactValue, not just redactString: an error body can echo a secret under a
+    // secret-named key, which only the structured pass recognizes.
+    detail = message
+      ? `: ${message}${typeof parsed.error?.param === 'string' ? ` (param ${parsed.error.param})` : ''}`
+      : `: ${JSON.stringify(redactValue(parsed))}`;
+  } catch { /* a non-JSON or already-read body must not mask the status */ }
+  const error = Object.assign(new Error(`Codex upstream HTTP ${response.status}${redactString(detail).slice(0, 500)}`), { status: response.status });
   return error;
 }
 
@@ -185,7 +254,9 @@ export async function callCodexStreaming(cfg: CodexProviderConfig, req: Canonica
     const ctl = timeout(tokenCfg.totalTimeoutMs);
     try {
     const response = await fetch(codexRequest(tokenCfg, '/responses'), { method: 'POST', headers: codexHeaders(tokenCfg, 'text/event-stream'), body: JSON.stringify(codexRequestPayload(req)), signal: ctl.signal });
-    if (!response.ok || !response.body) throw await responseError(response);
+    // Only a failed response is read as text here; a 2xx with no body must still report its status.
+    if (!response.ok) throw await responseError(response);
+    if (!response.body) throw Object.assign(new Error(`Codex upstream HTTP ${response.status}: empty response body`), { status: response.status });
     const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = '';
     const process = (raw: string) => { const data = raw.split(/\r?\n/).find((line) => line.startsWith('data:'))?.slice(5).trim(); if (data && data !== '[DONE]') onEvent(codexStreamEventToCanonical(JSON.parse(data) as Record<string, unknown>)); };
     for (;;) { const part = await reader.read(); buffer += decoder.decode(part.value ?? new Uint8Array(), { stream: part.done }); let index; while ((index = buffer.search(/\r?\n\r?\n/)) >= 0) { process(buffer.slice(0, index)); buffer = buffer.slice(index + (buffer[index] === '\r' ? 4 : 2)); } if (part.done) break; }
