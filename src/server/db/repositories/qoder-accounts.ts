@@ -5,6 +5,7 @@ import { decryptSecret, encryptSecret } from '../../auth/crypto';
 import { uuid } from '../../auth/ids';
 import { createHash } from 'node:crypto';
 import { getRawDb } from '../index';
+import type { QoderCredits } from '../../providers/qoder/credits';
 
 export interface DecryptedQoderCredentials {
   personalToken: string;
@@ -41,10 +42,25 @@ export interface QoderAccountSummary {
   priority: number;
   jobTokenExpiresAt: string;
   catalogFetchedAt: string | null;
+  /** Parsed Credits snapshot. The raw column never reaches the API layer. */
+  credits: QoderCredits | null;
+  creditsUpdatedAt: string | null;
+  creditsError: string | null;
   lastError: string | null;
   consecutiveFailures: number;
   createdAt: string;
   updatedAt: string;
+}
+
+/** A corrupted or absent snapshot reads as "no data", never as a thrown error on a list call. */
+function parseStoredCredits(json: string | null): QoderCredits | null {
+  if (!json) return null;
+  try {
+    const parsed = JSON.parse(json) as QoderCredits;
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
 }
 
 export interface QoderAccountDetail extends QoderAccountSummary {
@@ -76,9 +92,17 @@ export function identityFromQoderRecord(record: NormalizedQoderRecord): QoderIde
 }
 
 const SUMMARY_COLUMNS =
-  'id,provider_id AS providerId,label,email,qoder_user_id AS qoderUserId,machine_id AS machineId,enabled,health_state AS healthState,priority,job_token_expires_at AS jobTokenExpiresAt,catalog_fetched_at AS catalogFetchedAt,last_error AS lastError,consecutive_failures AS consecutiveFailures,created_at AS createdAt,updated_at AS updatedAt';
+  'id,provider_id AS providerId,label,email,qoder_user_id AS qoderUserId,machine_id AS machineId,enabled,health_state AS healthState,priority,job_token_expires_at AS jobTokenExpiresAt,catalog_fetched_at AS catalogFetchedAt,credits_json AS creditsJson,credits_updated_at AS creditsUpdatedAt,credits_error AS creditsError,last_error AS lastError,consecutive_failures AS consecutiveFailures,created_at AS createdAt,updated_at AS updatedAt';
 
-type SummaryRow = Omit<QoderAccountDetail, 'enabled' | 'qoderUserIdMasked'> & { enabled: boolean | number };
+// Two callers hand this either a raw row (serialized `creditsJson`) or an already-mapped detail
+// (parsed `credits`), so both spellings are accepted and the summary exposes one parsed shape.
+type SummaryRow = Omit<QoderAccountDetail, 'enabled' | 'qoderUserIdMasked' | 'credits' | 'creditsUpdatedAt' | 'creditsError'> & {
+  enabled: boolean | number;
+  creditsJson?: string | null;
+  credits?: QoderCredits | null;
+  creditsUpdatedAt?: string | null;
+  creditsError?: string | null;
+};
 
 export function toQoderAccountSummary(row: SummaryRow): QoderAccountSummary {
   return {
@@ -92,6 +116,9 @@ export function toQoderAccountSummary(row: SummaryRow): QoderAccountSummary {
     priority: row.priority,
     jobTokenExpiresAt: row.jobTokenExpiresAt,
     catalogFetchedAt: row.catalogFetchedAt,
+    credits: (row.credits ?? null) || parseStoredCredits(row.creditsJson ?? null),
+    creditsUpdatedAt: row.creditsUpdatedAt ?? null,
+    creditsError: row.creditsError ?? null,
     lastError: row.lastError,
     consecutiveFailures: row.consecutiveFailures,
     createdAt: row.createdAt,
@@ -253,6 +280,13 @@ export function saveQoderCatalog(id: string, catalogJson: string, fetchedAt?: st
   getRawDb()
     .prepare('UPDATE qoder_accounts SET catalog_json=?, catalog_fetched_at=?, updated_at=? WHERE id=?')
     .run(catalogJson, fetchedAt ?? new Date().toISOString(), nextUpdatedAt(id), id);
+}
+
+/** Credits are observability, not routing state: a failed fetch is recorded without touching health. */
+export function saveQoderCredits(id: string, creditsJson: string | null, error: string | null, fetchedAt: string): void {
+  getRawDb()
+    .prepare('UPDATE qoder_accounts SET credits_json=COALESCE(?, credits_json), credits_updated_at=?, credits_error=?, updated_at=? WHERE id=?')
+    .run(creditsJson, fetchedAt, error, nextUpdatedAt(id), id);
 }
 
 // Keeps `updated_at` strictly increasing even within the same millisecond, so a caller can

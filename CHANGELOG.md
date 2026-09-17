@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.17.3] - 2026-09-17
+
+### Added
+
+- **Qoder accounts now show Credits — the account's real usage.** Qoder does not bill in tokens: its chat stream carries no usage block at all, so every Qoder request logged zero tokens and the panel had no usage figure to show. Credits are now read from Qoder's quota API (`GET /api/v2/quota/usage`) and shown per account: plan / add-on / org buckets, percentage used, expiry, and whether the quota is exhausted. A **Refresh credits** action re-reads them for every account.
+- **Promotion-covered models are shown next to Credits.** Qoder keeps a model free by marking its catalog entry `is_free` — currently `qmodel_38max` (Qwen3.8-Max). Such a model spends no Credits, so an account at zero Credits still answers on it while every other model is refused. The panel now pairs **No plan credits** with **Free now: <model>** so a partly-working account reads as intended instead of looking like a router fault.
+
+### Fixed
+
+- **A Qoder quota refusal was reported as a token rejection.** The upstream returns HTTP 200 with a `403 code 112` envelope inside the streamed body for quota/billing refusals; the attempt classifier checked `401/403` before billing, so a depleted account was labelled "job token was rejected after a refresh" and the account was force-re-exchanged on every request. Billing-shaped refusals are no longer mistaken for credential failures.
+- **The account Test button reported a blocked account as working.** It only probed the model catalog, which proves the PAT exchanges and nothing else — the refusal arrives as a `403` envelope inside an HTTP 200 body, so a check that never sends a message cannot see it. Test now sends one real request, preferring a promotion-covered model so testing never spends Credits, and names the free models that still work when the account is out of them.
+
 ## [1.17.2] - 2026-09-17
 
 ### Fixed

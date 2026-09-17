@@ -81,6 +81,30 @@ Because the gateway serves model discovery from that live catalog, a new account
 
 The panel shows the masked user id, job-token expiry, when the catalog was last fetched, health, and an enabled toggle. Routing order is set by dragging rows, exactly as with Codex.
 
+### Qoder usage, Credits and promotions
+
+Qoder does not meter models in tokens: its chat stream carries no usage block at all, so request logs
+show zero tokens for every Qoder model and the panel's **Credits** column is the account's real
+usage. It is read from Qoder's quota API (`GET /api/v2/quota/usage` on `openapi.qoder.sh`) and shows
+the plan / add-on / org buckets, the percentage used, and whether the account is exhausted.
+
+**Credits and free models are different things, and the panel shows both.** Qoder keeps promoting a
+model — currently `qmodel_38max`, the Qwen3.8-Max route — by marking its catalog entry `is_free`.
+Such a model spends no Credits, so an account at **zero Credits** still answers on it while every
+other model returns an envelope `403 code 112` with a `pricingUrl`. That pairing is what makes an
+"out of credits" account look partly broken: the panel labels the column **No plan credits** next to
+**Free now: qmodel_38max** so the contradiction is visible instead of looking like a router fault.
+
+There is an upstream edge worth knowing when reading logs: a quota refusal arrives as **HTTP 200**
+with a `403` envelope inside the streamed body, so it is not an HTTP error at the transport layer.
+
+Use **Refresh credits** to re-read the snapshot for every account. It deliberately reuses the live
+`job token` instead of exchanging the PAT again — a fresh exchange invalidates the token a
+concurrent request may be using.
+
+**Test** sends one real message, because a catalog probe cannot see a quota refusal. It picks a
+promotion-covered model when the account has one, so testing never spends Credits.
+
 ## Environment variables
 
 | Variable | Description | Default |

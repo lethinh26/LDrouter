@@ -1,6 +1,6 @@
 // Qoder upstream behaviour against a stubbed transport. No network.
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { QoderUpstreamError, callQoderNonStreaming } from '../../src/server/providers/qoder/client';
+import { QoderUpstreamError, callQoderNonStreaming, probeQoderInference } from '../../src/server/providers/qoder/client';
 import { parseCatalog } from '../../src/server/providers/qoder/catalog';
 import type { CanonicalRequest } from '../../src/server/routing/capabilities';
 
@@ -49,5 +49,59 @@ describe('Qoder upstream (mocked)', () => {
     const result = await callQoderNonStreaming(cfg, request);
     expect(result.text).toBe('partial');
     expect(result.finishReason).toBeNull();
+  });
+});
+
+// The account "Test" button used to ask only for the catalog, so an account that was refused on
+// every chat (Qoder answers the refusal as an envelope 403 inside an HTTP 200 body) still reported
+// "Connected". The probe now sends one real message.
+describe('probeQoderInference', () => {
+  const freeCatalog = parseCatalog({ chat: [
+    { key: 'qmodel_38max', display_name: 'Qwen3.8-Max', enable: true, is_free: true, max_input_tokens: 200_000, max_output_tokens: 32_768 },
+    { key: 'dmodel', display_name: 'DeepSeek', enable: true, is_free: false, max_input_tokens: 200_000, max_output_tokens: 32_768 },
+  ] }, '2026-09-16T00:00:00.000Z');
+
+  it('proves inference and prefers a promotion-covered model', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(sse([content('pong')]));
+    vi.stubGlobal('fetch', fetchMock);
+    const result = await probeQoderInference({ ...cfg, catalog: freeCatalog });
+    expect(result.ok).toBe(true);
+    // The request body is obfuscated on the wire, so the chosen model is read off the detail.
+    expect(result.detail).toContain('qmodel_38max');
+    expect(result.detail).toContain('free');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('falls back to the first catalog entry when nothing is promoted', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(sse([content('pong')])));
+    const paidOnly = parseCatalog({ chat: [
+      { key: 'dmodel', display_name: 'DeepSeek', enable: true, is_free: false, max_input_tokens: 200_000, max_output_tokens: 32_768 },
+    ] }, '2026-09-16T00:00:00.000Z');
+    const result = await probeQoderInference({ ...cfg, catalog: paidOnly });
+    expect(result.ok).toBe(true);
+    expect(result.detail).toBe('Inference OK (dmodel)');
+  });
+
+  it('reports an out-of-Credits account as failing, naming the free models that still work', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(sse([{ statusCodeValue: 403, body: '{"code":"112","message":"quota exhausted","pricingUrl":"https://qoder.com/pricing"}' }])));
+    const result = await probeQoderInference({ ...cfg, catalog: freeCatalog });
+    expect(result.ok).toBe(false);
+    expect(result.detail).toContain('out of Credits');
+    expect(result.detail).toContain('qmodel_38max');
+  });
+
+  it('says plainly that nothing works when no model is promotion-covered', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(sse([{ statusCodeValue: 403, body: '{"code":"112"}' }])));
+    const paidOnly = parseCatalog({ chat: [{ key: 'dmodel', display_name: 'DeepSeek', enable: true, is_free: false }] }, '2026-09-16T00:00:00.000Z');
+    const result = await probeQoderInference({ ...cfg, catalog: paidOnly });
+    expect(result.ok).toBe(false);
+    expect(result.detail).toContain('nothing it serves will work');
+    expect(result.detail).not.toContain('still work');
+  });
+
+  it('fails when there is no catalog to test against', async () => {
+    const result = await probeQoderInference({ ...cfg, catalog: null });
+    expect(result.ok).toBe(false);
+    expect(result.detail).toContain('catalog is empty');
   });
 });

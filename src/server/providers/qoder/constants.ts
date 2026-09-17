@@ -11,6 +11,8 @@ export const QODER_LOGIN_URL = 'https://qoder.com/account/integrations';
 
 export const QODER_JOB_TOKEN_EXCHANGE_URL = `${QODER_OPENAPI_BASE}/api/v1/jobToken/exchange`;
 export const QODER_USERINFO_URL = `${QODER_OPENAPI_BASE}/api/v1/userinfo`;
+// Credits (Qoder's billing unit) live on openapi, not on the inference host.
+export const QODER_CREDITS_URL = `${QODER_OPENAPI_BASE}/api/v2/quota/usage`;
 
 export const QODER_CHAT_SIG_PATH = '/api/v2/service/pro/sse/agent_chat_generation';
 export const QODER_CHAT_URL = `${QODER_INFERENCE_BASE}/algo${QODER_CHAT_SIG_PATH}?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1`;

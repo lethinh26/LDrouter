@@ -6,7 +6,7 @@ import { listCodexAccountSummaries, chatgptAccountIdOf } from '../db/repositorie
 import { listQoderAccountSummaries } from '../db/repositories/qoder-accounts';
 import { probeCodex, codexModels, CODEX_BASE_URL } from './codex';
 import { withCodexCredentials, codexCredentialError } from './codex-refresh';
-import { probeQoder, qoderModels } from './qoder/client';
+import { probeQoderInference, qoderModels } from './qoder/client';
 import { withQoderCredentials } from './qoder/credentials';
 import { QODER_INFERENCE_BASE } from './qoder/constants';
 import type { DiscoveredModel, ProbeResult } from './index';
@@ -72,7 +72,9 @@ const qoderStrategy: PooledProvider = {
   // through the credential seam so a stale job token is refreshed before the upstream is asked.
   probe: async (provider) => {
     const account = firstEligible(qoderStrategy.listAccounts(provider.id));
-    return withQoderCredentials(account.id, (config) => probeQoder({ ...config, accountRecordId: account.id, totalTimeoutMs: Math.min(provider.totalTimeoutMs, 20_000) }))
+    // Inference, not just the catalog — see probeQoderInference: a catalog probe cannot see the
+    // billing envelope that Qoder returns with HTTP 200 when an account is out of Credits.
+    return withQoderCredentials(account.id, (config) => probeQoderInference({ ...config, accountRecordId: account.id, totalTimeoutMs: Math.min(provider.totalTimeoutMs, 30_000) }))
       .catch((error) => { throw qoderCredentialError(error); });
   },
   discover: async (provider) => {

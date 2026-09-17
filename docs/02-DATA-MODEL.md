@@ -125,6 +125,9 @@ as well as TypeScript).
 - `encrypted_job_token` / `job_token_nonce` / `job_token_version` — derived, short-lived
 - `job_token_expires_at`
 - `catalog_json`, `catalog_fetched_at` — the live model list last fetched for this account
+- `credits_json`, `credits_updated_at`, `credits_error` — last Credits snapshot (added by
+  `0008_qoder_credits.sql`). Qoder meters usage in Credits and its chat stream reports no token
+  usage at all, so this quota snapshot is the account's only real usage figure.
 - `enabled`
 - `health_state`: `healthy | degraded | down | unknown`
 - `last_error` nullable — sanitized; never contains a credential

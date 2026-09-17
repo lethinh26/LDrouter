@@ -33,7 +33,7 @@ const realFetch = globalThis.fetch;
  * The user id is derived from the PAT so distinct tokens are distinct accounts: identity is
  * (provider_id, qoder_user_id), and a shared id would silently collapse them into one row.
  */
-const stubUpstream = (overrides: { exchangeStatus?: number; catalogStatus?: number } = {}) => {
+const stubUpstream = (overrides: { exchangeStatus?: number; catalogStatus?: number; creditsStatus?: number; chatStatus?: number } = {}) => {
   // The exchange is a POST carrying the PAT; userinfo is a GET that carries only the job token, so
   // the identity has to be remembered across the two calls.
   const byJobToken = new Map<string, string>();
@@ -54,7 +54,22 @@ const stubUpstream = (overrides: { exchangeStatus?: number; catalogStatus?: numb
       return new Response(JSON.stringify({ id: userId, email: `${userId}@example.com`, name: 'Dev' }), { status: 200 });
     }
     if (overrides.catalogStatus && overrides.catalogStatus !== 200) return new Response('{"error":"nope"}', { status: overrides.catalogStatus });
-    return new Response(JSON.stringify({ chat: [{ key: 'qmodel_38max', display_name: 'Qwen 38 Max', max_input_tokens: 200000, max_output_tokens: 32000 }] }), { status: 200 });
+    // Credits live on the same openapi host as userinfo, so they must be matched explicitly:
+    // falling through would hand the credits parser a model list.
+    if (url.includes('/quota/usage')) {
+      if (overrides.creditsStatus && overrides.creditsStatus !== 200) return new Response('{"error":"nope"}', { status: overrides.creditsStatus });
+      return new Response(JSON.stringify({ userType: 'personal_standard', isQuotaExceeded: true, totalUsagePercentage: 0, userQuota: { total: 0, used: 0, remaining: 0, unit: 'credits' } }), { status: 200 });
+    }
+    // Inference: the account "Test" button now sends a real message, so the chat endpoint has to
+    // answer with an envelope. `chatStatus` 403 carries the billing code the upstream really uses.
+    // Matched on the chat sig path, not `/algo/` — the model list lives under the same prefix.
+    if (url.includes('agent_chat_generation')) {
+      const envelope = overrides.chatStatus === 403
+        ? { statusCodeValue: 403, body: '{"code":"112","message":"quota exhausted"}' }
+        : { statusCodeValue: 200, body: JSON.stringify({ id: 'c1', choices: [{ index: 0, delta: { content: 'pong' } }] }) };
+      return new Response(`data: ${JSON.stringify(envelope)}\n\n`, { status: 200 });
+    }
+    return new Response(JSON.stringify({ chat: [{ key: 'qmodel_38max', display_name: 'Qwen 38 Max', is_free: true, max_input_tokens: 200000, max_output_tokens: 32000 }] }), { status: 200 });
   }));
 };
 
@@ -86,6 +101,17 @@ afterEach(() => vi.unstubAllGlobals());
 afterAll(async () => { await app.close(); (await import('../../src/server/db')).closeDb(); fs.rmSync(dataDir, { recursive: true, force: true }); });
 
 describe('authenticated Qoder admin HTTP API', () => {
+  it('reports an out-of-Credits account as failing rather than "connected"', async () => {
+    stubUpstream({ chatStatus: 403 });
+    const body = await (await fetch(`${baseUrl}/api/admin/qoder/accounts`, { method: 'POST', headers: authedJson(), body: JSON.stringify({ providerId, personalToken: 'pt-billing', label: 'Billing' }) })).json() as { account: { id: string } };
+    const tested = await (await fetch(`${baseUrl}/api/admin/qoder/accounts/${body.account.id}/test`, { method: 'POST', headers: authedJson(), body: JSON.stringify({}) })).json() as { ok: boolean; detail: string };
+    // The catalog loads and the PAT exchanges, which is exactly why a catalog-only probe lied.
+    expect(tested.ok).toBe(false);
+    expect(tested.detail).toContain('out of Credits');
+    const listed = await (await fetch(`${baseUrl}/api/admin/qoder/accounts?providerId=${providerId}`, { headers: { cookie } })).json() as { accounts: Array<{ id: string; healthState: string }> };
+    expect(listed.accounts.find((account) => account.id === body.account.id)!.healthState).toBe('down');
+  });
+
   it('requires a session and CSRF for every route', async () => {
     const noSession = await fetch(`${baseUrl}/api/admin/qoder/accounts?providerId=${providerId}`);
     expect(noSession.status).toBe(401);
@@ -212,13 +238,30 @@ describe('authenticated Qoder admin HTTP API', () => {
 
     const tested = await fetch(`${baseUrl}/api/admin/qoder/accounts/${id}/test`, { method: 'POST', headers: authedJson(), body: JSON.stringify({}) });
     expect(tested.status).toBe(200);
-    expect((await tested.json() as { modelCount: number }).modelCount).toBe(1);
+    const testedBody = await tested.json() as { ok: boolean; detail: string; modelCount: number };
+    expect(testedBody.ok).toBe(true);
+    expect(testedBody.detail).toContain('Inference OK');
+    expect(testedBody.modelCount).toBe(1);
 
     const catalog = await fetch(`${baseUrl}/api/admin/qoder/accounts/${id}/catalog`, { method: 'POST', headers: authedJson(), body: JSON.stringify({}) });
     const catalogBody = await catalog.json() as { modelCount: number; modelKeys: string[] };
     expect(catalogBody.modelCount).toBe(1);
     expect(catalogBody.modelKeys).toEqual(['qmodel_38max']);
     expect(JSON.stringify(catalogBody)).not.toContain('catalogJson');
+
+    // Credits are the account's real usage (Qoder streams no tokens), so the refresh route must
+    // report them and persist them onto the summary the UI renders.
+    const credits = await fetch(`${baseUrl}/api/admin/qoder/accounts/${id}/credits`, { method: 'POST', headers: authedJson(), body: JSON.stringify({}) });
+    expect(credits.status).toBe(200);
+    const creditsBody = await credits.json() as { account: { credits: { userType: string; exhausted: boolean; freeModels: string[] } } };
+    expect(creditsBody.account.credits).toMatchObject({ userType: 'personal_standard', exhausted: true });
+    // is_free comes off the cached catalog, which is why the catalog refresh above ran first.
+    expect(creditsBody.account.credits.freeModels).toEqual(['qmodel_38max']);
+
+    const listed = await (await fetch(`${baseUrl}/api/admin/qoder/accounts?providerId=${providerId}`, { headers: { cookie } })).json() as { accounts: Array<{ id: string; credits: unknown; creditsUpdatedAt: string | null }> };
+    const persisted = listed.accounts.find((account) => account.id === id)!;
+    expect(persisted.credits).toMatchObject({ exhausted: true, freeModels: ['qmodel_38max'] });
+    expect(persisted.creditsUpdatedAt).toBeTruthy();
 
     const deleted = await fetch(`${baseUrl}/api/admin/qoder/accounts/${id}`, { method: 'DELETE', headers: authed() });
     expect(deleted.status).toBe(200);
@@ -227,7 +270,7 @@ describe('authenticated Qoder admin HTTP API', () => {
 
     const { getRawDb } = await import('../../src/server/db');
     const actions = (getRawDb().prepare("SELECT DISTINCT action FROM audit_logs WHERE action LIKE 'qoder.accounts.%'").all() as Array<{ action: string }>).map((row) => row.action);
-    for (const expected of ['qoder.accounts.add', 'qoder.accounts.import', 'qoder.accounts.test', 'qoder.accounts.delete', 'qoder.accounts.update', 'qoder.accounts.reorder', 'qoder.accounts.catalog']) {
+    for (const expected of ['qoder.accounts.add', 'qoder.accounts.import', 'qoder.accounts.test', 'qoder.accounts.delete', 'qoder.accounts.update', 'qoder.accounts.reorder', 'qoder.accounts.catalog', 'qoder.accounts.credits']) {
       expect(actions).toContain(expected);
     }
   });

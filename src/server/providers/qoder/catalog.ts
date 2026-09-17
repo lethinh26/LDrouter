@@ -14,6 +14,8 @@ export interface QoderCatalogEntry {
   enabled: boolean;
   isReasoning: boolean;
   isVl: boolean;
+  /** Upstream marks promotion-covered models `is_free`: they do not draw on Credits. */
+  isFree: boolean;
   maxInputTokens: number;
   maxOutputTokens: number;
   raw: Record<string, unknown>;
@@ -74,6 +76,7 @@ export function parseCatalog(body: unknown, fetchedAt: string): QoderCatalog {
       enabled: raw.enable !== false,
       isReasoning: raw.is_reasoning === true,
       isVl: raw.is_vl === true,
+      isFree: raw.is_free === true,
       maxInputTokens: numberOr(raw.max_input_tokens, 0),
       maxOutputTokens: numberOr(raw.max_output_tokens, 0),
       raw,
@@ -97,7 +100,12 @@ export function deserializeCatalog(raw: string | null): QoderCatalog | null {
     const parsed = JSON.parse(raw) as { fetchedAt?: unknown; entries?: unknown };
     const entries = new Map<string, QoderCatalogEntry>();
     if (Array.isArray(parsed.entries)) {
-      for (const entry of parsed.entries as QoderCatalogEntry[]) if (entry?.key) entries.set(entry.key, entry);
+      for (const entry of parsed.entries as QoderCatalogEntry[]) {
+        if (!entry?.key) continue;
+        // Catalogs cached before `isFree` existed carry only `raw.is_free`, so re-derive it
+        // rather than showing an empty free-model list until the next catalog refresh.
+        entries.set(entry.key, entry.isFree === undefined ? { ...entry, isFree: entry.raw?.is_free === true } : entry);
+      }
     }
     return { entries, fetchedAt: typeof parsed.fetchedAt === 'string' ? parsed.fetchedAt : '' };
   } catch {

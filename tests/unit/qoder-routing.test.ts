@@ -31,3 +31,38 @@ describe('Qoder account candidate expansion', () => {
     expect(expandQoderAccountCandidates(candidate, mixed).map((c) => c.qoderAccountId)).toEqual(['a', 'b', 'e']);
   });
 });
+
+// A quota refusal arrives as an envelope carrying status 403 (code 112), so classifying by status
+// alone reports it as a rejected credential. That mislabels the cause and force-re-exchanges a good
+// PAT on every request. Billing must win over the 401/403 branch.
+describe('Qoder attempt failure classification', () => {
+  it('reports a billing block as quota, not as a rejected token', async () => {
+    const { closeDb, openDb, getRawDb } = await import('../../src/server/db');
+    const { setConfigMasterKey } = await import('../../src/server/config');
+    const fs = await import('node:fs');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'latedev-qoder-billing-'));
+    process.env.LATEDEV_MASTER_KEY = '12345678901234567890123456789012';
+    setConfigMasterKey(process.env.LATEDEV_MASTER_KEY);
+    openDb(path.join(dir, 'data.sqlite'));
+    try {
+      getRawDb().prepare("INSERT INTO providers (id,name,slug,type,base_url) VALUES ('qp','Qoder','qp','qoder','https://api2.qoder.sh')").run();
+      const repo = await import('../../src/server/db/repositories/qoder-accounts');
+      const id = repo.insertQoderAccount('qp', {
+        index: 0, personalToken: 'pt-x', jobToken: 'jt-x', jobTokenExpiresAt: '2026-09-18T00:00:00.000Z',
+        qoderUserId: 'u1', machineId: 'm1', email: null, label: null, source: undefined,
+      });
+      const { qoderAttemptFailure } = await import('../../src/server/providers/qoder/credentials');
+      await expect(qoderAttemptFailure(id, { status: 403, message: 'quota exceeded', billing: true })).rejects.toMatchObject({ code: 'qoder_billing_block' });
+      const after = repo.listQoderAccountSummaries('qp')[0]!;
+      // degraded, not down: a depleted account is still eligible, it is out of quota for paid models.
+      expect(after.healthState).toBe('degraded');
+      expect(after.lastError).toContain('quota');
+      expect(getRawDb().prepare('SELECT 1').get()).toBeTruthy();
+    } finally {
+      closeDb();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

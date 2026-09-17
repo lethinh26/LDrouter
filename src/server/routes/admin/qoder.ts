@@ -12,12 +12,14 @@ import {
   upsertQoderAccount,
   findQoderAccountForImport,
   saveQoderCatalog,
+  saveQoderCredits,
   toQoderAccountSummary,
   type NormalizedQoderRecord,
   type QoderAccountSummary,
 } from '../../db/repositories/qoder-accounts';
 import { exchangeQoderPat, fetchQoderCatalog, serializeCatalog, type QoderCatalog } from '../../providers/qoder/catalog';
-import { probeQoder } from '../../providers/qoder/client';
+import { probeQoderInference } from '../../providers/qoder/client';
+import { fetchQoderCredits, type QoderCredits } from '../../providers/qoder/credits';
 import { qoderCredentialsFor, withQoderCredentials } from '../../providers/qoder/credentials';
 import { parseQoderImportText, toQoderPreview, qoderTokenFingerprint, type NormalizedQoderToken, type QoderParseFailure } from '../../providers/qoder/qoder-import';
 import { redactString } from '../../security/redact';
@@ -88,6 +90,19 @@ function summaryOrThrow(id: string): QoderAccountSummary {
 }
 
 /**
+ * Fetch and persist the Credits snapshot. Free models come from the account's cached catalog
+ * because `is_free` is a catalog property, not a quota one — it is why an account at zero
+ * Credits can still serve a promotional model.
+ */
+async function refreshQoderCredits(id: string, config?: { jobToken: string; catalog: QoderCatalog | null }): Promise<QoderCredits> {
+  const resolved = config ?? (await qoderCredentialsFor(id)).config;
+  const freeModels = resolved.catalog ? [...resolved.catalog.entries.values()].filter((entry) => entry.isFree).map((entry) => entry.key) : [];
+  const credits = await fetchQoderCredits({ jobToken: resolved.jobToken }, freeModels, { timeoutMs: 10_000 });
+  saveQoderCredits(id, credits.unavailable ? null : JSON.stringify(credits), credits.unavailable ?? null, credits.fetchedAt);
+  return credits;
+}
+
+/**
  * A PAT that works but a catalog that 502s is recoverable — the operator retries later — so the
  * exchange result is stored even when the catalog fetch fails. When the exchange itself fails
  * nothing is written and the error is redacted.
@@ -132,6 +147,8 @@ export async function registerQoderRoutes(app: FastifyInstance): Promise<void> {
     // than throwing it away and leaving the account with no routable models until a manual refresh.
     if (catalog) saveQoderCatalog(result.id, serializeCatalog(catalog), catalog.fetchedAt);
     if (catalogError) setQoderAccountHealth(result.id, 'unknown', catalogError);
+    // Best effort: an account that cannot report Credits is still a usable account.
+    await refreshQoderCredits(result.id).catch(() => {});
     recordAudit({ action: 'qoder.accounts.add', success: true, targetType: 'qoder_account', targetId: result.id, targetName: record.label ?? undefined, ip: req.ip, metadata: { status: result.status, catalogError: catalogError ? 'yes' : 'no' } });
     return { account: summaryOrThrow(result.id), status: result.status, catalogError };
   });
@@ -235,7 +252,9 @@ export async function registerQoderRoutes(app: FastifyInstance): Promise<void> {
     const account = getQoderAccountDetailById(id);
     if (!account) throw new GatewayError('invalid_request_error', 'Qoder account not found', { status: 404 });
     const provider = providerOrThrow(account.providerId);
-    const result = await withQoderCredentials(id, (config) => probeQoder({ ...config, accountRecordId: id, totalTimeoutMs: Math.min(provider.total_timeout_ms, 20_000) }));
+    // Test must exercise inference, not just the catalog: Qoder refuses chat with a billing
+    // envelope on HTTP 200, so a catalog-only probe reports a blocked account as working.
+    const result = await withQoderCredentials(id, (config) => probeQoderInference({ ...config, accountRecordId: id, totalTimeoutMs: Math.min(provider.total_timeout_ms, 30_000) }));
     setQoderAccountHealth(id, result.ok ? 'healthy' : 'down', result.ok ? null : redactString(result.detail));
     recordAudit({ action: 'qoder.accounts.test', success: result.ok, targetType: 'qoder_account', targetId: id, ip: req.ip, metadata: { detail: redactString(result.detail) } });
     return { ok: result.ok, detail: redactString(result.detail), latencyMs: result.latencyMs, modelCount: result.modelCount ?? null };
@@ -246,8 +265,23 @@ export async function registerQoderRoutes(app: FastifyInstance): Promise<void> {
     const { id } = req.params as { id: string };
     if (!getQoderAccountDetailById(id)) throw new GatewayError('invalid_request_error', 'Qoder account not found', { status: 404 });
     const { config } = await qoderCredentialsFor(id, { force: true });
+    await refreshQoderCredits(id, config).catch(() => {});
     const keys = config.catalog ? [...config.catalog.entries.keys()] : [];
     recordAudit({ action: 'qoder.accounts.catalog', success: Boolean(config.catalog), targetType: 'qoder_account', targetId: id, ip: req.ip, metadata: { modelCount: keys.length } });
     return { modelCount: keys.length, modelKeys: keys, catalogFetchedAt: config.catalog?.fetchedAt ?? null };
+  });
+
+  /**
+   * Refresh the Credits snapshot on demand. Qoder meters usage in Credits and its chat stream
+   * reports no usage at all, so this quota call is the only way to show real consumption.
+   */
+  app.post('/api/admin/qoder/accounts/:id/credits', MutationOptions, async (req) => {
+    const { id } = req.params as { id: string };
+    if (!getQoderAccountDetailById(id)) throw new GatewayError('invalid_request_error', 'Qoder account not found', { status: 404 });
+    // Deliberately not forced: a fresh exchange invalidates the job token in flight, so reading
+    // Credits must reuse the live one rather than churn it.
+    const credits = await refreshQoderCredits(id);
+    recordAudit({ action: 'qoder.accounts.credits', success: !credits.unavailable, targetType: 'qoder_account', targetId: id, ip: req.ip, metadata: { freeModels: credits.freeModels.length } });
+    return { account: summaryOrThrow(id) };
   });
 }

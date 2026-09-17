@@ -130,6 +130,13 @@ export async function qoderCredentialsFor(accountRecordId: string, options: { fo
 export async function qoderAttemptFailure(accountRecordId: string, error: unknown): Promise<never> {
   const status = (error as { status?: number }).status ?? 502;
   const billing = Boolean((error as { billing?: boolean }).billing);
+  // Billing is checked first because a quota refusal carries status 403 (code 112) and would
+  // otherwise be classified as a rejected credential: that mislabels the cause, force-re-exchanges
+  // a perfectly good PAT on every request, and hides the real answer (the account is out of quota).
+  if (billing) {
+    setQoderAccountHealth(accountRecordId, 'degraded', 'upstream reported a quota or billing block');
+    throw new GatewayError('upstream_error', 'Qoder account is out of quota', { status: 502, code: 'qoder_billing_block' });
+  }
   if (status === 401 || status === 403) {
     // The PAT may still be valid — the job token may merely have expired mid-request. Force one
     // exchange before condemning the account; a second rejection is the PAT's fault.
@@ -139,10 +146,6 @@ export async function qoderAttemptFailure(accountRecordId: string, error: unknow
       throw new GatewayError('upstream_auth_error', 'Qoder account credentials were rejected — replace the personal access token', { status: 502, code: 'qoder_auth_failed' });
     }
     throw new GatewayError('upstream_auth_error', 'Qoder job token was rejected after a refresh', { status: 502, code: 'qoder_auth_failed' });
-  }
-  if (billing) {
-    setQoderAccountHealth(accountRecordId, 'degraded', 'upstream reported a quota or billing block');
-    throw new GatewayError('upstream_error', 'Qoder account is out of quota', { status: 502, code: 'qoder_billing_block' });
   }
   throw upstreamHttpError(status, '', error);
 }

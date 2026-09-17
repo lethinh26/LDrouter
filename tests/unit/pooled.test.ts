@@ -19,7 +19,7 @@ vi.mock('../../src/server/db/repositories/qoder-accounts', () => ({
   listQoderAccountSummaries: vi.fn(() => [{ id: 'qacct-1', enabled: true, healthState: 'healthy' }]),
 }));
 vi.mock('../../src/server/providers/qoder/client', () => ({
-  probeQoder: vi.fn(async () => ({ ok: true, detail: 'Connected (catalog loaded)', latencyMs: 7, modelCount: 2 })),
+  probeQoderInference: vi.fn(async () => ({ ok: true, detail: 'Inference OK (qmodel_38max, free)', latencyMs: 7, modelCount: 2 })),
   qoderModels: vi.fn(() => [{ upstreamId: 'qmodel_38max', displayName: 'Qwen3.8-Max', capabilities: { chat: true } }]),
 }));
 vi.mock('../../src/server/providers/qoder/credentials', () => ({

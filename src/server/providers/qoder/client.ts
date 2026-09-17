@@ -11,7 +11,7 @@ import { GatewayError } from '../../errors';
 import { redactString } from '../../security/redact';
 import type { CanonicalRequest } from '../../routing/capabilities';
 import type { DiscoveredModel, ProbeResult } from '../index';
-import type { QoderCatalog } from './catalog';
+import type { QoderCatalog, QoderCatalogEntry } from './catalog';
 import { QODER_CHAT_URL, QODER_CHAT_SIG_PATH } from './constants';
 import { buildCosyHeaders } from './cosy';
 import { encodeQoderBody } from './encode';
@@ -271,6 +271,53 @@ export async function probeQoder(cfg: QoderProviderConfig): Promise<ProbeResult>
     return { ok: false, detail: 'Model catalog is empty — check the personal access token', latencyMs: Date.now() - started };
   }
   return { ok: true, detail: 'Connected (catalog loaded)', latencyMs: Date.now() - started, modelCount: catalogue.entries.size };
+}
+
+/**
+ * A catalog probe proves the PAT exchanges, nothing more. Qoder refuses inference with an
+ * envelope-level 403 (code 112, billing) on an HTTP 200 response, so an account can pass the
+ * catalog probe while every chat it serves is refused — which reads as "the API key is fine"
+ * right up until a real request fails. This probe sends one real message to settle it.
+ *
+ * It prefers a catalog entry marked `is_free` (a promotion spends no Credits) so testing an
+ * account never consumes paid quota.
+ */
+export async function probeQoderInference(cfg: QoderProviderConfig): Promise<ProbeResult> {
+  const started = Date.now();
+  const catalogue = cfg.catalog;
+  if (!catalogue || catalogue.entries.size === 0) {
+    return { ok: false, detail: 'Model catalog is empty — check the personal access token', latencyMs: Date.now() - started };
+  }
+  const entries = [...catalogue.entries.values()];
+  const model = entries.find((entry) => entry.isFree) ?? entries[0]!;
+  const probe: CanonicalRequest = {
+    model: model.key,
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'ping' }] }],
+    maxOutputTokens: 16,
+    stream: false,
+  };
+  try {
+    await callQoderNonStreaming({ ...cfg, totalTimeoutMs: Math.min(cfg.totalTimeoutMs, 30_000) }, probe);
+    return { ok: true, detail: `Inference OK (${model.key}${model.isFree ? ', free' : ''})`, latencyMs: Date.now() - started, modelCount: entries.length };
+  } catch (error) {
+    if (error instanceof QoderUpstreamError && error.billing) {
+      const free = freeModelHint(entries);
+      return {
+        ok: false,
+        detail: `Account is out of Credits — ${model.key} was refused as billing. ${free ?? 'No promotion-covered model is available on this account, so nothing it serves will work until Credits are added.'}`,
+        latencyMs: Date.now() - started,
+        modelCount: entries.length,
+      };
+    }
+    const detail = error instanceof QoderUpstreamError ? `HTTP ${error.status}: ${error.message}` : error instanceof Error ? error.message : 'inference probe failed';
+    return { ok: false, detail: redactString(detail), latencyMs: Date.now() - started, modelCount: entries.length };
+  }
+}
+
+/** Null when the account has no promotion-covered model — the caller words that case itself. */
+function freeModelHint(entries: QoderCatalogEntry[]): string | null {
+  const free = entries.filter((entry) => entry.isFree).map((entry) => entry.key);
+  return free.length > 0 ? `Free models (promotions) still work: ${free.join(', ')}` : null;
 }
 
 /** Catalog entries become discovered models; hidden (enable:false) keys stay routable. */

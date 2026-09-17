@@ -1,6 +1,6 @@
-// Qoder account pool panel: PAT accounts, health, job-token expiry, catalog refresh, and
-// drag-and-drop routing order. Simpler than the Codex panel because Qoder exposes no quota API —
-// the only upstream truth is the model catalog.
+// Qoder account pool panel: PAT accounts, health, job-token expiry, catalog refresh, Credits
+// usage, and drag-and-drop routing order. Qoder meters usage in Credits (its chat stream carries
+// no usage block), so Credits come from the quota API and free models from the catalog's `is_free`.
 import { useCallback, useEffect, useState } from 'react';
 import { api } from '../lib/api';
 import { toast } from 'sonner';
@@ -16,12 +16,22 @@ import { Input } from './ui/input';
 import { Label } from './ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from './ui/table';
+import { Progress } from './ui/progress';
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from './ui/tooltip';
 import { QoderImportDialog } from './qoder-import-dialog';
+
+interface QoderCreditsBucket { label: string; total: number; used: number; remaining: number; unit: string }
+interface QoderCredits {
+  userType: string; freeModels: string[]; buckets: QoderCreditsBucket[];
+  totalUsedPercent: number; exhausted: boolean; expiresAt: string | null;
+  upgradeUrl: string | null; fetchedAt: string; unavailable?: string;
+}
 
 export interface QoderAccount {
   id: string; label: string | null; email: string | null; qoderUserIdMasked: string | null;
   enabled: boolean; healthState: string; priority: number; jobTokenExpiresAt: string;
   catalogFetchedAt: string | null; lastError: string | null; consecutiveFailures: number;
+  credits: QoderCredits | null; creditsUpdatedAt: string | null; creditsError: string | null;
   createdAt: string; updatedAt: string;
 }
 
@@ -41,6 +51,38 @@ function countdown(at: string | null, now: number): string {
 function healthBadge(state: string) {
   const variant = state === 'healthy' ? 'default' : state === 'degraded' ? 'secondary' : state === 'down' ? 'destructive' : 'outline';
   return <Badge variant={variant}>{state}</Badge>;
+}
+
+/**
+ * Qoder bills in Credits, and a zero-Credits account still serves models the live catalog marks
+ * `is_free` (promotions). Both facts are shown together, because "out of credits" alone reads as
+ * "nothing works" when the opposite is why one model keeps answering.
+ */
+function creditsCell(account: QoderAccount, now: number) {
+  const { credits, creditsError } = account;
+  if (!credits) {
+    return creditsError
+      ? <span className="text-xs text-destructive">{creditsError}</span>
+      : <span className="text-xs text-muted-foreground">—</span>;
+  }
+  const bucket = credits.buckets[0];
+  const used = credits.totalUsedPercent;
+  const free = credits.freeModels;
+  const freeLabel = free.length > 2 ? `${free.slice(0, 2).join(', ')} +${free.length - 2}` : free.join(', ');
+  return (
+    <div className="min-w-[10rem] space-y-1">
+      <div className="flex items-center justify-between gap-2 text-xs">
+        <span className={credits.exhausted ? 'font-medium text-destructive' : 'text-muted-foreground'}>
+          {bucket ? `${bucket.used.toFixed(0)} / ${bucket.total.toFixed(0)} ${bucket.unit}` : credits.exhausted ? 'No plan credits' : `${used.toFixed(0)}% used`}
+        </span>
+        <span className="tabular-nums text-muted-foreground">{countdown(credits.expiresAt, now)}</span>
+      </div>
+      <Progress value={used} indicatorClassName={credits.exhausted ? 'bg-destructive' : used > 70 ? 'bg-amber-500' : 'bg-emerald-500'} />
+      {free.length > 0 && <p className="text-xs text-muted-foreground">Free now: {freeLabel}</p>}
+      {/* A stale snapshot is kept on a failed read, so the error has to be shown next to it. */}
+      {creditsError && <p className="text-xs text-destructive">last read failed: {creditsError}</p>}
+    </div>
+  );
 }
 
 export function QoderAccountsPanel({ providerId, providerName }: { providerId: string; providerName?: string }) {
@@ -134,6 +176,13 @@ export function QoderAccountsPanel({ providerId, providerName }: { providerId: s
           })()}>
             <RefreshCw className="mr-1 h-3 w-3" /> Refresh catalogs
           </Button>
+          <Button size="sm" variant="outline" disabled={busyId !== null || accounts.length === 0} onClick={() => void (async () => {
+            setBusyId('all');
+            try { await Promise.allSettled(accounts.map((account) => api.post(`/api/admin/qoder/accounts/${account.id}/credits`))); await load(); toast.success('Credits refreshed'); }
+            finally { setBusyId(null); }
+          })()}>
+            <RefreshCw className="mr-1 h-3 w-3" /> Refresh credits
+          </Button>
           <Button size="sm" variant="outline" onClick={() => setImportOpen(true)}><Upload className="mr-1 h-4 w-4" /> Import tokens</Button>
           <Button size="sm" onClick={() => setAddOpen(true)}><Plus className="mr-1 h-4 w-4" /> Add token</Button>
         </div>
@@ -154,6 +203,7 @@ export function QoderAccountsPanel({ providerId, providerName }: { providerId: s
                     <TableHead className="text-xs">User</TableHead>
                     <TableHead className="text-xs">Job token</TableHead>
                     <TableHead className="text-xs">Catalog</TableHead>
+                    <TableHead className="text-xs">Credits</TableHead>
                     <TableHead className="text-xs">Health</TableHead>
                     <TableHead className="text-xs">Enabled</TableHead>
                     <TableHead className="text-right text-xs">Actions</TableHead>
@@ -246,6 +296,7 @@ function SortableAccountRow({ account, now, busy, onToggle, onDelete, onChanged 
       <TableCell className="font-mono text-xs">{account.qoderUserIdMasked || '—'}</TableCell>
       <TableCell className="text-xs tabular-nums">{countdown(account.jobTokenExpiresAt, now)}</TableCell>
       <TableCell className="text-xs tabular-nums">{account.catalogFetchedAt ? `${countdown(account.catalogFetchedAt, now)} ago` : 'never'}</TableCell>
+      <TableCell>{creditsCell(account, now)}</TableCell>
       <TableCell>{healthBadge(account.healthState)}</TableCell>
       <TableCell>
         <Button size="sm" variant={account.enabled ? 'secondary' : 'outline'} disabled={busy} onClick={() => onToggle(!account.enabled)}>
@@ -262,6 +313,17 @@ function SortableAccountRow({ account, now, busy, onToggle, onDelete, onChanged 
             try { const r = await api.post<{ modelCount: number }>(`/api/admin/qoder/accounts/${account.id}/catalog`); toast.success(`${label}: ${r.modelCount} models`); onChanged(); }
             catch (e) { toast.error((e as Error).message || 'Catalog refresh failed'); }
           })()}>Catalog</Button>
+          <TooltipProvider>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button size="sm" variant="outline" aria-label={`Refresh credits for ${label}`} disabled={busy} onClick={() => void (async () => {
+                  try { await api.post(`/api/admin/qoder/accounts/${account.id}/credits`); toast.success(`Credits refreshed: ${label}`); onChanged(); }
+                  catch (e) { toast.error((e as Error).message || 'Credits refresh failed'); }
+                })()}><RefreshCw className="h-3 w-3" /></Button>
+              </TooltipTrigger>
+              <TooltipContent>Refresh credits</TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
           <Button size="sm" variant="ghost" aria-label={`Delete ${label}`} disabled={busy} onClick={() => { if (window.confirm(`Delete the Qoder account ${label}? The stored token is removed permanently.`)) onDelete(); }}><Trash2 className="h-3 w-3" /></Button>
         </div>
       </TableCell>

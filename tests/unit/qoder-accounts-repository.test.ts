@@ -13,6 +13,7 @@ import {
   maskQoderValue,
   persistQoderJobToken,
   readQoderCatalog,
+  saveQoderCredits,
   setQoderAccountHealth,
   toQoderAccountSummary,
   upsertQoderAccount,
@@ -75,11 +76,13 @@ describe('Qoder account repository', () => {
     const summary = toQoderAccountSummary({
       id: 'x', providerId: 'qp', label: null, email: null, qoderUserId: 'user-1234567890', machineId: 'm',
       enabled: 1, healthState: 'unknown', priority: 0, jobTokenExpiresAt: JOB_TOKEN_EXPIRES_AT,
-      catalogFetchedAt: null, lastError: null, consecutiveFailures: 0, createdAt: 'a', updatedAt: 'b',
+      catalogFetchedAt: null, creditsJson: null, creditsUpdatedAt: null, creditsError: null,
+      lastError: null, consecutiveFailures: 0, createdAt: 'a', updatedAt: 'b',
     });
     expect(summary.enabled).toBe(true);
     expect(summary.qoderUserIdMasked).toBe('user…7890');
     expect(summary).not.toHaveProperty('qoderUserId');
+    expect(summary.credits).toBeNull();
   });
 
   it('updates in place on re-add of the same qoder user and preserves identity', () => {
@@ -141,5 +144,23 @@ describe('Qoder account repository', () => {
     expect(getQoderAccountRefreshState('missing')).toBeNull();
     expect(readQoderCatalog('missing')).toBeNull();
     expect(() => getQoderCredentials('missing')).toThrow(/not found/i);
+  });
+
+  it('round-trips the Credits snapshot and its failure', () => {
+    const id = insertQoderAccount('qp', record());
+    expect(listQoderAccountSummaries('qp')[0]!.credits).toBeNull();
+    const credits = { userType: 'personal_standard', freeModels: ['qmodel_38max'], buckets: [], totalUsedPercent: 0, exhausted: true, expiresAt: null, upgradeUrl: null, fetchedAt: '2026-09-17T00:00:00.000Z' };
+    saveQoderCredits(id, JSON.stringify(credits), null, credits.fetchedAt);
+    const refreshed = listQoderAccountSummaries('qp')[0]!;
+    expect(refreshed.credits).toMatchObject({ exhausted: true, freeModels: ['qmodel_38max'] });
+    expect(refreshed.creditsUpdatedAt).toBe(credits.fetchedAt);
+    expect(refreshed.creditsError).toBeNull();
+    // A failed read keeps the last known snapshot (better than blanking the column) and records
+    // the error, so the UI can show both.
+    saveQoderCredits(id, null, 'HTTP 500', '2026-09-17T01:00:00.000Z');
+    const failed = listQoderAccountSummaries('qp')[0]!;
+    expect(failed.credits).toMatchObject({ exhausted: true });
+    expect(failed.creditsError).toBe('HTTP 500');
+    expect(failed.creditsUpdatedAt).toBe('2026-09-17T01:00:00.000Z');
   });
 });
