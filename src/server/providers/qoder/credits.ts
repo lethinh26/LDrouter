@@ -3,6 +3,8 @@
 // consumption. `is_free` on a catalog entry is the separate signal that a model is covered
 // by a promotion (e.g. Qwen3.8-Max) and therefore does not draw on Credits at all.
 import { QODER_CREDITS_URL } from './constants';
+import { qoderCredentialsFor } from './credentials';
+import { readQoderCreditsUpdatedAt, saveQoderCredits } from '../../db/repositories/qoder-accounts';
 
 const FETCH_TIMEOUT_MS = 10_000;
 
@@ -104,4 +106,33 @@ export async function fetchQoderCredits(
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * Fetch and persist one account's Credits snapshot. Free models come from the account's cached
+ * catalog because `is_free` is a catalog property, not a quota one — it is why an account at zero
+ * Credits can still serve a promotional model.
+ *
+ * Lives here rather than in the admin route so the gateway can reuse it: Credits are the only
+ * upstream truth about consumption (Qoder's chat stream reports no usage at all), so the snapshot
+ * has to be kept fresh as accounts are actually used, not only when an admin opens the page.
+ */
+export async function refreshStoredQoderCredits(accountRecordId: string): Promise<QoderCredits> {
+  const { config } = await qoderCredentialsFor(accountRecordId);
+  const freeModels = config.catalog ? [...config.catalog.entries.values()].filter((entry) => entry.isFree).map((entry) => entry.key) : [];
+  const credits = await fetchQoderCredits({ jobToken: config.jobToken }, freeModels, { timeoutMs: FETCH_TIMEOUT_MS });
+  saveQoderCredits(accountRecordId, credits.unavailable ? null : JSON.stringify(credits), credits.unavailable ?? null, credits.fetchedAt);
+  return credits;
+}
+
+/** Same throttle as Codex usage: the Credits endpoint is a second upstream call per account. */
+export const QODER_CREDITS_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
+
+export async function refreshQoderCreditsIfStale(accountRecordId: string, now = new Date()): Promise<void> {
+  const row = readQoderCreditsUpdatedAt(accountRecordId);
+  const last = row ? Date.parse(row) : NaN;
+  if (Number.isFinite(last) && now.getTime() - last < QODER_CREDITS_REFRESH_INTERVAL_MS) return;
+  // Never throws, matching `refreshStoredCodexUsage`: this runs in the background after a response
+  // has already been delivered, so a dead credential or unreachable quota API must not surface.
+  await refreshStoredQoderCredits(accountRecordId).catch(() => {});
 }

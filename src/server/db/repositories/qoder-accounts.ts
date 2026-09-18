@@ -260,13 +260,16 @@ export function persistQoderJobToken(
     );
 }
 
-export function setQoderAccountHealth(id: string, healthState: string, lastError: string | null = null): void {
+/** `enabled` mirrors the Codex setter: pass `false` to take an exhausted account out of the pool. */
+export function setQoderAccountHealth(id: string, healthState: string, lastError: string | null = null, enabled?: boolean): void {
   const failures = healthState === 'healthy' ? 0 : null;
-  getRawDb()
-    .prepare(
-      `UPDATE qoder_accounts SET health_state=?, last_error=?, consecutive_failures=COALESCE(?, consecutive_failures), updated_at=? WHERE id=?`,
-    )
-    .run(healthState, lastError, failures, nextUpdatedAt(id), id);
+  const fields = enabled === undefined
+    ? 'health_state=?, last_error=?, consecutive_failures=COALESCE(?, consecutive_failures), updated_at=?'
+    : 'health_state=?, last_error=?, consecutive_failures=COALESCE(?, consecutive_failures), enabled=?, updated_at=?';
+  const values = enabled === undefined
+    ? [healthState, lastError, failures, nextUpdatedAt(id), id]
+    : [healthState, lastError, failures, enabled ? 1 : 0, nextUpdatedAt(id), id];
+  getRawDb().prepare(`UPDATE qoder_accounts SET ${fields} WHERE id=?`).run(...values);
 }
 
 export function readQoderCatalog(id: string): { catalogJson: string | null; catalogFetchedAt: string | null } | null {
@@ -280,6 +283,12 @@ export function saveQoderCatalog(id: string, catalogJson: string, fetchedAt?: st
   getRawDb()
     .prepare('UPDATE qoder_accounts SET catalog_json=?, catalog_fetched_at=?, updated_at=? WHERE id=?')
     .run(catalogJson, fetchedAt ?? new Date().toISOString(), nextUpdatedAt(id), id);
+}
+
+/** When the Credits snapshot was last written; null when it never has been. */
+export function readQoderCreditsUpdatedAt(id: string): string | null {
+  const row = getRawDb().prepare('SELECT credits_updated_at AS at FROM qoder_accounts WHERE id=?').get(id) as { at: string | null } | undefined;
+  return row?.at ?? null;
 }
 
 /** Credits are observability, not routing state: a failed fetch is recorded without touching health. */

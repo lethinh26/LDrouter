@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.17.4] - 2026-09-18
+
+### Fixed
+
+- **An account that ran out of quota kept being retried instead of leaving the pool.** A quota refusal was classified `unknown`, which is not a routing decision: `isUpstreamHealthFailure` excludes it and `shouldFallback` answers false for it, so the pool selected the same spent account on every request and answered "usage limited". Live production data confirmed the shape — 49 quota refusals (`Codex upstream HTTP 429: The usage limit has been reached`, `Qoder account is out of quota`) recorded over 14 days, every one of them `failure_reason=unknown`, with the same `codex_account_id` / `qoder_account_id` retried each time. Quota is now its own failure class, checked before the error-type switch (a 429 reaches the classifier as `upstream_rate_limit`, which previously returned `http_status` before the quota test could run).
+- **The exhausted account is now disabled, not just marked degraded.** Disabling (`enabled=0`) is the write that actually stops the churn: every selection path — `expandCodexAccountCandidates`, `expandQoderAccountCandidates`, `getCodexAccountForProvider`, `findEligibleQoderAccount` — filters on it, whereas `health_state` alone was overwritten to `healthy` by the next successful request. A Qoder billing block now disables the account too, instead of only degrading it.
+- **A direct model never advanced to the next account.** The retry was gated on `comboPlan ? ... : false`, so the reported case — a direct `qoder/...` model, logged 33 times in production — never retried at all. A quota failure now always advances to the next candidate, combo or not; that is safe precisely because the exhausted account was just disabled, so the retry cannot land on it again.
+- **The upstream 429 body was discarded, hiding the reason.** Quota exhaustion arrives as a plain 429 on OpenAI-compatible providers, with the wording ("you exceeded your current quota") only in the body — which `upstreamHttpError` dropped, leaving an account unclassifiable. The redacted body excerpt is now carried on a 429 too. A 429 without quota wording is still treated as a transient throttle: it retries the same account and does not disable it.
+- **Re-enabling an account in the admin UI did not put it back in the pool.** The enable toggle flipped `enabled` but left `health_state=down`, which every selection filter excludes, so the account stayed unroutable while the panel showed it as enabled. Both the Codex and Qoder routes now clear the health verdict when re-enabling.
+
+### Added
+
+- **Usage and Credits are refreshed as the pool is used.** Both the Codex usage snapshot and the Qoder credits snapshot are re-read in the background after a successful request, throttled per account so a burst of traffic costs at most one extra upstream call, and never awaited — the response path is unaffected.
+
 ## [1.17.3] - 2026-09-17
 
 ### Added

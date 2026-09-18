@@ -134,7 +134,11 @@ export async function qoderAttemptFailure(accountRecordId: string, error: unknow
   // otherwise be classified as a rejected credential: that mislabels the cause, force-re-exchanges
   // a perfectly good PAT on every request, and hides the real answer (the account is out of quota).
   if (billing) {
-    setQoderAccountHealth(accountRecordId, 'degraded', 'upstream reported a quota or billing block');
+    // Disabled, not merely degraded: a depleted account cannot serve paid models until its Credits
+    // refill, and leaving it eligible made the pool retry it on every request while the client saw
+    // "usage limited". The operator re-enables it (or adds Credits) from the admin UI; Credits
+    // refresh keeps the snapshot honest in the meantime.
+    setQoderAccountHealth(accountRecordId, 'down', 'out of Credits — re-enable after topping up', false);
     throw new GatewayError('upstream_error', 'Qoder account is out of quota', { status: 502, code: 'qoder_billing_block' });
   }
   if (status === 401 || status === 403) {

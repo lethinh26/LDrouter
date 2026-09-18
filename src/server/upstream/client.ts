@@ -112,7 +112,10 @@ export interface StreamChunk {
  */
 export function upstreamHttpError(status: number, bodyExcerpt: string, cause?: unknown): GatewayError {
   if (status >= 500) return new GatewayError('upstream_error', `Upstream HTTP ${status}`, { status: 502, cause, code: `upstream_http_${status}` });
-  if (status === 429) return new GatewayError('upstream_rate_limit', `Upstream rate limited (HTTP ${status})`, { status: 429, cause, code: 'upstream_http_429' });
+  // Keep the body on a 429: it is the only place a provider says *why*, and the wording decides
+  // whether this is a transient throttle (retry) or an exhausted account (disable it and move on).
+  // `isQuotaFailure` matches on that wording. Callers pass an already-redacted excerpt.
+  if (status === 429) return new GatewayError('upstream_rate_limit', `Upstream rate limited (HTTP ${status})${bodyExcerpt ? `: ${bodyExcerpt}` : ''}`, { status: 429, cause, code: 'upstream_http_429' });
   if (status === 401 || status === 403) return new GatewayError('upstream_auth_error', `Upstream authentication failed (HTTP ${status})`, { status: 502, cause, code: `upstream_http_${status}` });
   return new GatewayError('upstream_error', `Upstream HTTP ${status}: ${bodyExcerpt}`, { status: 502, cause, code: `upstream_http_${status}` });
 }

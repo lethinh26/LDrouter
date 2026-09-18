@@ -257,6 +257,9 @@ export async function registerCodexRoutes(app: FastifyInstance): Promise<void> {
       const column = ({ enabled: 'enabled', email: 'email', workspaceId: 'workspace_id', planType: 'plan_type', priority: 'priority', autostart: 'codex_autostart_enabled' } as Record<string, string>)[key];
       if (column) { fields.push(`${column}=?`); values.push(typeof value === 'boolean' ? (value ? 1 : 0) : value); }
     }
+    // Re-enabling must also clear a quota verdict: every selection path excludes `health_state='down'`,
+    // so flipping `enabled` alone would leave the account unreachable while the UI showed it as on.
+    if (body.enabled === true) { fields.push('health_state=?'); values.push('unknown'); }
     fields.push('updated_at=?'); values.push(new Date().toISOString(), id);
     raw.prepare(`UPDATE codex_accounts SET ${fields.join(',')} WHERE id=?`).run(...values);
     recordAudit({ action: 'codex.accounts.update', success: true, targetType: 'codex_account', targetId: id, ip: req.ip, metadata: { fields: Object.keys(body) } });

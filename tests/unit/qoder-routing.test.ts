@@ -56,9 +56,12 @@ describe('Qoder attempt failure classification', () => {
       const { qoderAttemptFailure } = await import('../../src/server/providers/qoder/credentials');
       await expect(qoderAttemptFailure(id, { status: 403, message: 'quota exceeded', billing: true })).rejects.toMatchObject({ code: 'qoder_billing_block' });
       const after = repo.listQoderAccountSummaries('qp')[0]!;
-      // degraded, not down: a depleted account is still eligible, it is out of quota for paid models.
-      expect(after.healthState).toBe('degraded');
-      expect(after.lastError).toContain('quota');
+      // down AND disabled: a depleted account cannot serve paid models until Credits refill, so it
+      // leaves the pool instead of being retried on every request (which showed the client
+      // "usage limited" while the same account was selected again and again).
+      expect(after.healthState).toBe('down');
+      expect(after.enabled).toBe(false);
+      expect(after.lastError).toContain('Credits');
       expect(getRawDb().prepare('SELECT 1').get()).toBeTruthy();
     } finally {
       closeDb();

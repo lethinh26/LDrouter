@@ -24,6 +24,26 @@ function accountFor(accountId: string): AccountRow | null {
   return (getRawDb().prepare('SELECT id,chatgpt_account_id FROM codex_accounts WHERE id=?').get(accountId) as AccountRow | undefined) ?? null;
 }
 
+/**
+ * Keep the quota snapshot honest while the account is in use.
+ *
+ * The usage API is a second upstream call, so this is throttled rather than run per request: a
+ * snapshot younger than the interval is left alone. Before this, usage only refreshed when an admin
+ * pressed the button or on the 10-minute autostart tick for opted-in accounts, so a dashboard could
+ * show hours-old consumption for an account actively serving traffic.
+ */
+export const CODEX_USAGE_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
+
+export async function refreshCodexUsageIfStale(accountId: string, now = new Date()): Promise<void> {
+  const row = getRawDb().prepare('SELECT provider_id AS providerId,chatgpt_account_id AS chatgptAccountId,codex_usage_updated_at AS at FROM codex_accounts WHERE id=?').get(accountId) as { providerId: string; chatgptAccountId: string | null; at: string | null } | undefined;
+  if (!row) return;
+  const provider = providerFor(row.providerId);
+  if (!provider) return;
+  const last = row.at ? Date.parse(row.at) : NaN;
+  if (Number.isFinite(last) && now.getTime() - last < CODEX_USAGE_REFRESH_INTERVAL_MS) return;
+  await refreshStoredCodexUsage(accountId, provider, { id: accountId, chatgpt_account_id: row.chatgptAccountId });
+}
+
 /** Reads fresh usage; stores the snapshot or a sanitized reason on failure. */
 export async function refreshStoredCodexUsage(accountId: string, provider: ProviderRow, account: AccountRow): Promise<CodexUsage | null> {
   try {

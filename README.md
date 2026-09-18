@@ -65,6 +65,8 @@ ZIP upload and automatic Codex CLI config-file generation/mutation are not inclu
 
 The account panel shows the 5-hour and weekly quota windows with reset countdowns, per-account and bulk usage refresh, weekly reset credits, an opt-in 5-hour window auto-start, and a **Test** control that probes the upstream account without exposing tokens. Routing order is set by dragging rows; the saved order is the fallback order the router uses. **Delete** is permanent and erases the stored encrypted credentials — past request logs are kept but lose the account reference.
 
+**A quota-exhausted account leaves the pool on its own.** When an account refuses for quota reasons — Codex `429 The usage limit has been reached`, or Qoder `out of credits` — it is marked `down` *and disabled*, so the very next request picks a different account in the pool rather than retrying the spent one. This applies to direct `codex/...` and `qoder/...` models too, not only combos. Re-enable the account in the panel once its window resets. Both Codex usage and Qoder credits are also refreshed in the background after a successful request (throttled, and never on the response path), so the panel figures track real usage without pressing **Refresh**.
+
 ### Qoder setup
 
 Qoder providers use a personal access token (PAT) instead of an API key. Create one at `https://qoder.com/account/integrations`; it starts with `pt-`.

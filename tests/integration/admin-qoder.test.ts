@@ -274,4 +274,34 @@ describe('authenticated Qoder admin HTTP API', () => {
       expect(actions).toContain(expected);
     }
   });
+
+  /**
+   * Re-enabling must clear a quota verdict. Every selection path excludes `health_state='down'`, so
+   * flipping `enabled` alone left the account unreachable while the UI showed it as "Enabled".
+   */
+  it('clears a quota verdict when an account is re-enabled', async () => {
+    stubUpstream({ chatStatus: 403 });
+    const added = await (await fetch(`${baseUrl}/api/admin/qoder/accounts`, {
+      method: 'POST', headers: authedJson(), body: JSON.stringify({ providerId, personalToken: 'pt-reenable', label: 'Reenable' }),
+    })).json() as { account: { id: string } };
+
+    // Put the account in exactly the state a quota refusal leaves behind (the runner's
+    // markQuotaExhausted / qoderAttemptFailure write these two columns together).
+    const { getRawDb } = await import('../../src/server/db');
+    const repo = await import('../../src/server/db/repositories/qoder-accounts');
+    repo.setQoderAccountHealth(added.account.id, 'down', 'out of Credits — re-enable after topping up', false);
+    const depleted = getRawDb().prepare('SELECT enabled, health_state AS h FROM qoder_accounts WHERE id=?').get(added.account.id) as { enabled: number; h: string };
+    expect(depleted.enabled).toBe(0);
+    expect(depleted.h).toBe('down');
+
+    const res = await fetch(`${baseUrl}/api/admin/qoder/accounts/${added.account.id}`, {
+      method: 'PATCH', headers: authedJson(), body: JSON.stringify({ enabled: true }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json() as { account: { enabled: boolean; healthState: string } };
+    expect(body.account.enabled).toBe(true);
+    expect(body.account.healthState).not.toBe('down');
+
+    expect(repo.findEligibleQoderAccount(providerId)).not.toBeNull();
+  });
 });

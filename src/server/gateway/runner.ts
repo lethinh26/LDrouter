@@ -9,7 +9,9 @@ import { loadCombo, selectCandidates, orderCandidates, shouldFallback, expandCod
 import { listCodexAccountsForProvider, setCodexAccountHealth } from '../db/repositories/codex-accounts';
 import { listQoderAccountsForProvider, setQoderAccountHealth } from '../db/repositories/qoder-accounts';
 import { qoderAttemptFailure, qoderCredentialsFor } from '../providers/qoder/credentials';
+import { refreshQoderCreditsIfStale } from '../providers/qoder/credits';
 import { callQoderNonStreaming, callQoderStreaming } from '../providers/qoder/client';
+import { refreshCodexUsageIfStale } from '../providers/codex-autostart';
 import { getEffectiveState, isOpen, recordSuccess, recordFailure, halfOpenProbeAllowed } from '../routing/circuit';
 import { checkRpm, checkTpm, acquireConcurrent, releaseConcurrent } from '../routing/ratelimit';
 import { checkDailyMonthly, consumeUsage } from '../routing/quota';
@@ -352,21 +354,30 @@ export class GatewayRunner {
           recordSuccess(provider.id);
           if (candidate.codexAccountId) setCodexAccountHealth(candidate.codexAccountId, 'healthy');
           if (candidate.qoderAccountId) setQoderAccountHealth(candidate.qoderAccountId, 'healthy');
+          // Refresh the quota snapshot in the background so the dashboard reflects real usage.
+          // Never awaited: it is a second upstream call, and the response is already complete.
+          // Throttled inside each helper, so a burst of requests costs at most one refresh.
+          if (candidate.codexAccountId) void refreshCodexUsageIfStale(candidate.codexAccountId).catch(() => {});
+          if (candidate.qoderAccountId) void refreshQoderCreditsIfStale(candidate.qoderAccountId).catch(() => {});
           getDb().update(schema.providers).set({ healthState: 'healthy', updatedAt: new Date().toISOString() }).where(eq(schema.providers.id, provider.id)).run();
           attempts.push(attempt);
           sentToClient = (out as { streamStarted?: boolean }).streamStarted ?? false;
           break;
         } catch (e) {
           const err = e instanceof GatewayError ? e : new GatewayError('upstream_error', (e as Error).message, { cause: e });
+          const quotaFailure = isQuotaFailure(err);
           debugUpstream(ctx.requestId, 'ATTEMPT ERROR', [
             `attempt=${i + 1}`,
             `provider=${provider.name}`,
             `model=${candidate.publicModelId}`,
             `type=${err.type}`,
             `status=${err.status}`,
-            `willFallback=${comboPlan ? shouldFallback(comboPlan, { type: classifyFailure(err), status: err.status }) : false}`,
+            `willFallback=${shouldRetryAttempt(comboPlan, err)}`,
           ]);
-          const shouldRetry = comboPlan ? shouldFallback(comboPlan, { type: classifyFailure(err), status: err.status }) : false;
+          // Quota failures always advance (see shouldRetryAttempt): the next candidate for a pool
+          // provider is the next account, and the exhausted one was just disabled so the retry cannot
+          // land on it again.
+          const shouldRetry = shouldRetryAttempt(comboPlan, err);
           attempt.statusCode = err.status;
           attempt.success = false;
           attempt.latencyMs = Date.now() - attemptStart;
@@ -384,6 +395,9 @@ export class GatewayRunner {
           }
           attempts.push(attempt);
           lastError = err;
+          // An exhausted account leaves the pool outright: without this the combo retried the same
+          // dead account on every request for hours (verified live) and answered "usage limited".
+          if (quotaFailure) markQuotaExhausted(candidate, err.message);
           if (isUpstreamHealthFailure(err)) {
             recordFailure(provider.id, provider.cbFailureThreshold, provider.cbCooldownSeconds);
             if (candidate.codexAccountId) setCodexAccountHealth(candidate.codexAccountId, 'down', redactString(err.message));
@@ -1069,7 +1083,68 @@ export function isUpstreamHealthFailure(err: GatewayError): boolean {
   return ['connection_error', 'connect_timeout', 'first_token_timeout', 'http_status', 'upstream_rate_limit'].includes(classifyFailure(err));
 }
 
+/**
+ * An exhausted quota is a durable, per-account verdict — the account cannot serve anything again
+ * until its window resets, so it must leave the pool instead of being retried.
+ *
+ * Deliberately NOT part of `isUpstreamHealthFailure`: that path opens the provider's circuit
+ * breaker, which here would take down every sibling account of a healthy pool because one member
+ * ran dry. The exhaustion is applied account-by-account by `markQuotaExhausted` instead.
+ *
+ * Detection needs both signals because the two upstreams refuse differently, and neither reports a
+ * status the router can trust alone:
+ *  - Codex answers 429 but the credential layer re-wraps it (status 502, cause 429), and a plain
+ *    rate limit is also a 429 — the "usage limit"/"quota" wording is what distinguishes "come back
+ *    in an hour" from "this account is spent".
+ *  - Qoder refuses with a billing envelope carrying status 403/code 112, surfaced as the
+ *    `qoder_billing_block` code.
+ * Wording is only consulted when the status is quota-shaped, so a 400 that merely mentions the word
+ * "quota" cannot disable a working account.
+ */
+export function isQuotaFailure(err: GatewayError): boolean {
+  if (err.code === 'qoder_billing_block') return true;
+  const cause = err.cause as { status?: unknown } | undefined;
+  const upstreamStatus = typeof cause?.status === 'number' ? cause.status : err.status;
+  if (upstreamStatus !== 429 && upstreamStatus !== 403) return false;
+  return /usage[_ -]?limit|quota|out of credits|insufficient[_ -]?(credit|balance)|exceeded your current quota|billing/i.test(err.message);
+}
+
+/**
+ * Take an exhausted account out of the pool: mark it down and disable it.
+ *
+ * `enabled=0` (not just `health_state='down'`) is what the operator asked for and what actually
+ * stops the churn: every selection path — `expandCodexAccountCandidates`,
+ * `expandQoderAccountCandidates`, `getCodexAccountForProvider`, `findEligibleQoderAccount` — filters
+ * on `enabled`, so disabling is the one write that makes the next request pick a different account.
+ * The account stays visible in the admin UI, where re-enabling it after the window resets is a
+ * one-click action.
+ */
+export function markQuotaExhausted(candidate: CandidateModel, message: string): void {
+  const reason = redactString(message);
+  if (candidate.codexAccountId) setCodexAccountHealth(candidate.codexAccountId, 'down', reason, false);
+  if (candidate.qoderAccountId) setQoderAccountHealth(candidate.qoderAccountId, 'down', reason, false);
+}
+
+/**
+ * Whether a failed attempt should advance to the next candidate.
+ *
+ * A quota failure always advances, with or without a combo plan. For a pool provider the next
+ * candidate is the next *account*, so requiring a combo plan left a direct `codex/…` or `qoder/…`
+ * request pinned to the exhausted account — the reported bug ("does not switch to a new account,
+ * just answers usage limited"). Safe because the exhausted account was just disabled: the retry
+ * cannot land on it again. Everything else keeps the combo's configured triggers, where no combo
+ * plan means no fallback.
+ */
+export function shouldRetryAttempt(comboPlan: ComboPlan | null, err: GatewayError): boolean {
+  if (isQuotaFailure(err)) return true;
+  return comboPlan ? shouldFallback(comboPlan, { type: classifyFailure(err), status: err.status }) : false;
+}
+
 export function classifyFailure(err: GatewayError): string {
+  // Checked first, before the type switch: a quota refusal arrives as `upstream_rate_limit` (a
+  // 429) or `upstream_error` (Codex rewraps it as a 502 with a 429 cause; Qoder uses code 112) and
+  // must not fall through to `http_status`/`unknown`, neither of which is a routing decision.
+  if (isQuotaFailure(err)) return 'quota';
   switch (err.type) {
     case 'timeout_error':
       return err.message.includes('first token') ? 'first_token_timeout' : 'connect_timeout';

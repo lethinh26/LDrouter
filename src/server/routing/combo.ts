@@ -173,6 +173,13 @@ export function shouldFallback(combo: ComboPlan, reason: { type: string; status?
       return combo.trigger.connectTimeout;
     case 'first_token_timeout':
       return combo.trigger.firstTokenTimeout;
+    case 'quota':
+      // An exhausted account is the clearest case for trying the next candidate: retrying the same
+      // one cannot succeed until its window resets. Unconditional because a dead account is not a
+      // provider problem the admin's 429/5xx toggles were meant to gate — the account is already
+      // disabled by the runner, and stopping here would answer "usage limited" instead of routing
+      // to a healthy account.
+      return true;
     case 'http_status':
       if (reason.status === 408) return combo.trigger.on408;
       if (reason.status === 429) return combo.trigger.on429;
