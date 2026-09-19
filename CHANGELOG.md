@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.17.5] - 2026-09-19
+
+### Fixed
+
+- **An account whose session was revoked kept being selected instead of leaving the Codex pool.** Auth0 answers `refresh_token_invalidated` ("Your session has ended. Please log in again.") for an account whose login was revoked; the account cannot serve anything again until it is re-imported. The credential layer surfaced that as a bare `oauth_refresh_failed`, which the router classified `unknown` — and `unknown` is not a routing decision, so `shouldFallback` answered false, the retry never advanced to a sibling account, and the request answered `502`. Live production data confirmed the shape: two accounts holding invalidated refresh tokens sat at the head of the pool, so every request landed on one of them, and 226 of 241 failed requests carried `attempts_count=1` while healthy accounts sat idle behind them. Credential failure is now its own failure class, checked before the error-type switch, and it always advances to the next candidate — with or without a combo plan, since a direct `codex1/...` model has no fallback triggers to consult.
+- **The account with the dead credential is now disabled, not merely degraded.** Marking down *and* disabling (`enabled=0`) is what actually stops the churn, mirroring quota exhaustion: every selection path — `expandCodexAccountCandidates`, `getCodexAccountForProvider` — filters on `enabled`. Deliberately kept out of `isUpstreamHealthFailure`, because one re-imported account must not open the provider circuit breaker for its healthy siblings.
+- **`codexCredentialError` discarded the raw error code.** Its wrapping message is deliberately generic, so without the cause the routing layer could not distinguish a dead account from any other `authentication_error`. The raw error is now carried as `cause`.
+
 ## [1.17.4] - 2026-09-18
 
 ### Fixed
