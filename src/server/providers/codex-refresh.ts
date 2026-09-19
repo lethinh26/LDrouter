@@ -11,7 +11,9 @@ export function codexCredentialError(error: unknown): unknown {
   const code = error instanceof Error ? error.message : '';
   if (code === 'account_not_found') return new GatewayError('invalid_request_error', 'Codex account not found', { status: 404 });
   if (code === 'oauth_refresh_failed' || code === 'invalid_refresh_response' || code === 'credential_unavailable') {
-    return new GatewayError('authentication_error', 'Codex credentials could not be refreshed — re-import the account', { status: 401 });
+    // `cause` carries the raw credential code: the wrapping message is deliberately generic, so
+    // without it the routing layer cannot tell a dead account from any other authentication_error.
+    return new GatewayError('authentication_error', 'Codex credentials could not be refreshed — re-import the account', { status: 401, cause: error });
   }
   return error;
 }

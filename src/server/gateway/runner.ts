@@ -366,6 +366,7 @@ export class GatewayRunner {
         } catch (e) {
           const err = e instanceof GatewayError ? e : new GatewayError('upstream_error', (e as Error).message, { cause: e });
           const quotaFailure = isQuotaFailure(err);
+          const credentialFailure = isCredentialFailure(err);
           debugUpstream(ctx.requestId, 'ATTEMPT ERROR', [
             `attempt=${i + 1}`,
             `provider=${provider.name}`,
@@ -398,6 +399,10 @@ export class GatewayRunner {
           // An exhausted account leaves the pool outright: without this the combo retried the same
           // dead account on every request for hours (verified live) and answered "usage limited".
           if (quotaFailure) markQuotaExhausted(candidate, err.message);
+          // A dead refresh token also leaves the pool outright: the account cannot serve anything
+          // again until it is re-imported, so a retry may only be spent on a sibling account. Without
+          // this the retry landed on the same dead account and the request answered 502.
+          if (credentialFailure) markCredentialsDead(candidate, err.message);
           if (isUpstreamHealthFailure(err)) {
             recordFailure(provider.id, provider.cbFailureThreshold, provider.cbCooldownSeconds);
             if (candidate.codexAccountId) setCodexAccountHealth(candidate.codexAccountId, 'down', redactString(err.message));
@@ -1126,6 +1131,39 @@ export function markQuotaExhausted(candidate: CandidateModel, message: string): 
 }
 
 /**
+ * A credential failure is a durable, per-account verdict — the same class as quota exhaustion.
+ *
+ * `withCodexCredentials` throws these as bare codes when the account's refresh token is dead
+ * (Auth0 answers `refresh_token_invalidated`, "Your session has ended. Please log in again.").
+ * The account cannot serve anything again until it is re-imported, so retrying it is pure waste
+ * and leaving it in the pool answers 502 to every client.
+ *
+ * Live evidence (production, 2026-09-19): two accounts holding invalidated refresh tokens sat at
+ * the head of the pool, so every request landed on one of them — `oauth_refresh_failed`,
+ * classified `unknown`, `attempts_count=1`, 502 straight to the client (226 of 241 failed
+ * requests had exactly one attempt while healthy accounts sat idle behind them).
+ *
+ * Deliberately NOT part of `isUpstreamHealthFailure`: one re-imported account must not open the
+ * provider circuit breaker for its healthy siblings. The verdict is applied per account by
+ * `markCredentialsDead` instead.
+ *
+ * Both spellings are checked because the code travels either raw (from `withCodexCredentials`
+ * inside the gateway) or wrapped by `codexCredentialError`, which now keeps it as `cause`.
+ */
+export function isCredentialFailure(err: GatewayError): boolean {
+  const codes = /^(oauth_refresh_failed|invalid_refresh_response|credential_unavailable|account_not_found)$/;
+  const cause = err.cause as { message?: unknown } | undefined;
+  return codes.test(err.message) || (typeof cause?.message === 'string' && codes.test(cause.message));
+}
+
+/** Takes an account with a dead refresh token out of the pool. `enabled=0` is what stops the churn. */
+export function markCredentialsDead(candidate: CandidateModel, message: string): void {
+  const reason = redactString(message);
+  if (candidate.codexAccountId) setCodexAccountHealth(candidate.codexAccountId, 'down', reason, false);
+  if (candidate.qoderAccountId) setQoderAccountHealth(candidate.qoderAccountId, 'down', reason, false);
+}
+
+/**
  * Whether a failed attempt should advance to the next candidate.
  *
  * A quota failure always advances, with or without a combo plan. For a pool provider the next
@@ -1136,11 +1174,15 @@ export function markQuotaExhausted(candidate: CandidateModel, message: string): 
  * plan means no fallback.
  */
 export function shouldRetryAttempt(comboPlan: ComboPlan | null, err: GatewayError): boolean {
+  if (isCredentialFailure(err)) return true;
   if (isQuotaFailure(err)) return true;
   return comboPlan ? shouldFallback(comboPlan, { type: classifyFailure(err), status: err.status }) : false;
 }
 
 export function classifyFailure(err: GatewayError): string {
+  // Checked before the type switch for the same reason as quota: a dead account is not a routing
+  // decision the combo's triggers were meant to gate, and `unknown` is not a routing decision at all.
+  if (isCredentialFailure(err)) return 'credential';
   // Checked first, before the type switch: a quota refusal arrives as `upstream_rate_limit` (a
   // 429) or `upstream_error` (Codex rewraps it as a 502 with a 429 cause; Qoder uses code 112) and
   // must not fall through to `http_status`/`unknown`, neither of which is a routing decision.
