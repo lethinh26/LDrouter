@@ -94,7 +94,15 @@ export function Combos() {
     finally { setEditing(false); }
   };
 
+  // Separate handlers per dialog: a single `addMember` that only wrote `editForm`
+  // was wired into BOTH pickers, so "+ Add" in the New-combo dialog silently
+  // mutated the edit form and the create list stayed empty (the button looked
+  // dead). Each dialog owns its own member list.
   const addMember = (modelId: string) => {
+    setForm((f) => ({ ...f, members: reindex([...f.members, { modelId, weight: 1, position: f.members.length, enabled: true }]) }));
+  };
+
+  const addEditMember = (modelId: string) => {
     setEditForm((f) => ({ ...f, members: reindex([...f.members, { modelId, weight: 1, position: f.members.length, enabled: true }]) }));
   };
 
@@ -190,7 +198,7 @@ export function Combos() {
             <div className="flex items-center gap-2"><Switch checked={editForm.enabled} onCheckedChange={(v) => setEditForm({ ...editForm, enabled: v })} /><Label>Enabled</Label></div>
             <div>
               <Label>Members — priority order · drag to reorder</Label>
-              <MemberPicker models={models} addedIds={editForm.members.map((m) => m.modelId)} onAdd={addMember} />
+              <MemberPicker models={models} addedIds={editForm.members.map((m) => m.modelId)} onAdd={addEditMember} />
               <MemberList
                 className="mt-2"
                 members={editForm.members}
