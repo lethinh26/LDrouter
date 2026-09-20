@@ -179,7 +179,18 @@ function usage(value: unknown): CodexCanonicalResult['usage'] {
   const u = (value && typeof value === 'object' ? value : {}) as Record<string, unknown>;
   const input = typeof u.input_tokens === 'number' ? u.input_tokens : 0;
   const output = typeof u.output_tokens === 'number' ? u.output_tokens : 0;
-  return { input, output, total: input + output, cacheRead: typeof u.cached_input_tokens === 'number' ? u.cached_input_tokens : 0, cacheWrite: 0, reasoning: typeof u.reasoning_tokens === 'number' ? u.reasoning_tokens : 0 };
+  // The Responses API nests both of these (`usage.input_tokens_details.cached_tokens`,
+  // `usage.output_tokens_details.reasoning_tokens`). Reading only the flat names returned
+  // 0 for every Codex request — 1,381 of them, 46% of all traffic — so the statistics page
+  // reported a cache-hit rate missing its largest contributor. Flat names stay supported
+  // for compatibility with OpenAI-compatible upstreams that use them.
+  const inDetails = (u.input_tokens_details && typeof u.input_tokens_details === 'object' ? u.input_tokens_details : {}) as Record<string, unknown>;
+  const outDetails = (u.output_tokens_details && typeof u.output_tokens_details === 'object' ? u.output_tokens_details : {}) as Record<string, unknown>;
+  const cacheRead = typeof inDetails.cached_tokens === 'number' ? inDetails.cached_tokens
+    : typeof u.cached_input_tokens === 'number' ? u.cached_input_tokens : 0;
+  const reasoning = typeof outDetails.reasoning_tokens === 'number' ? outDetails.reasoning_tokens
+    : typeof u.reasoning_tokens === 'number' ? u.reasoning_tokens : 0;
+  return { input, output, total: input + output, cacheRead, cacheWrite: 0, reasoning };
 }
 
 export function codexResponseToCanonical(body: Record<string, unknown>, requestedModel: string): CodexCanonicalResult {

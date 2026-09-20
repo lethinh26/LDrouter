@@ -24,6 +24,38 @@ const PRESETS: Record<string, () => { from: Date; to: Date; bucket: 'hour' | 'da
   },
 };
 
+/**
+ * Provider-cache hit rate for a window.
+ *
+ * The blanket `cacheRead / (input + cacheRead)` double-counts the cache: OpenAI-compatible
+ * providers report `cached_tokens` as a SUBSET of `prompt_tokens`, so the cached prefix is
+ * already inside `input` and adding it again inflates the denominator — understating the
+ * rate (measured on real traffic: 21.75% instead of 27.80%).
+ *
+ * Anthropic is the exception: its `input_tokens` EXCLUDES the cached prefix, so there the
+ * prompt really is `input + cache`. Each row is weighed by its provider's own `type` in a
+ * single pass.
+ */
+function cacheHitRateFor(
+  db: BetterSQLite3Database<typeof schema>,
+  conds: Parameters<typeof and>
+): number {
+  const anthropic = sql`${schema.providers.type} = 'anthropic'`;
+  const r = db
+    .select({
+      cacheRead: sql<number>`COALESCE(SUM(${schema.requests.cacheReadTokens}),0)`,
+      anthropicPrompt: sql<number>`COALESCE(SUM(CASE WHEN ${anthropic} THEN ${schema.requests.inputTokens} + ${schema.requests.cacheReadTokens} ELSE 0 END),0)`,
+      otherPrompt: sql<number>`COALESCE(SUM(CASE WHEN ${anthropic} THEN 0 ELSE ${schema.requests.inputTokens} END),0)`,
+    })
+    .from(schema.requests)
+    .leftJoin(schema.models, eq(schema.models.id, schema.requests.finalModelId))
+    .leftJoin(schema.providers, eq(schema.providers.id, schema.models.providerId))
+    .where(and(...conds))
+    .get();
+  const prompt = Number(r?.anthropicPrompt ?? 0) + Number(r?.otherPrompt ?? 0);
+  return prompt > 0 ? Number(r?.cacheRead ?? 0) / prompt : 0;
+}
+
 function rangeFromQuery(q: Record<string, string | undefined>): { from: Date; to: Date; bucket: 'hour' | 'day' } {
   if (q.preset && PRESETS[q.preset]) return PRESETS[q.preset]!();
   const from = q.from ? new Date(q.from) : new Date(Date.now() - 7 * 24 * 3600 * 1000);
@@ -58,6 +90,7 @@ export async function registerStatsRoutes(app: FastifyInstance): Promise<void> {
       .from(schema.requests)
       .where(and(...conds))
       .get();
+    const cacheHitRate = cacheHitRateFor(db, conds);
 
     const latRows = db
       .select({ v: schema.requests.totalLatencyMs })
@@ -96,7 +129,7 @@ export async function registerStatsRoutes(app: FastifyInstance): Promise<void> {
       p95LatencyMs: p95,
       averageTtftMs: avgTtft,
       p95TtftMs: p95Ttft,
-      cacheHitRate: success ? Number(summary?.cacheRead ?? 0) > 0 ? Number(summary?.cacheRead ?? 0) / Math.max(1, Number(summary?.inputTokens ?? 0) + Number(summary?.cacheRead ?? 0)) : 0 : 0,
+      cacheHitRate,
       gatewayCacheHitRate: total ? Number(summary?.gatewayCacheHits ?? 0) / total : 0,
       fallbackRate: total ? Number(summary?.fallbacks ?? 0) / total : 0,
     };
@@ -260,6 +293,7 @@ function buildSummary(db: BetterSQLite3Database<typeof schema>, fromIso: string,
   const success = Number(r?.success ?? 0);
   const cacheRead = Number(r?.cacheRead ?? 0);
   const inputTokens = Number(r?.inputTokens ?? 0);
+  const cacheHitRate = cacheHitRateFor(db, conds);
 
   return {
     totalRequests: total,
@@ -276,7 +310,7 @@ function buildSummary(db: BetterSQLite3Database<typeof schema>, fromIso: string,
     p95LatencyMs: 0,   // caller fills via percentile query
     averageTtftMs: (r?.avgTtft ?? null) as number | null,
     p95TtftMs: null,
-    cacheHitRate: success ? cacheRead > 0 ? cacheRead / Math.max(1, inputTokens + cacheRead) : 0 : 0,
+    cacheHitRate,
     gatewayCacheHitRate: total ? Number(r?.gatewayCacheHits ?? 0) / total : 0,
     fallbackRate: total ? Number(r?.fallbacks ?? 0) / total : 0,
   };

@@ -13,7 +13,7 @@ type RequestRow = typeof schema.requests.$inferSelect;
 interface SummaryMaps {
   keyMap: Map<string, { name: string }>;
   modelMap: Map<string, { providerId: string | null; publicModelId: string }>;
-  providerMap: Map<string, { name: string }>;
+  providerMap: Map<string, { name: string; type: string }>;
 }
 
 export function loadSummaryMaps(): SummaryMaps {
@@ -48,6 +48,7 @@ export function toSummary(r: RequestRow, maps: SummaryMaps): RequestLogSummary {
     finalModelPublicId: finalModel?.publicModelId ?? null,
     providerId: provider ? finalModel!.providerId : null,
     providerName: provider?.name ?? null,
+    providerType: provider?.type ?? null,
     streaming: Boolean(r.streaming),
     httpStatus: r.httpStatus,
     success: Boolean(r.success),

@@ -25,7 +25,8 @@ export interface LiveRequestShape {
   id: string; createdAt: string; requestedModel: string; finalModelPublicId: string | null;
   providerId: string | null; providerName: string | null;
   success: boolean; httpStatus: number; inputTokens: number; outputTokens: number;
-  cacheReadTokens: number; totalLatencyMs: number;
+  cacheReadTokens: number; totalLatencyMs: number; attemptsCount: number;
+  gatewayCacheHit: boolean; providerType: string | null;
 }
 
 export interface Pulse { id: string; providerId: string; success: boolean }
@@ -61,19 +62,75 @@ export interface UseLiveStatsResult {
   error: string | null;
 }
 
+/**
+ * Counts the live SSE feed must carry so the derived rates can advance with it.
+ * The averages' inputs (tokens, requests) are already in the summary; these four
+ * are not summarizable, so they are tallied alongside it.
+ */
+export interface LiveTally {
+  cacheReadTokens: number;
+  /** The prompt of each provider, already expressed on ITS OWN denominator (see promptTokensFor). */
+  promptTokens: number;
+  gatewayCacheHits: number;
+  fallbacks: number;
+}
+
+export const EMPTY_TALLY: LiveTally = { cacheReadTokens: 0, promptTokens: 0, gatewayCacheHits: 0, fallbacks: 0 };
+
+/**
+ * The size of the prompt a single request actually had to be fed.
+ *
+ * OpenAI-compatible providers report `cached_tokens` as a SUBSET of `prompt_tokens`, so the
+ * cached prefix is already counted in `inputTokens`. Anthropic reports `input_tokens`
+ * EXCLUDING the cached prefix — the prompt there is `input + cache`. Each request is
+ * therefore normalised on its own provider's semantics, so the rates over a mixed window
+ * stay correct instead of favouring whichever provider happens to dominate.
+ */
+export function promptTokensFor(inputTokens: number, cacheReadTokens: number, providerType: string | null): number {
+  return providerType === 'anthropic' ? inputTokens + cacheReadTokens : inputTokens;
+}
+
+/** Cached share of the prompt that a provider actually served from its prompt cache. */
+export function cacheHitRateOf(t: LiveTally): number {
+  return t.promptTokens > 0 ? t.cacheReadTokens / t.promptTokens : 0;
+}
+
+/** Share of requests that needed more than the first attempt. */
+export function fallbackRateOf(t: { fallbacks: number }, totalRequests: number): number {
+  return totalRequests > 0 ? t.fallbacks / totalRequests : 0;
+}
+
+/** Requests the gateway answered from its own response cache. */
+export function gatewayCacheHitRateOf(t: { gatewayCacheHits: number }, totalRequests: number): number {
+  return totalRequests > 0 ? t.gatewayCacheHits / totalRequests : 0;
+}
+
 /** Merge a live SSE row into an incremental summary (mutates and returns it). */
-function applyLiveSummary(s: StatsSummaryShape, r: LiveRequestShape): StatsSummaryShape {
+function applyLiveSummary(s: StatsSummaryShape, t: LiveTally, r: LiveRequestShape): StatsSummaryShape {
+  const totalRequests = s.totalRequests + 1;
+  const successfulRequests = s.successfulRequests + (r.success ? 1 : 0);
+  const next: LiveTally = {
+    cacheReadTokens: t.cacheReadTokens + r.cacheReadTokens,
+    promptTokens: t.promptTokens + promptTokensFor(r.inputTokens, r.cacheReadTokens, r.providerType),
+    gatewayCacheHits: t.gatewayCacheHits + (r.gatewayCacheHit ? 1 : 0),
+    fallbacks: t.fallbacks + (r.attemptsCount > 1 ? 1 : 0),
+  };
   return {
     ...s,
-    totalRequests: s.totalRequests + 1,
-    successfulRequests: s.successfulRequests + (r.success ? 1 : 0),
+    ...next,
+    totalRequests,
+    successfulRequests,
     failedRequests: s.failedRequests + (r.success ? 0 : 1),
-    successRate: s.totalRequests + 1 ? (s.successfulRequests + (r.success ? 1 : 0)) / (s.totalRequests + 1) : 0,
+    successRate: successfulRequests / totalRequests,
     inputTokens: s.inputTokens + r.inputTokens,
     outputTokens: s.outputTokens + r.outputTokens,
     totalTokens: s.totalTokens + r.inputTokens + r.outputTokens,
-    cacheReadTokens: s.cacheReadTokens + r.cacheReadTokens,
-    averageLatencyMs: (s.averageLatencyMs * s.totalRequests + r.totalLatencyMs) / (s.totalRequests + 1),
+    // Unlike tokens/latency, a rate is a ratio — summing it (as this did) is
+    // meaningless. Re-derive each from its running totals instead.
+    cacheHitRate: cacheHitRateOf(next),
+    gatewayCacheHitRate: gatewayCacheHitRateOf(next, totalRequests),
+    fallbackRate: fallbackRateOf(next, totalRequests),
+    averageLatencyMs: (s.averageLatencyMs * s.totalRequests + r.totalLatencyMs) / totalRequests,
   };
 }
 
@@ -90,6 +147,8 @@ export function useLiveStats(preset: Preset): UseLiveStatsResult {
   // Refs: read by the SSE effect without re-subscribing.
   const providersRef = useRef<RoutingProviderShape[]>([]);
   const liveRef = useRef<StatsSummaryShape | null>(null);
+  // Running totals behind the derived rates, reseeded from each snapshot.
+  const tallyRef = useRef<LiveTally>(EMPTY_TALLY);
   const seenIdsRef = useRef<Set<string>>(new Set());
   const sinceRef = useRef<number>(Date.now());
   const pulseIdRef = useRef(0);
@@ -109,6 +168,21 @@ export function useLiveStats(preset: Preset): UseLiveStatsResult {
         setSnapshot(r);
         setLive(r.summary);
         liveRef.current = r.summary;
+        // The rates in `summary` were computed server-side; the live increments append
+        // to the same tallies, so seed them with what that snapshot summed.
+        tallyRef.current = {
+          cacheReadTokens: r.summary.cacheReadTokens,
+          // The server's rate already encodes each provider's own denominator, so invert it
+          // to recover the mixed-provider prompt total (a raw inputTokens sum cannot express
+          // it). Rounded: a token count is an integer, so this drops float noise only. With
+          // no cache reads the rate is 0 and no inversion is possible — the plain sum is
+          // then correct anyway, since nothing was cached.
+          promptTokens: r.summary.cacheHitRate > 0
+            ? Math.round(r.summary.cacheReadTokens / r.summary.cacheHitRate)
+            : r.summary.inputTokens,
+          gatewayCacheHits: Math.round(r.summary.gatewayCacheHitRate * r.summary.totalRequests),
+          fallbacks: Math.round(r.summary.fallbackRate * r.summary.totalRequests),
+        };
         setRecent(r.recent);
         setProviders(r.providers);
         providersRef.current = r.providers;
@@ -141,8 +215,16 @@ export function useLiveStats(preset: Preset): UseLiveStatsResult {
           if (seenIdsRef.current.has(row.id)) return; // replay duplicate
           seenIdsRef.current.add(row.id);
 
-          // Live summary increments.
-          if (liveRef.current) setLive(applyLiveSummary(liveRef.current, row));
+          // Live summary increments. Each row is normalised on its own provider's token
+          // semantics, so a mixed window stays correct without knowing the whole mix.
+          const nextTally: LiveTally = {
+            cacheReadTokens: tallyRef.current.cacheReadTokens + row.cacheReadTokens,
+            promptTokens: tallyRef.current.promptTokens + promptTokensFor(row.inputTokens, row.cacheReadTokens, row.providerType),
+            gatewayCacheHits: tallyRef.current.gatewayCacheHits + (row.gatewayCacheHit ? 1 : 0),
+            fallbacks: tallyRef.current.fallbacks + (row.attemptsCount > 1 ? 1 : 0),
+          };
+          tallyRef.current = nextTally;
+          if (liveRef.current) setLive(applyLiveSummary(liveRef.current, nextTally, row));
           // Recent list (cap).
           setRecent((prev) => {
             if (prev.some((r) => r.id === row.id)) return prev;

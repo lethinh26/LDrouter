@@ -137,6 +137,9 @@ export interface RequestLogSummary {
   // Added v1.9.0: provider id/name derived from finalModelId (for routing aggregation).
   providerId: string | null;
   providerName: string | null;
+  // Provider kind, so the client can apply that provider's own cache-token
+  // semantics (Anthropic reports `input_tokens` WITHOUT the cached prefix).
+  providerType: string | null;
   streaming: boolean;
   httpStatus: number;
   success: boolean;

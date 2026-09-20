@@ -101,6 +101,30 @@ describe('Codex upstream adapter', () => {
     expect(codexStreamEventToCanonical({ type: 'response.completed', response: { usage: { input_tokens: 1, output_tokens: 2 } } })).toMatchObject({ isLast: true, usage: { input: 1, output: 2, total: 3 } });
   });
 
+  // The Responses API nests these; reading only the flat names made every Codex request
+  // report cacheRead/reasoning as 0 (1,381 requests — 46% of traffic — on live data), which
+  // is most of why the statistics page's cache-hit rate was wrong.
+  it('reads the nested cached/reasoning token details', () => {
+    const body = {
+      type: 'response.completed',
+      response: {
+        usage: {
+          input_tokens: 100, output_tokens: 40, total_tokens: 140,
+          input_tokens_details: { cached_tokens: 75, cache_write_tokens: 0 },
+          output_tokens_details: { reasoning_tokens: 25 },
+        },
+      },
+    };
+    expect(codexStreamEventToCanonical(body)).toMatchObject({ usage: { input: 100, output: 40, cacheRead: 75, reasoning: 25 } });
+  });
+
+  it('still accepts the flat names, and yields 0 when neither shape is present', () => {
+    expect(codexResponseToCanonical({ output: [], usage: { input_tokens: 5, output_tokens: 1, cached_input_tokens: 4, reasoning_tokens: 1 } }, 'm'))
+      .toMatchObject({ usage: { cacheRead: 4, reasoning: 1 } });
+    expect(codexResponseToCanonical({ output: [], usage: { input_tokens: 5, output_tokens: 1 } }, 'm'))
+      .toMatchObject({ usage: { cacheRead: 0, reasoning: 0 } });
+  });
+
   it('refreshes and retries unauthorized calls exactly once', async () => {
     const refresh = vi.fn().mockResolvedValue({ ok: true, expiresAt: '2099-01-01T00:00:00.000Z' });
     const call = vi.fn().mockRejectedValueOnce(Object.assign(new Error('unauthorized'), { status: 401 })).mockResolvedValueOnce('ok');
