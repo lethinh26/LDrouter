@@ -59,14 +59,41 @@ describe('Codex refresh lifecycle', () => {
     expect(getCodexCredentials(id)).toEqual({ accessToken: 'new-access', refreshToken: 'rotated-refresh', idToken: 'old-id' });
   });
 
-  it('fails safely and keeps old credentials when refresh fails', async () => {
+  it('fails safely and keeps old credentials when the refresh attempt fails', async () => {
     const { id } = setup('2026-09-12T00:01:00.000Z');
     configureCodexOAuthRefreshClient(async () => { throw new Error('secret-old-refresh upstream refused'); });
     const result = await refreshCodexAccount(id, new Date('2026-09-12T00:00:00.000Z'));
-    expect(result).toEqual({ ok: false, error: 'oauth_refresh_failed' });
+    // An error carrying no grant rejection is not evidence the refresh token is dead: the account
+    // keeps its health and stays eligible, and only the attempt is reported as failed.
+    expect(result).toEqual({ ok: false, error: 'oauth_refresh_unavailable' });
     expect(getCodexCredentials(id).accessToken).toBe('old-access');
-    expect((getRawDb().prepare('SELECT health_state,last_error FROM codex_accounts WHERE id=?').get(id) as { health_state: string; last_error: string }).health_state).toBe('degraded');
+    expect((getRawDb().prepare('SELECT health_state FROM codex_accounts WHERE id=?').get(id) as { health_state: string }).health_state).not.toBe('degraded');
     expect(JSON.stringify(result)).not.toContain('old-refresh');
+  });
+
+  it('degrades the account only when the endpoint actually rejected the grant', async () => {
+    const { id } = setup('2026-09-12T00:01:00.000Z');
+    // Exactly what Auth0 answers for a revoked login. OpenAI nests the code in an `error` object, so
+    // the classification must read the whole body rather than a top-level `error` field.
+    const rejected = JSON.stringify({ error: { message: 'Your session has ended. Please log in again.', code: 'refresh_token_invalidated' } });
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(rejected, { status: 401, headers: { 'content-type': 'application/json' } })));
+
+    const result = await refreshCodexAccount(id, new Date('2026-09-12T00:00:00.000Z'));
+    expect(result).toEqual({ ok: false, error: 'oauth_refresh_failed' });
+    expect(getRawDb().prepare('SELECT health_state,last_error FROM codex_accounts WHERE id=?').get(id)).toMatchObject({ health_state: 'degraded', last_error: 'oauth_refresh_failed' });
+    vi.unstubAllGlobals();
+  });
+
+  it('treats a token-endpoint server error as transient, not as a dead credential', async () => {
+    const { id } = setup('2026-09-12T00:01:00.000Z');
+    // A 5xx is the endpoint having a bad moment. Recording it as a dead credential retires the
+    // account and disables it, which is how every live account read `consecutive_failures = 0`.
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('<html>invalid_grant</html>', { status: 503 })));
+
+    const result = await refreshCodexAccount(id, new Date('2026-09-12T00:00:00.000Z'));
+    expect(result).toEqual({ ok: false, error: 'oauth_refresh_unavailable' });
+    expect((getRawDb().prepare('SELECT health_state FROM codex_accounts WHERE id=?').get(id) as { health_state: string }).health_state).not.toBe('degraded');
+    vi.unstubAllGlobals();
   });
 
   it('rejects malformed and expired refresh expiries without persisting', async () => {
@@ -87,13 +114,14 @@ describe('Codex refresh lifecycle', () => {
   it('aborts a refresh using the configured timeout', async () => {
     const { id } = setup('2026-09-12T00:01:00.000Z');
     configureCodexOAuthRefreshClient(async ({ signal }) => await new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(new Error('aborted')))), 5);
-    await expect(refreshCodexAccount(id, new Date('2026-09-12T00:00:00.000Z'))).resolves.toEqual({ ok: false, error: 'oauth_refresh_failed' });
+    // A timeout says nothing about the grant.
+    await expect(refreshCodexAccount(id, new Date('2026-09-12T00:00:00.000Z'))).resolves.toEqual({ ok: false, error: 'oauth_refresh_unavailable' });
   });
 
   it('cleans up a rejected single-flight and preserves a rotated id token', async () => {
     const { id } = setup('2026-09-12T00:01:00.000Z');
     configureCodexOAuthRefreshClient(async () => { throw new Error('upstream'); });
-    await expect(refreshCodexAccount(id, new Date('2026-09-12T00:00:00.000Z'))).resolves.toEqual({ ok: false, error: 'oauth_refresh_failed' });
+    await expect(refreshCodexAccount(id, new Date('2026-09-12T00:00:00.000Z'))).resolves.toEqual({ ok: false, error: 'oauth_refresh_unavailable' });
     configureCodexOAuthRefreshClient(async () => ({ accessToken: 'new-access', expiresIn: 3600, idToken: 'rotated-id' }));
     await expect(refreshCodexAccount(id, new Date('2026-09-12T00:00:00.000Z'))).resolves.toMatchObject({ ok: true });
     expect(getCodexCredentials(id).idToken).toBe('rotated-id');
@@ -140,9 +168,10 @@ describe('Codex refresh lifecycle', () => {
     getRawDb().prepare(`CREATE TRIGGER fail_codex_refresh BEFORE UPDATE OF encrypted_access_token ON codex_accounts BEGIN SELECT RAISE(ABORT, 'injected database failure'); END`).run();
     configureCodexOAuthRefreshClient(async () => ({ accessToken: 'new-access', refreshToken: 'new-refresh', idToken: 'new-id', expiresIn: 3600 }));
 
-    await expect(refreshCodexAccount(id, new Date('2026-09-12T00:00:00.000Z'))).resolves.toEqual({ ok: false, error: 'oauth_refresh_failed' });
+    await expect(refreshCodexAccount(id, new Date('2026-09-12T00:00:00.000Z'))).resolves.toEqual({ ok: false, error: 'oauth_refresh_unavailable' });
+    // The write rolled back, so nothing changed and no health verdict may be left behind.
     const after = getRawDb().prepare('SELECT encrypted_access_token,encrypted_refresh_token,encrypted_id_token,token_expires_at,health_state,last_error FROM codex_accounts WHERE id=?').get(id);
-    expect(after).toMatchObject({ ...before, health_state: 'degraded', last_error: 'oauth_refresh_failed' });
+    expect(after).toEqual(before);
     expect(getCodexCredentials(id)).toEqual({ accessToken: 'old-access', refreshToken: 'old-refresh', idToken: 'old-id' });
   });
 
@@ -152,10 +181,11 @@ describe('Codex refresh lifecycle', () => {
     configureCodexOAuthRefreshClient(async ({ refreshToken }) => { throw new Error(`credential ${refreshToken}`); });
 
     const result = await refreshCodexAccount(id, new Date('2026-09-12T00:00:00.000Z'));
-    expect(result).toEqual({ ok: false, error: 'oauth_refresh_failed' });
+    expect(result).toEqual({ ok: false, error: 'credential_unavailable' });
     expect(JSON.stringify(result)).not.toContain('not-a-secret-ciphertext');
     const health = getRawDb().prepare('SELECT health_state,last_error FROM codex_accounts WHERE id=?').get(id) as { health_state: string; last_error: string };
-    expect(health).toEqual({ health_state: 'degraded', last_error: 'oauth_refresh_failed' });
+    // Unreadable stored credentials are a real verdict: only a re-import fixes them.
+    expect(health).toEqual({ health_state: 'degraded', last_error: 'credential_unavailable' });
 
     getRawDb().prepare('UPDATE codex_accounts SET encrypted_refresh_token=? WHERE id=?').run('still-secret-ciphertext', id);
     await expect(withCodexCredentials(id, async () => 'unreachable', new Date('2026-09-12T00:00:00.000Z'))).rejects.toThrow('credential_unavailable');
@@ -165,6 +195,6 @@ describe('Codex refresh lifecycle', () => {
   it('sanitizes refresh-state repository failures', async () => {
     const { id } = setup('2026-09-12T00:01:00.000Z');
     getRawDb().prepare('DROP TABLE codex_accounts').run();
-    await expect(refreshCodexAccount(id, new Date('2026-09-12T00:00:00.000Z'))).resolves.toEqual({ ok: false, error: 'oauth_refresh_failed' });
+    await expect(refreshCodexAccount(id, new Date('2026-09-12T00:00:00.000Z'))).resolves.toEqual({ ok: false, error: 'credential_unavailable' });
   });
 });

@@ -369,7 +369,9 @@ export class GatewayRunner {
         } catch (e) {
           const err = e instanceof GatewayError ? e : new GatewayError('upstream_error', (e as Error).message, { cause: e });
           const quotaFailure = isQuotaFailure(err);
-          const credentialFailure = isCredentialFailure(err);
+          // Only a final verdict retires the account (below); a transient refresh failure still moves
+          // the request to a sibling account but must leave this one enabled.
+          const credentialFailure = isPermanentCredentialFailure(err);
           debugUpstream(ctx.requestId, 'ATTEMPT ERROR', [
             `attempt=${i + 1}`,
             `provider=${provider.name}`,
@@ -1156,7 +1158,22 @@ export function markQuotaExhausted(candidate: CandidateModel, message: string): 
  * inside the gateway) or wrapped by `codexCredentialError`, which now keeps it as `cause`.
  */
 export function isCredentialFailure(err: GatewayError): boolean {
-  const codes = /^(oauth_refresh_failed|invalid_refresh_response|credential_unavailable|account_not_found)$/;
+  const codes = /^(oauth_refresh_failed|oauth_refresh_unavailable|invalid_refresh_response|credential_unavailable|account_not_found)$/;
+  const cause = err.cause as { message?: unknown } | undefined;
+  return codes.test(err.message) || (typeof cause?.message === 'string' && codes.test(cause.message));
+}
+
+/**
+ * Whether the verdict is final, i.e. the account cannot serve again until an operator re-imports it.
+ *
+ * A transient refresh failure (timeout, network error, token-endpoint 5xx, rolled-back write) is
+ * still a credential failure for routing — the request should move to a sibling account — but it
+ * must NOT retire this one. Treating both classes as final is what degraded healthy accounts and
+ * disabled them (`enabled=0`) on a single flaky moment; every live account carried
+ * `consecutive_failures = 0`, so no pattern was ever required before the verdict.
+ */
+export function isPermanentCredentialFailure(err: GatewayError): boolean {
+  const codes = /^(oauth_refresh_failed|credential_unavailable|account_not_found)$/;
   const cause = err.cause as { message?: unknown } | undefined;
   return codes.test(err.message) || (typeof cause?.message === 'string' && codes.test(cause.message));
 }

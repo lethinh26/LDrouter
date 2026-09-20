@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { GatewayError } from '../../src/server/errors';
-import { classifyFailure, isCredentialFailure, markCredentialsDead, shouldRetryAttempt } from '../../src/server/gateway/runner';
+import { classifyFailure, isCredentialFailure, isPermanentCredentialFailure, markCredentialsDead, shouldRetryAttempt } from '../../src/server/gateway/runner';
 import { expandCodexAccountCandidates } from '../../src/server/routing/combo';
 import { codexCredentialError } from '../../src/server/providers/codex-refresh';
 
@@ -49,6 +49,25 @@ describe('credential failure classification', () => {
     expect(isCredentialFailure(new GatewayError('upstream_error', 'Upstream HTTP 400: bad field', { status: 502 }))).toBe(false);
     expect(isCredentialFailure(new GatewayError('upstream_error', 'Codex upstream HTTP 429: The usage limit has been reached', { status: 502 }))).toBe(false);
     expect(classifyFailure(new GatewayError('upstream_error', 'Upstream HTTP 400: bad field', { status: 502 }))).toBe('unknown');
+  });
+
+  it('still routes around a transient refresh failure, but does not retire the account', () => {
+    // The production failure mode: a refresh that timed out (or met a 5xx, or a rolled-back write)
+    // was recorded as `oauth_refresh_failed`, which the gateway reads as "the credentials are dead".
+    // One flaky moment therefore disabled the account (`enabled=0`) — every live account read
+    // `consecutive_failures = 0`, because no pattern was ever required before the verdict.
+    const transient = () => new GatewayError('upstream_error', 'oauth_refresh_unavailable', { status: 502, cause: new Error('oauth_refresh_unavailable') });
+    // Still a credential failure for routing: the request moves to a sibling account.
+    expect(isCredentialFailure(transient())).toBe(true);
+    expect(shouldRetryAttempt(null, transient())).toBe(true);
+    expect(classifyFailure(transient())).toBe('credential');
+    // But not a final verdict, so `markCredentialsDead` must not run for it.
+    expect(isPermanentCredentialFailure(transient())).toBe(false);
+  });
+
+  it('treats a rejected grant as the final verdict that retires an account', () => {
+    expect(isPermanentCredentialFailure(rawDeadCredential())).toBe(true);
+    expect(isPermanentCredentialFailure(wrappedDeadCredential())).toBe(true);
   });
 
   it('advances to the next account with no combo plan configured', () => {
