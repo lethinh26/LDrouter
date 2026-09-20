@@ -4,6 +4,12 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.17.7] - 2026-09-20
+
+### Fixed
+
+- **Codex accounts were refreshed at the last minute, in the window where a rotating grant is most fragile.** The refresh lead is a threshold on the *remaining* lifetime, not a token lifetime — `needsCodexRefresh` fires once `expires - now` drops below it — and it sat at 5 minutes, so the exchange ran as the access token expired. Because OpenAI rotates the refresh token on every exchange, that is exactly when another client holding the same grant can invalidate it, and the observed fleet showed every account at `consecutive_failures = 0`: the first failure was already being treated as final. Codex access tokens last 10 days (measured from the fleet: a rotation at 13:39:00 expired at 13:39:00 ten days later), so the lead is now 5 days — half a lifetime of margin, refreshing every 5 days instead of every 10. This matches the 5-day `refreshLeadMs` 9router ships for Codex, and it surfaces a dead grant on day 5 rather than day 10. The lead is deliberately far below the lifetime: any value above it makes `needsCodexRefresh` permanently true and refreshes on *every* request, which multiplies refresh-token rotation by the request count.
+
 ## [1.17.6] - 2026-09-20
 
 ### Fixed
