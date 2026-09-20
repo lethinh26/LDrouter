@@ -71,7 +71,12 @@ export function isPermanentRefreshFailure(error: CodexRefreshFailure): boolean {
 
 export type OAuthRefreshClient = (input: { refreshToken: string; signal: AbortSignal }) => Promise<OAuthRefreshResponse>;
 
-const REFRESH_LEAD_MS = 5 * 60 * 1000;
+// Lead is measured against the remaining lifetime, and must stay well under it: a refresh that fires
+// at the last minute races the expiry, and because OpenAI rotates the refresh token on every
+// exchange, that is exactly the moment another client holding the same grant can invalidate it.
+// Codex access tokens last 10 days, so a 5-day lead keeps half the lifetime as margin and refreshes
+// every 5 days. Matches the 5-day `refreshLeadMs` 9router ships for Codex.
+const REFRESH_LEAD_MS = 5 * 24 * 60 * 60 * 1000;
 const REFRESH_TIMEOUT_MS = 10_000;
 const flights = new Map<string, Promise<SafeRefreshResult>>();
 let refreshClient: OAuthRefreshClient = defaultRefreshClient;

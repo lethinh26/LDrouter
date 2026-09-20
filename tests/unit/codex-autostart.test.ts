@@ -32,7 +32,7 @@ beforeAll(async () => {
   const { parseCodexImportText } = await import('../../src/server/providers/codex-import');
   const record = parseCodexImportText(JSON.stringify({
     access_token: 'access-token', refresh_token: 'refresh-token', email: 'auto@example.com',
-    chatgpt_account_id: 'acct-1', chatgpt_plan_type: 'plus', expires_at: new Date(Date.now() + 86_400_000).toISOString(),
+    chatgpt_account_id: 'acct-1', chatgpt_plan_type: 'plus', expires_at: new Date(Date.now() + 10 * 86_400_000).toISOString(),
   }))[0] as never;
   accountId = insertCodexAccount(providerId, record);
 });

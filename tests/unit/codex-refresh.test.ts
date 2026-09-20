@@ -10,7 +10,12 @@ import { CODEX_OAUTH } from '../../src/server/providers/codex-oauth';
 
 const record = (expiresAt: string, idToken: string | null = 'old-id') => ({ index: 0, email: 'user@example.com', workspaceId: 'workspace-1', chatgptAccountId: 'account-1', planType: 'plus', expiresAt, accessToken: 'old-access', refreshToken: 'old-refresh', idToken, identity: 'account:account-1' });
 
-function setup(expiresAt = '2026-09-12T01:00:00.000Z') {
+/** Shipped Codex access-token lifetime. Fixtures must use it: a refresh result that expires inside
+ * the 5-day lead re-triggers on the next call and turns every refresh count into a moving target. */
+const CODEX_LIFETIME_S = 10 * 24 * 60 * 60;
+const FRESH_EXPIRY = '2026-09-22T00:00:00.000Z';
+
+function setup(expiresAt = FRESH_EXPIRY) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'latedev-codex-refresh-'));
   tempDirs.push(dir);
   process.env.LATEDEV_MASTER_KEY = '12345678901234567890123456789012';
@@ -27,10 +32,17 @@ describe('Codex refresh lifecycle', () => {
   afterEach(() => { configureCodexOAuthRefreshClient(null); closeDb(); resetConfigForTests(); for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
 
   it('detects tokens inside the refresh lead time', () => {
-    const account = { tokenExpiresAt: '2026-09-12T00:04:00.000Z' };
-    expect(needsCodexRefresh(account, new Date('2026-09-12T00:00:00.000Z'))).toBe(true);
-    expect(needsCodexRefresh({ tokenExpiresAt: '2026-09-12T01:00:00.000Z' }, new Date('2026-09-12T00:00:00.000Z'))).toBe(false);
-  });
+    const now = new Date('2026-09-12T00:00:00.000Z');
+    const at = (iso: string) => needsCodexRefresh({ tokenExpiresAt: iso }, now);
+    // A 5-day lead means anything with 5 days or less of life left refreshes, and a healthy
+    // 10-day token (the shipped lifetime) does not — the threshold sits at half a lifetime.
+    expect(at('2026-09-12T00:04:00.000Z')).toBe(true);
+    expect(at('2026-09-16T23:59:00.000Z')).toBe(true);
+    expect(at('2026-09-17T00:00:00.000Z')).toBe(true);
+    expect(at('2026-09-17T00:01:00.000Z')).toBe(false);
+    expect(at('2026-09-22T00:00:00.000Z')).toBe(false);
+    expect(needsCodexRefresh({ tokenExpiresAt: 'not-a-date' }, now)).toBe(true);
+    });
 
   it('sends client_id on the real refresh request, which the endpoint requires', async () => {
     const { id } = setup('2026-09-12T00:01:00.000Z');
@@ -53,7 +65,7 @@ describe('Codex refresh lifecycle', () => {
 
   it('persists rotated refresh tokens and preserves an omitted id token', async () => {
     const { id } = setup('2026-09-12T00:01:00.000Z');
-    configureCodexOAuthRefreshClient(async (input) => { expect(input.refreshToken).toBe('old-refresh'); return { accessToken: 'new-access', refreshToken: 'rotated-refresh', expiresIn: 3600 }; });
+    configureCodexOAuthRefreshClient(async (input) => { expect(input.refreshToken).toBe('old-refresh'); return { accessToken: 'new-access', refreshToken: 'rotated-refresh', expiresIn: CODEX_LIFETIME_S }; });
     const result = await refreshCodexAccount(id, new Date('2026-09-12T00:00:00.000Z'));
     expect(result).toMatchObject({ ok: true });
     expect(getCodexCredentials(id)).toEqual({ accessToken: 'new-access', refreshToken: 'rotated-refresh', idToken: 'old-id' });
@@ -122,7 +134,7 @@ describe('Codex refresh lifecycle', () => {
     const { id } = setup('2026-09-12T00:01:00.000Z');
     configureCodexOAuthRefreshClient(async () => { throw new Error('upstream'); });
     await expect(refreshCodexAccount(id, new Date('2026-09-12T00:00:00.000Z'))).resolves.toEqual({ ok: false, error: 'oauth_refresh_unavailable' });
-    configureCodexOAuthRefreshClient(async () => ({ accessToken: 'new-access', expiresIn: 3600, idToken: 'rotated-id' }));
+    configureCodexOAuthRefreshClient(async () => ({ accessToken: 'new-access', expiresIn: CODEX_LIFETIME_S, idToken: 'rotated-id' }));
     await expect(refreshCodexAccount(id, new Date('2026-09-12T00:00:00.000Z'))).resolves.toMatchObject({ ok: true });
     expect(getCodexCredentials(id).idToken).toBe('rotated-id');
   });
@@ -130,7 +142,7 @@ describe('Codex refresh lifecycle', () => {
   it('single-flights concurrent refreshes and retries one unauthorized call', async () => {
     const { id } = setup('2026-09-12T00:01:00.000Z');
     let calls = 0;
-    configureCodexOAuthRefreshClient(async () => { calls += 1; await new Promise((resolve) => setTimeout(resolve, 5)); return { accessToken: 'new-access', expiresIn: 3600 }; });
+    configureCodexOAuthRefreshClient(async () => { calls += 1; await new Promise((resolve) => setTimeout(resolve, 5)); return { accessToken: 'new-access', expiresIn: CODEX_LIFETIME_S }; });
     const first = vi.fn(async () => { const error = Object.assign(new Error('unauthorized'), { status: 401 }); throw error; });
     const second = vi.fn(async () => 'ok');
     const refreshes = await Promise.all([
@@ -146,10 +158,11 @@ describe('Codex refresh lifecycle', () => {
   });
 
   it('handles HTTP 403 with exactly one forced refresh and one retry boundary', async () => {
-    const { id } = setup('2026-09-12T01:00:00.000Z');
+    // A fresh token, so the proactive path stays silent and the only refresh is the forced one.
+    const { id } = setup();
     let refreshes = 0;
     const calls: string[] = [];
-    configureCodexOAuthRefreshClient(async () => { refreshes += 1; return { accessToken: `access-${refreshes}`, expiresIn: 3600 }; });
+    configureCodexOAuthRefreshClient(async () => { refreshes += 1; return { accessToken: `access-${refreshes}`, expiresIn: CODEX_LIFETIME_S }; });
     const fn = vi.fn(async (credentials) => {
       calls.push(credentials.accessToken);
       if (calls.length === 1) throw Object.assign(new Error('forbidden credential'), { status: 403 });
@@ -166,7 +179,7 @@ describe('Codex refresh lifecycle', () => {
     const { id } = setup('2026-09-12T00:01:00.000Z');
     const before = getRawDb().prepare('SELECT encrypted_access_token,encrypted_refresh_token,encrypted_id_token,token_expires_at,health_state,last_error FROM codex_accounts WHERE id=?').get(id) as Record<string, string | null>;
     getRawDb().prepare(`CREATE TRIGGER fail_codex_refresh BEFORE UPDATE OF encrypted_access_token ON codex_accounts BEGIN SELECT RAISE(ABORT, 'injected database failure'); END`).run();
-    configureCodexOAuthRefreshClient(async () => ({ accessToken: 'new-access', refreshToken: 'new-refresh', idToken: 'new-id', expiresIn: 3600 }));
+    configureCodexOAuthRefreshClient(async () => ({ accessToken: 'new-access', refreshToken: 'new-refresh', idToken: 'new-id', expiresIn: CODEX_LIFETIME_S }));
 
     await expect(refreshCodexAccount(id, new Date('2026-09-12T00:00:00.000Z'))).resolves.toEqual({ ok: false, error: 'oauth_refresh_unavailable' });
     // The write rolled back, so nothing changed and no health verdict may be left behind.

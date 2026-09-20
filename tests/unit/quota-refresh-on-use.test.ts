@@ -36,7 +36,7 @@ beforeAll(async () => {
   const record = parseCodexImportText(JSON.stringify({
     access_token: 'access-token', refresh_token: 'refresh-token', email: 'usage@example.com',
     chatgpt_account_id: 'acct-usage', chatgpt_plan_type: 'plus',
-    expires_at: new Date(Date.now() + 86_400_000).toISOString(),
+    expires_at: new Date(Date.now() + 10 * 86_400_000).toISOString(),
   }))[0] as never;
   codexId = codexRepo.insertCodexAccount('cp', record);
   qoderId = qoderRepo.insertQoderAccount('qp', {
