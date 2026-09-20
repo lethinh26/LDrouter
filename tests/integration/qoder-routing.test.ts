@@ -147,6 +147,47 @@ describe('Qoder account-pool routing', () => {
     expect(body).toContain('[DONE]');
   });
 
+  // Reported as "Tokens in 0 · out 0 · cache 0" for every Qoder request. The upstream usage
+  // frame is OpenAI-shaped (the stub sends `prompt_tokens`), but the runner only parsed usage
+  // for `cfg.type === 'openai'`, leaving the accumulator at zero for Qoder.
+  it('records the upstream token usage on the request and its attempt', async () => {
+    const db = (await import('../../src/server/db/index')).getDb();
+    const sch = await import('../../src/server/db/schema');
+    const { eq } = await import('drizzle-orm');
+    const before = db.select().from(sch.requests).all().length;
+
+    const res = await chat('qoder/qmodel_38max');
+    expect(res.status).toBe(200);
+    await res.json();
+
+    const rows = db.select().from(sch.requests).all();
+    const row = rows.filter((r) => r.requestedModel === 'qoder/qmodel_38max').at(-1)!;
+    expect(rows.length).toBeGreaterThan(before);
+    // The stub reported prompt_tokens 5 / completion_tokens 3 / total_tokens 8.
+    expect(row.inputTokens).toBe(5);
+    expect(row.outputTokens).toBe(3);
+    expect(row.totalTokens).toBe(8);
+    expect(row.inputTokens + row.outputTokens).toBeGreaterThan(0);
+
+    const attempt = db.select().from(sch.requestAttempts).where(eq(sch.requestAttempts.requestId, row.id)).all().at(-1)!;
+    expect(attempt.inputTokens).toBe(5);
+    expect(attempt.outputTokens).toBe(3);
+  });
+
+  it('records the same usage when the answer streams', async () => {
+    const db = (await import('../../src/server/db/index')).getDb();
+    const sch = await import('../../src/server/db/schema');
+
+    const res = await chat('qoder/qmodel_38max', true);
+    expect(res.status).toBe(200);
+    await res.text();
+
+    const row = db.select().from(sch.requests).all().filter((r) => r.requestedModel === 'qoder/qmodel_38max' && r.streaming).at(-1)!;
+    // Streaming parity is the case that stayed at 0 in production (128 of 128 requests).
+    expect(row.inputTokens).toBe(5);
+    expect(row.outputTokens).toBe(3);
+  });
+
   it('fails the request when every account is down', async () => {
     const { setQoderAccountHealth } = await import('../../src/server/db/repositories/qoder-accounts');
     setQoderAccountHealth(healthyAccountId, 'down', 'personal access token rejected — replace it');

@@ -241,6 +241,22 @@ async function drainEnvelope(
   }
 }
 
+/**
+ * Interpret a non-SSE body as a plain OpenAI chat completion and fold it into the reader.
+ * A no-op when the origin framed its answer as SSE frames, which is the usual case.
+ */
+function applyPlainCompletion(reader: QoderEnvelopeReader): void {
+  const raw = reader.takeUnparsed();
+  if (!raw) return;
+  let body: Record<string, unknown>;
+  try {
+    body = JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    return;
+  }
+  reader.applyCompletion(body);
+}
+
 /** Streaming: emit OpenAI-shaped chunks as they arrive, stop at the terminal frame. */
 export async function callQoderStreaming(
   cfg: QoderProviderConfig,
@@ -261,6 +277,12 @@ export async function callQoderNonStreaming(
 ): Promise<QoderCanonicalResult & { status: number; upstreamRequestId: string | null }> {
   const { response, reader, status, upstreamRequestId } = await openSignedStream(cfg, { ...req, stream: false }, deps);
   await drainEnvelope(reader, response);
+  // The caller invoked this with stream disabled, so the origin may honour the stream
+  // preference and answer with the full completion in one body rather than SSE frames.
+  // The reader buffers those bytes as an unparsed trailing line (it only understands
+  // `data:` framing), which is why a non-streaming Qoder call logged zero tokens:
+  // `usage` came back `undefined` and the runner reported `in 0 · out 0 · cache 0`.
+  applyPlainCompletion(reader);
   return { status, upstreamRequestId, text: reader.text, toolCalls: reader.toolCalls, finishReason: reader.finishReason, usage: reader.usage ?? emptyUsage() };
 }
 

@@ -336,6 +336,9 @@ export class GatewayRunner {
           });
           attempt.statusCode = (out as { statusCode?: number | null }).statusCode ?? null;
           attempt.success = true;
+          // A fallback that succeeded answered the client 200: the earlier failed
+          // attempt must not keep the request logged (and reported) as a failure.
+          lastError = null;
           attempt.latencyMs = Date.now() - attemptStart;
           attempt.ttftMs = out.ttftMs;
           attempt.usage = out.usage;
@@ -707,7 +710,9 @@ export class GatewayRunner {
       }
       try {
         const obj = JSON.parse(chunk.data);
-        if (cfg.type === 'openai') {
+        // Qoder emits OpenAI-shaped chunks and pipes them through this same handler
+        // (see the qoder branch below), so its usage block is parsed here too.
+        if (cfg.type === 'openai' || cfg.type === 'qoder') {
           const choice = obj.choices?.[0];
           if (choice?.delta?.content) textBuf += choice.delta.content;
           if (choice?.delta?.tool_calls) {

@@ -24,13 +24,21 @@ function numberOr(value: unknown, fallback: number): number {
 
 export function qoderUsageOf(value: unknown): QoderUsage {
   const usage = (value && typeof value === 'object' ? value : {}) as Record<string, unknown>;
-  const details = (usage.prompt_tokens_details && typeof usage.prompt_tokens_details === 'object' ? usage.prompt_tokens_details : {}) as Record<string, unknown>;
-  const input = numberOr(usage.prompt_tokens ?? usage.input_tokens, 0);
-  const output = numberOr(usage.completion_tokens ?? usage.output_tokens, 0);
+  // The envelope nests the real OpenAI usage object one level down under `body`, so a
+  // few shapes are worth reading; the flat one stays authoritative when present.
+  const nested = (usage.usage && typeof usage.usage === 'object' ? usage.usage : {}) as Record<string, unknown>;
+  const asObject = (v: unknown): Record<string, unknown> => (v && typeof v === 'object' ? v : {}) as Record<string, unknown>;
+  const details = asObject(usage.prompt_tokens_details ?? nested.prompt_tokens_details);
+  const input = numberOr(usage.prompt_tokens ?? usage.input_tokens ?? nested.prompt_tokens ?? nested.input_tokens, 0);
+  const output = numberOr(usage.completion_tokens ?? usage.output_tokens ?? nested.completion_tokens ?? nested.output_tokens, 0);
   return {
     input, output,
-    total: numberOr(usage.total_tokens, input + output),
-    cacheRead: numberOr(details.cached_tokens ?? usage.cached_tokens ?? usage.cache_read_input_tokens, 0),
+    total: numberOr(usage.total_tokens ?? nested.total_tokens, input + output),
+    cacheRead: numberOr(
+      details.cached_tokens ?? usage.cached_tokens ?? usage.cache_read_input_tokens
+        ?? nested.cached_tokens,
+      0,
+    ),
     cacheWrite: numberOr(details.cache_creation_tokens ?? usage.cache_creation_input_tokens, 0),
     reasoning: numberOr(usage.reasoning_tokens ?? (usage.completion_tokens_details as Record<string, unknown> | undefined)?.reasoning_tokens, 0),
   };
@@ -46,6 +54,8 @@ export class QoderEnvelopeReader {
   usage: QoderUsage | null = null;
   error: QoderErrorEnvelope | null = null;
   private buffer = '';
+  // Non-`data:` lines, in arrival order: a plain (unframed) JSON body. See takeUnparsed().
+  private plain: string[] = [];
   private ended = false;
   private pendingFinish: string | null = null;
   private pendingUsage: QoderUsage | null = null;
@@ -58,6 +68,44 @@ export class QoderEnvelopeReader {
 
   terminal(): boolean { return this.ended; }
   errorEnvelope(): QoderErrorEnvelope | null { return this.error; }
+
+  /**
+   * Take the buffered, never-`data:`-framed bytes (if any) and clear them. An origin
+   * answering a non-streaming call with a plain JSON completion leaves the whole
+   * response here — the SSE line scanner only recognises `data:` frames.
+   */
+  takeUnparsed(): string {
+    const raw = [...this.plain, this.buffer].join('\n').trim();
+    this.plain = [];
+    this.buffer = '';
+    return raw;
+  }
+
+  /**
+   * Fold an OpenAI-shaped non-streaming completion into this reader, so the caller
+   * gets text/toolCalls/finishReason/usage from one accessor set regardless of how
+   * the origin framed the answer. `usage` is only written when the body carries one:
+   * a zero would be indistinguishable from "the provider reported nothing".
+   */
+  applyCompletion(body: Record<string, unknown>): void {
+    const choice = (Array.isArray(body.choices) ? body.choices[0] : null) as Record<string, unknown> | null;
+    const message = (choice?.message ?? {}) as Record<string, unknown>;
+    if (typeof message.content === 'string') this.text += message.content;
+    const calls = Array.isArray(message.tool_calls) ? message.tool_calls as PendingToolCall[] : [];
+    for (const call of calls) {
+      let input: unknown = {};
+      if (typeof call.function?.arguments === 'string' && call.function.arguments) {
+        try { input = JSON.parse(call.function.arguments) as unknown; } catch { input = {}; }
+      }
+      this.toolCalls.push({ id: call.id ?? `call-${this.toolCalls.length}`, name: call.function?.name ?? 'unknown', input });
+    }
+    // Assigned directly, not via the pending machinery: this body is complete, and the
+    // stream has already ended (finish() set `ended`), which those paths return early on.
+    const finish = (choice?.finish_reason ?? (typeof body.status === 'string' ? body.status : null)) as string | null;
+    if (finish) this.finishReason = finish;
+    if (body.usage) this.usage = qoderUsageOf(body.usage);
+    this.ended = true;
+  }
 
   push(text: string): void {
     if (this.ended) return;
@@ -84,8 +132,16 @@ export class QoderEnvelopeReader {
   cancel(): void { this.ended = true; this.buffer = ''; }
 
   private line(raw: string): void {
-    const trimmed = raw.replace(/\r$/, '').trim();
-    if (!trimmed.startsWith('data:')) return;
+    // trim() also drops the trailing CR of a CRLF frame, so no separate strip is needed.
+    const trimmed = raw.trim();
+    if (!trimmed.startsWith('data:')) {
+      // An origin answering a non-streaming call may send the whole completion as one
+      // plain JSON body instead of SSE frames. Hold those lines rather than dropping
+      // them: finish() consumes the buffer, so this is the only place they survive.
+      // Blank lines and `:comment` keepalives are not content.
+      if (trimmed && !trimmed.startsWith(':')) this.plain.push(trimmed);
+      return;
+    }
     const data = trimmed.slice(5).trimStart();
     if (data === '[DONE]') { this.flushPending(); return; }
 
