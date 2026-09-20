@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.17.6] - 2026-09-20
+
+### Fixed
+
+- **Every Qoder request logged `Tokens in 0 · out 0 · cache 0`.** Two independent causes. Streaming: the Qoder branch pipes OpenAI-shaped chunks through the runner's shared chunk handler, which only parsed usage under `cfg.type === 'openai'`, so the accumulator stayed at zero for Qoder — live data confirmed 128 of 128 streaming Qoder requests carried no tokens. Non-streaming: a call asking for no stream can be answered with the whole completion as one plain JSON body, which the SSE-only envelope reader left in its unparsed buffer, so `usage` came back `undefined`. The reader now keeps non-`data:` lines rather than dropping them and the non-streaming path folds a plain completion in (a no-op when the origin did frame its answer as SSE). The usage shapes Qoder actually sends are read too: the object nested one level down as `{statusCodeValue, body}`, and OpenAI-compatible `prompt_tokens_details.cached_tokens`.
+- **A fallback that succeeded was logged as a failure.** The failed first attempt's error was never cleared once a later candidate answered, so the row kept the first attempt's status: 17 requests were recorded `success=0` with `http_status` 502/504/429 while the client had received a 200 answer. The success rate and every per-model figure derived from the request log inherited that error.
+- **The cache-hit rate double-counted the cache.** OpenAI-compatible providers report `cached_tokens` as a *subset* of `prompt_tokens`, so `input` already contains the cached prefix and the blanket `cacheRead / (input + cacheRead)` inflated the denominator — measured at 21.75% where the truth was 27.80% over real traffic. Anthropic is the exception (`input_tokens` *excludes* the cached prefix), so each request is now normalised on its own provider's semantics, on the server and in the live feed alike. The live feed also derives its rates from running totals instead of incrementing a ratio, which is meaningless.
+- **Codex reported zero cached and zero reasoning tokens.** The Responses API nests them under `usage.input_tokens_details.cached_tokens` and `usage.output_tokens_details.reasoning_tokens`; only the flat names were read, so 1,381 requests (46% of traffic) contributed nothing to the cache-hit rate. Flat names still work for upstreams that send them.
+- **`+ Add` in the New combo dialog never added the model.** One handler served both dialogs and wrote to the *edit* form, so adding in the create dialog mutated the edit state while the create member list stayed empty — the button read as dead. The edit dialog worked, which is why the report was "sometimes". Each dialog now owns its member list.
+
 ## [1.17.5] - 2026-09-19
 
 ### Fixed
