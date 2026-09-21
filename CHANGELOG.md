@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- Raised provider connection, first-token, stream-idle, and total request timeout defaults to 15s, 60s, 300s, and 600s. Existing providers still using the old defaults are upgraded by migration 0009.
+- Distinguish total request timeout errors from stream-idle timeout errors.
+
 ## [1.17.7] - 2026-09-20
 
 ### Fixed

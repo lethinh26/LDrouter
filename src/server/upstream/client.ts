@@ -191,15 +191,18 @@ export async function callUpstreamStreaming(
   requestId = '-'
 ): Promise<{ headers: Record<string, string>; upstreamRequestId: string | null; ttftMs: number }> {
   const ctl = new AbortController();
-  const totalTimer = setTimeout(() => ctl.abort(), cfg.totalTimeoutMs);
   const start = Date.now();
   let ttft: number | null = null;
   let firstTokenTimer: ReturnType<typeof setTimeout> | null = null;
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
+  // Which watchdog aborted, so the error names the limit that was actually hit: the total
+  // timer used to surface as "stream idle timeout", which sent operators tuning the wrong knob.
+  let abortedBy: 'total' | 'idle' | 'first_token' = 'total';
+  const totalTimer = setTimeout(() => { abortedBy = 'total'; ctl.abort(); }, cfg.totalTimeoutMs);
 
   const resetIdle = () => {
     if (idleTimer) clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => ctl.abort(), cfg.streamIdleTimeoutMs);
+    idleTimer = setTimeout(() => { abortedBy = 'idle'; ctl.abort(); }, cfg.streamIdleTimeoutMs);
   };
 
   try {
@@ -216,7 +219,7 @@ export async function callUpstreamStreaming(
     }
     logUpstreamResponse(requestId, res.status, res.statusText, res.headers, Date.now() - start, '');
     // First-token watchdog
-    firstTokenTimer = setTimeout(() => ctl.abort(), cfg.firstTokenTimeoutMs);
+    firstTokenTimer = setTimeout(() => { abortedBy = 'first_token'; ctl.abort(); }, cfg.firstTokenTimeoutMs);
     resetIdle();
 
     const reader = res.body.getReader();
@@ -272,7 +275,10 @@ export async function callUpstreamStreaming(
       ...formatError(e),
     ]);
     if (err.name === 'AbortError') {
-      if (ttft === null && firstTokenTimer) {
+      if (abortedBy === 'total') {
+        throw new GatewayError('timeout_error', 'Upstream total timeout', { status: 504, cause: e });
+      }
+      if (abortedBy === 'first_token' && ttft === null) {
         throw new GatewayError('timeout_error', 'Upstream first token timeout', { status: 504, cause: e });
       }
       throw new GatewayError('timeout_error', 'Upstream stream idle timeout', { status: 504, cause: e });
