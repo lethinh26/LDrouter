@@ -1,6 +1,6 @@
 // Unit tests: circuit breaker transitions.
 import { describe, expect, it, beforeEach } from 'vitest';
-import { recordSuccess, recordFailure, getEffectiveState, halfOpenProbeAllowed } from '../../src/server/routing/circuit';
+import { recordSuccess, recordFailure, getEffectiveState, halfOpenProbeAllowed, circuitBlocks } from '../../src/server/routing/circuit';
 
 describe('circuit breaker', () => {
   beforeEach(() => { /* state is module-local; tests use unique ids */ });
@@ -36,5 +36,18 @@ describe('circuit breaker', () => {
     // Only failure categories indicating upstream health trip the circuit.
     recordFailure('p-client', 2, 60); // simulate only upstream failures recorded
     expect(getEffectiveState('p-client', 60)).toBe('closed');
+  });
+
+  it('admits a candidate once the cooldown has elapsed', async () => {
+    // Regression: candidate filtering used the raw isOpen() flag, which stays 'open'
+    // until some request walks the attempt loop to decay it — the filter prevented that
+    // request from ever being built, so the provider was unroutable until a restart and
+    // the admin test endpoint answered an empty stream.
+    recordFailure('p-block', 1, 0);
+    recordSuccess('p-block');
+    recordFailure('p-block', 1, 0);
+    expect(circuitBlocks('p-block', 3600)).toBe(true); // cooldown not yet elapsed
+    await new Promise((r) => setTimeout(r, 20));
+    expect(circuitBlocks('p-block', 0)).toBe(false); // elapsed: the probe may run
   });
 });

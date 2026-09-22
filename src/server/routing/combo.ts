@@ -54,9 +54,10 @@ export interface CandidateModel {
   providerId: string;
   enabled: boolean;
   upstreamAvailable: boolean;
+  /** Cooldown-aware: false once the breaker's cooldown has elapsed, so the half-open probe can run. */
+  circuitOpen: boolean;
   /** undefined = unknown (treated as usable); only an explicit false rejects. */
   providerEnabled?: boolean;
-  circuitOpen: boolean;
   capabilities: ModelCapabilitiesInput;
   codexAccountId?: string;
   codexChatgptAccountId?: string;

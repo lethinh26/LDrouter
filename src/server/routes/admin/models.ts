@@ -300,7 +300,9 @@ export async function registerModelRoutes(app: FastifyInstance): Promise<void> {
     } catch (e) {
       // Never let a raw non-GatewayError (e.g. MasterKeyError from credential
       // decryption) escape into the global handler as an opaque "Gateway error".
-      if (e instanceof GatewayError) throw e;
+      // The reply is hijacked, so a rethrow here cannot reach the error handler:
+      // it ends the response having sent nothing, which the UI can only report as
+      // "Stream ended unexpectedly". Report the reason over the stream instead.
       send('test_error', { message: (e as Error).message });
     } finally {
       res.end();

@@ -47,3 +47,17 @@ export function getEffectiveState(providerId: string, cooldownSeconds: number): 
 export function halfOpenProbeAllowed(providerId: string): boolean {
   return circuitState(providerId) === 'half_open';
 }
+
+/**
+ * Should the candidate filter refuse this provider outright?
+ *
+ * `isOpen()` reports the raw state, which stays `'open'` until a request walks the
+ * attempt loop — so a tripped breaker rejected every candidate for the lifetime of the
+ * process and made the provider unroutable until a restart (the combo path and the
+ * direct-model path both read the flag off the candidate record). A candidate must be
+ * allowed through once the cooldown has elapsed so the probe that closes the breaker
+ * can actually run; `getEffectiveState` is what performs that open -> half_open decay.
+ */
+export function circuitBlocks(providerId: string, cooldownSeconds: number): boolean {
+  return getEffectiveState(providerId, cooldownSeconds) === 'open';
+}

@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **A tripped provider circuit breaker locked the provider out until the process restarted.** The breaker's `open -> half_open` decay runs inside `getEffectiveState()`, which is only called from the attempt loop, but both candidate filters read the raw `isOpen()` flag instead — so once the flag was set no candidate ever reached the attempt loop that would have decayed it, and the provider answered `provider circuit is open` to every request until the container was restarted. `health_state` kept reading `healthy` throughout, so nothing in the UI showed the lockout. Live production: `code` and `qo` had each accumulated five consecutive upstream failures (a real upstream `503`) and were both in that state, while the upstream itself answered `200` to the same model and key when called directly. Candidate construction is now cooldown-aware through `circuitBlocks()`, so a candidate is admitted again as soon as the cooldown has elapsed and the half-open probe can close the breaker. Verified on a container against the released image: breaker open with the cooldown elapsed returned a zero-length `200`; with the fix it streams normally again.
+- **The admin "test model" button reported `Stream ended unexpectedly` instead of the actual reason.** The `test-stream` route hijacks the reply, so a `GatewayError` rethrown from its catch block could never reach Fastify's error handler — the response simply ended as `HTTP 200` with a zero-length body and no events, leaving the UI nothing to parse but that placeholder. The route now sends the reason as a `test_error` event. Measured on the released build with the breaker open: status `200`, `content-type` null, `body` 0 bytes; with the fix: `text/event-stream` carrying the real message.
+
 ## [1.17.8] - 2026-09-21
 
 ### Changed

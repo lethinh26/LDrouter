@@ -12,7 +12,7 @@ import { qoderAttemptFailure, qoderCredentialsFor } from '../providers/qoder/cre
 import { refreshQoderCreditsIfStale } from '../providers/qoder/credits';
 import { callQoderNonStreaming, callQoderStreaming } from '../providers/qoder/client';
 import { refreshCodexUsageIfStale } from '../providers/codex-autostart';
-import { getEffectiveState, isOpen, recordSuccess, recordFailure, halfOpenProbeAllowed } from '../routing/circuit';
+import { getEffectiveState, recordSuccess, recordFailure, halfOpenProbeAllowed, circuitBlocks } from '../routing/circuit';
 import { checkRpm, checkTpm, acquireConcurrent, releaseConcurrent } from '../routing/ratelimit';
 import { checkDailyMonthly, consumeUsage } from '../routing/quota';
 import { keyAllowedFor, type AuthenticatedKey } from '../auth/api-key';
@@ -503,7 +503,10 @@ export class GatewayRunner {
       enabled: m.enabled,
       providerEnabled: p.enabled,
       upstreamAvailable: m.upstreamAvailable,
-      circuitOpen: isOpen(m.providerId),
+      // Cooldown-aware, not the raw flag: `isOpen()` stays true until some request decays it,
+      // so a raw read here refused every candidate forever and the provider was unroutable
+      // until a restart.
+      circuitOpen: circuitBlocks(m.providerId, p.cbCooldownSeconds),
       capabilities: caps as never,
       providerType: p.type,
     };
@@ -541,6 +544,7 @@ export class GatewayRunner {
     const providers = db.select().from(schema.providers).all();
     const providerEnabled = new Map(providers.map((p) => [p.id, p.enabled]));
     const providerType = new Map(providers.map((p) => [p.id, p.type as string]));
+    const providerCooldown = new Map(providers.map((p) => [p.id, p.cbCooldownSeconds]));
     // Deliberately unfiltered: every combo member must reach selectCandidates so
     // it can report WHY it was skipped. Pre-filtering here erased the model rows
     // and turned every distinct reason into "model not found".
@@ -551,7 +555,10 @@ export class GatewayRunner {
       enabled: m.enabled,
       providerEnabled: providerEnabled.get(m.providerId),
       upstreamAvailable: m.upstreamAvailable,
-      circuitOpen: isOpen(m.providerId),
+      // Cooldown-aware: a raw `isOpen()` here froze the whole combo on one bad minute,
+      // because the flags are computed once per request while the breaker stays open
+      // until some request decays it — which this filter prevented from ever happening.
+      circuitOpen: circuitBlocks(m.providerId, providerCooldown.get(m.providerId) ?? 0),
       capabilities: safeJson(m.capabilitiesJson) as never,
       providerType: providerType.get(m.providerId),
     }));
