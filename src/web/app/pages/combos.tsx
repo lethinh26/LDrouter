@@ -5,21 +5,29 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '../..
 import { Button } from '../../components/ui/button';
 import { Input } from '../../components/ui/input';
 import { Label } from '../../components/ui/label';
+import { Badge } from '../../components/ui/badge';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../../components/ui/table';
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from '../../components/ui/dialog';
 import { Switch } from '../../components/ui/switch';
 import { api } from '../../lib/api';
 import { toast } from 'sonner';
-import { Plus, Edit, Trash2, Search, X, GripVertical } from 'lucide-react';
+import { Plus, Edit, Trash2, Search, X, GripVertical, Play, Loader2, CheckCircle2, AlertTriangle } from 'lucide-react';
 import { DndContext, KeyboardSensor, PointerSensor, closestCenter, useSensor, useSensors, type DragEndEvent } from '@dnd-kit/core';
 import { restrictToParentElement, restrictToVerticalAxis } from '@dnd-kit/modifiers';
 import { SortableContext, arrayMove, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable';
 import { cn } from '../../lib/utils';
 
 interface Combo { id: string; name: string; slug: string; publicModelId: string; enabled: boolean; memberCount: number; healthyMemberCount: number; }
-interface ComboDetail extends Combo { members: Array<{ id: string; modelId: string; publicModelId: string; displayName: string; providerSlug: string; position: number; enabled: boolean }>; }
-interface ModelRow { id: string; publicModelId: string; displayName: string; }
+interface ComboDetail extends Combo { members: Array<{ id: string; modelId: string; publicModelId: string; upstreamModelId: string; displayName: string; providerSlug: string; position: number; enabled: boolean; upstreamAvailable: boolean }>; }
+interface ModelRow { id: string; publicModelId: string; upstreamModelId: string; displayName: string; providerSlug: string; enabled: boolean; upstreamAvailable: boolean; }
 interface MemberForm { id?: string; modelId: string; position: number; enabled: boolean }
+interface ComboTestResult {
+  success: boolean;
+  text: string;
+  latencyMs: number;
+  selectedModel: { publicModelId: string; upstreamModelId: string; providerSlug: string } | null;
+  attempts: Array<{ publicModelId: string; upstreamModelId: string; providerName: string; latencyMs: number; success: boolean; failureReason: string | null }>;
+}
 
 // Priority is the array order: index 0 is tried first.
 const reindex = (members: MemberForm[]) => members.map((m, i) => ({ ...m, position: i }));
@@ -32,6 +40,8 @@ export function Combos() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [editing, setEditing] = useState(false);
+  const [testingId, setTestingId] = useState<string | null>(null);
+  const [testResult, setTestResult] = useState<ComboTestResult | null>(null);
   const [form, setForm] = useState({ name: '', slug: '', enabled: true, members: [] as MemberForm[] });
   const [editForm, setEditForm] = useState({ name: '', slug: '', enabled: true, members: [] as typeof form.members });
 
@@ -44,6 +54,17 @@ export function Combos() {
     setModels(m.models);
   };
   useEffect(() => { void reload(); }, []);
+
+  const testCombo = async (combo: Combo) => {
+    setTestingId(combo.id);
+    try {
+      setTestResult(await api.post<ComboTestResult>("/api/admin/combos/" + combo.id + "/test"));
+    } catch (e) {
+      toast.error((e as Error).message);
+    } finally {
+      setTestingId(null);
+    }
+  };
 
   const submit = async () => {
     if (form.members.length === 0) { toast.error('Add at least one member'); return; }
@@ -122,10 +143,12 @@ export function Combos() {
               <div>
                 <Label>Members — priority order · drag to reorder</Label>
                 <MemberPicker models={models} addedIds={form.members.map((m) => m.modelId)} onAdd={addMember} />
+                <RoutePreview members={form.members} modelFor={(m) => models.find((x) => x.id === m.modelId) ?? null} />
                 <MemberList
                   className="mt-2"
                   members={form.members}
                   label={(m) => models.find((x) => x.id === m.modelId)?.publicModelId ?? m.modelId}
+                  modelFor={(m) => models.find((x) => x.id === m.modelId) ?? null}
                   onChange={(members) => setForm((f) => ({ ...f, members }))}
                 />
               </div>
@@ -154,6 +177,9 @@ export function Combos() {
                   <TableCell>{c.enabled ? 'Yes' : 'No'}</TableCell>
                   <TableCell className="text-right">
                     <div className="flex items-center justify-end gap-1">
+                      <Button size="sm" variant="outline" onClick={() => void testCombo(c)} disabled={testingId === c.id}>
+                        {testingId === c.id ? <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" /> : <Play className="mr-1 h-3.5 w-3.5" />} Test
+                      </Button>
                       <Button size="sm" variant="outline" onClick={() => void openEdit(c)}><Edit className="h-3.5 w-3.5" /> Sửa</Button>
                       <Button size="sm" variant="destructive" onClick={() => del(c.id)}><Trash2 className="h-3.5 w-3.5" /> Xoá</Button>
                     </div>
@@ -176,10 +202,12 @@ export function Combos() {
             <div>
               <Label>Members — priority order · drag to reorder</Label>
               <MemberPicker models={models} addedIds={editForm.members.map((m) => m.modelId)} onAdd={addEditMember} />
+              <RoutePreview members={editForm.members} modelFor={(m) => models.find((x) => x.id === m.modelId) ?? null} />
               <MemberList
                 className="mt-2"
                 members={editForm.members}
                 label={(m) => models.find((x) => x.id === m.modelId)?.publicModelId ?? m.modelId}
+                modelFor={(m) => models.find((x) => x.id === m.modelId) ?? null}
                 onChange={(members) => setEditForm((f) => ({ ...f, members }))}
               />
             </div>
@@ -190,15 +218,82 @@ export function Combos() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <Dialog open={testResult !== null} onOpenChange={(value) => { if (!value) setTestResult(null); }}>
+        <DialogContent className="max-w-2xl">
+          <DialogHeader><DialogTitle>Combo test result</DialogTitle></DialogHeader>
+          {testResult && <ComboTestResultView result={testResult} />}
+          <DialogFooter><Button onClick={() => setTestResult(null)}>Close</Button></DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}
+
+function RoutePreview({ members, modelFor }: { members: MemberForm[]; modelFor: (member: MemberForm) => ModelRow | null }) {
+  if (members.length === 0) return null;
+  return (
+    <div className="rounded border bg-muted/20 p-2 text-xs">
+      <div className="mb-1 font-medium">Route preview <span className="font-normal text-muted-foreground">(first available member wins)</span></div>
+      <div className="space-y-1">
+        {members.map((member, index) => {
+          const model = modelFor(member);
+          return (
+            <div key={member.id ?? member.modelId} className="flex items-center gap-2 font-mono">
+              <span className="w-4 text-muted-foreground">{index + 1}.</span>
+              <span>{model?.publicModelId ?? member.modelId}</span>
+              <span className="text-muted-foreground">→ {model?.upstreamModelId ?? "upstream model unknown"}</span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function ComboTestResultView({ result }: { result: ComboTestResult }) {
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between rounded border p-3">
+        <div className="flex items-center gap-2">
+          {result.success ? <CheckCircle2 className="h-4 w-4 text-emerald-600" /> : <AlertTriangle className="h-4 w-4 text-amber-600" />}
+          <Badge variant={result.success ? "success" : "warning"}>{result.success ? "Success" : "Failed"}</Badge>
+        </div>
+        <span className="text-xs text-muted-foreground">{result.latencyMs} ms total</span>
+      </div>
+      <div>
+        <div className="mb-1 text-sm font-medium">Selected upstream</div>
+        {result.selectedModel ? (
+          <div className="rounded border bg-muted/20 p-2 font-mono text-xs">
+            {result.selectedModel.publicModelId} → {result.selectedModel.upstreamModelId}
+            <span className="ml-2 text-muted-foreground">({result.selectedModel.providerSlug})</span>
+          </div>
+        ) : <p className="text-sm text-muted-foreground">No member completed successfully.</p>}
+      </div>
+      <div>
+        <div className="mb-1 text-sm font-medium">Attempts</div>
+        <div className="space-y-1">
+          {result.attempts.map((attempt, index) => (
+            <div key={attempt.publicModelId + "-" + index} className="flex items-center gap-2 rounded border p-2 text-xs">
+              <span className="w-4 text-muted-foreground">{index + 1}.</span>
+              <span className="min-w-0 flex-1 font-mono">{attempt.publicModelId} → {attempt.upstreamModelId}</span>
+              <span className="text-muted-foreground">{attempt.latencyMs} ms</span>
+              <Badge variant={attempt.success ? "success" : "warning"}>{attempt.success ? "Used" : attempt.failureReason ?? "Skipped"}</Badge>
+            </div>
+          ))}
+        </div>
+      </div>
+      {result.text && <pre className="max-h-32 overflow-auto whitespace-pre-wrap rounded border bg-muted/20 p-2 text-xs">{result.text}</pre>}
     </div>
   );
 }
 
 // Drag-sortable member rows: the row order IS the routing priority that gets saved
 // as member.position (0 = highest priority), like the Codex account pool.
-function MemberList({ members, label, onChange, className }: {
+function MemberList({ members, label, modelFor, onChange, className }: {
   members: MemberForm[];
   label: (member: MemberForm) => string;
+  modelFor: (member: MemberForm) => ModelRow | null;
   onChange: (members: MemberForm[]) => void;
   className?: string;
 }) {
@@ -220,6 +315,7 @@ function MemberList({ members, label, onChange, className }: {
               key={m.id ?? m.modelId}
               index={i}
               label={label(m)}
+              model={modelFor(m)}
               onRemove={() => onChange(reindex(members.filter((_, j) => j !== i)))}
             />
           ))}
@@ -230,9 +326,10 @@ function MemberList({ members, label, onChange, className }: {
 }
 
 /** One member row. Separate because useSortable is a hook and must run per row. */
-function MemberRow({ index, label, onRemove }: {
+function MemberRow({ index, label, model, onRemove }: {
   index: number;
   label: string;
+  model: ModelRow | null;
   onRemove: () => void;
 }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: index });
@@ -253,7 +350,11 @@ function MemberRow({ index, label, onRemove }: {
         <GripVertical className="h-4 w-4" />
       </button>
       <span className="w-5 text-xs tabular-nums text-muted-foreground">{index + 1}</span>
-      <span className="flex-1 font-mono text-xs">{label}</span>
+      <div className="min-w-0 flex-1">
+        <div className="truncate font-mono text-xs">{label}</div>
+        <div className="truncate text-[11px] text-muted-foreground">{model?.providerSlug || "provider"} · upstream: {model?.upstreamModelId ?? "unknown"}</div>
+      </div>
+      <Badge variant={model?.enabled && model.upstreamAvailable ? "success" : "warning"}>{model?.enabled && model.upstreamAvailable ? "Ready" : "Unavailable"}</Badge>
       <Button size="sm" variant="outline" onClick={onRemove}>Remove</Button>
     </div>
   );

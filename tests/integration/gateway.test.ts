@@ -183,6 +183,31 @@ describe('gateway smoke', () => {
     expect((await chat.json()).choices[0].message.content).toBe('via combo');
   });
 
+  it("admin combo test reports the selected upstream model", async () => {
+    const db = (await import('../../src/server/db/index')).getDb();
+    const sch = await import('../../src/server/db/schema');
+    const model = db.select().from(sch.models).all().find((m) => m.publicModelId === 'mock/gpt-mock')!;
+    const created = await (await fetch(baseUrl + '/api/admin/combos', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', cookie: csrfCookies },
+      body: JSON.stringify({ name: 'combo-test', slug: 'combo-test', mode: 'fallback', members: [{ modelId: model.id, position: 0, enabled: true }] }),
+    })).json() as { id: string };
+    const { reset, pushHandler } = (await import('./_mock-control.js'));
+    reset();
+    pushHandler((_req: unknown, res: { statusCode: number; setHeader: (key: string, value: string) => void; end: (body: string) => void }, body: string) => {
+      expect(JSON.parse(body).model).toBe('gpt-mock');
+      res.statusCode = 200;
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'combo test ok' }, finish_reason: 'stop' }] }));
+    });
+    const tested = await fetch(baseUrl + '/api/admin/combos/' + created.id + '/test', { method: 'POST', headers: { cookie: csrfCookies } });
+    expect(tested.status).toBe(200);
+    const result = await tested.json() as { success: boolean; selectedModel: { publicModelId: string; upstreamModelId: string }; attempts: unknown[] };
+    expect(result.success).toBe(true);
+    expect(result.selectedModel).toMatchObject({ publicModelId: 'mock/gpt-mock', upstreamModelId: 'gpt-mock' });
+    expect(result.attempts).toHaveLength(1);
+  });
+
   it('GET /api/admin/stats returns summary, series and top tables', async () => {
     const res = await fetch(`${baseUrl}/api/admin/stats?preset=7d`, { headers: { cookie: csrfCookies } });
     expect(res.status).toBe(200);

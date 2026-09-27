@@ -8,6 +8,8 @@ import { requireAdminAuth } from '../../auth/middleware';
 import { recordAudit } from '../../db/repositories/audit';
 import { uuid } from '../../auth/ids';
 import { GatewayError } from '../../errors';
+import type { GatewayContext, GatewayRequest } from '../../gateway/runner';
+import type { CanonicalRequest } from '../../routing/capabilities';
 
 const MemberSpec = z.object({ modelId: z.string(), position: z.number().int().min(0), enabled: z.boolean().default(true) });
 
@@ -139,6 +141,8 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
       .sort((a, b) => a.position - b.position);
     const models = db.select().from(schema.models).all();
     const modelMap = new Map(models.map((m) => [m.id, m]));
+    const providers = db.select().from(schema.providers).all();
+    const providerMap = new Map(providers.map((p) => [p.id, p]));
     return {
       combo: {
         ...c,
@@ -146,12 +150,77 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
           id: m.id,
           modelId: m.modelId,
           publicModelId: modelMap.get(m.modelId)?.publicModelId ?? '',
+          upstreamModelId: modelMap.get(m.modelId)?.upstreamModelId ?? '',
           displayName: modelMap.get(m.modelId)?.displayName ?? '',
-          providerSlug: '',
+          providerSlug: providerMap.get(modelMap.get(m.modelId)?.providerId ?? '')?.slug ?? '',
           position: m.position,
           enabled: m.enabled,
+          upstreamAvailable: modelMap.get(m.modelId)?.upstreamAvailable ?? false,
         })),
       },
+    };
+  });
+
+  app.post('/api/admin/combos/:id/test', async (req) => {
+    const { id } = req.params as { id: string };
+    const db = getDb();
+    const combo = db.select().from(schema.combos).where(eq(schema.combos.id, id)).get();
+    if (!combo) throw new GatewayError('invalid_request_error', 'Combo not found', { status: 404 });
+
+    const { GatewayRunner } = await import('../../gateway/runner');
+    const runner = new GatewayRunner();
+    const canonicalReq: CanonicalRequest = {
+      model: combo.publicModelId,
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'Bạn là model gì?' }] }],
+      stream: false,
+      maxOutputTokens: 256,
+      temperature: 0.7,
+    };
+    const ctx: GatewayContext = {
+      requestId: 'combo-test-' + uuid(),
+      clientIp: req.ip,
+      protocol: 'openai',
+      endpoint: 'chat/completions',
+      requestedModel: combo.publicModelId,
+      key: null,
+      reply: { raw: {} } as never,
+    };
+    const gatewayReq: GatewayRequest = { canonical: canonicalReq, protocol: 'openai', endpoint: 'chat/completions' };
+    let outcome: Awaited<ReturnType<typeof runner.execute>>;
+    try {
+      outcome = await runner.execute(gatewayReq, ctx);
+    } catch (e) {
+      if (e instanceof GatewayError) throw e;
+      throw new GatewayError('gateway_error', (e as Error).message, { cause: e });
+    }
+
+    const models = db.select().from(schema.models).all();
+    const providers = db.select().from(schema.providers).all();
+    const modelMap = new Map(models.map((m) => [m.id, m]));
+    const providerMap = new Map(providers.map((p) => [p.id, p]));
+    const selected = outcome.attempts.find((attempt) => attempt.success);
+    const selectedModel = selected ? modelMap.get(selected.modelId) : undefined;
+    recordAudit({ action: 'combo.test', success: outcome.success, targetType: 'combo', targetId: id, targetName: combo.publicModelId, ip: req.ip });
+    return {
+      success: outcome.success,
+      text: outcome.text ?? '',
+      latencyMs: outcome.latencyMs,
+      selectedModel: selectedModel ? {
+        publicModelId: selectedModel.publicModelId,
+        upstreamModelId: selectedModel.upstreamModelId,
+        providerSlug: providerMap.get(selectedModel.providerId)?.slug ?? '',
+      } : null,
+      attempts: outcome.attempts.map((attempt) => {
+        const model = modelMap.get(attempt.modelId);
+        return {
+          publicModelId: model?.publicModelId ?? attempt.modelId,
+          upstreamModelId: model?.upstreamModelId ?? '',
+          providerName: attempt.providerName,
+          latencyMs: attempt.latencyMs,
+          success: attempt.success,
+          failureReason: attempt.failureReason,
+        };
+      }),
     };
   });
 
