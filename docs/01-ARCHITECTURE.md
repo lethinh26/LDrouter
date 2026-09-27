@@ -171,7 +171,6 @@ It is acceptable and preferred to keep these process-local in v1:
 - token buckets/rate limiter state
 - concurrency counters
 - circuit breaker state
-- weighted round-robin cursor/state
 - short-lived provider health state
 
 The SQLite configuration remains source of truth. Restarting the process may reset short-duration rate-limit/circuit state; document this behavior.

@@ -56,7 +56,7 @@ afterAll(async () => {
   try { fs.rmSync(dataDir, { recursive: true, force: true }); } catch { /* ignore */ }
 });
 
-const member = (modelId: string, position = 0) => ({ modelId, position, weight: 1, enabled: true });
+const member = (modelId: string, position = 0) => ({ modelId, position, enabled: true });
 
 const create = (body: Record<string, unknown>) =>
   fetch(`${baseUrl}/api/admin/combos`, {
@@ -104,8 +104,7 @@ describe('admin combo create', () => {
     const r = await create({ name: 'dup', members: [member(modelA, 0), member(modelA, 1)] });
     expect(r.status).toBe(400);
     expect(((await r.json()).error.message as string)).toMatch(/duplicate members/i);
-    // A repeated model across a weighted list is the same mistake.
-    const r2 = await create({ name: 'dup2', mode: 'weighted_round_robin', members: [member(modelA, 0), member(modelB, 1), member(modelA, 2)] });
+    const r2 = await create({ name: 'dup2', members: [member(modelA, 0), member(modelB, 1), member(modelA, 2)] });
     expect(r2.status).toBe(400);
     // Distinct models at the SAME position stay legal (positions are not unique).
     expect((await create({ name: 'same-pos', members: [member(modelA, 0), member(modelB, 0)] })).status).toBe(200);

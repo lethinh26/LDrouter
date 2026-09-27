@@ -116,7 +116,7 @@ describe('gateway smoke', () => {
     const model = db.select().from(sch.models).all().find((m) => m.publicModelId === 'mock/gpt-mock')!;
     const comboId = uuid();
     db.insert(sch.combos).values({ id: comboId, name: 'sol-combo', slug: 'sol-combo', publicModelId: 'combo/sol-combo', mode: 'fallback', enabled: true }).run();
-    db.insert(sch.comboMembers).values({ id: uuid(), comboId, modelId: model.id, position: 0, weight: 1, enabled: true }).run();
+    db.insert(sch.comboMembers).values({ id: uuid(), comboId, modelId: model.id, position: 0, enabled: true }).run();
     db.insert(sch.modelAliases).values({ id: uuid(), alias: 'my-alias', targetKind: 'combo', targetId: comboId, enabled: true }).run();
     // A combo with no members can never route — must not be advertised.
     db.insert(sch.combos).values({ id: uuid(), name: 'empty-combo', slug: 'empty-combo', publicModelId: 'combo/empty-combo', mode: 'fallback', enabled: true }).run();
@@ -139,7 +139,7 @@ describe('gateway smoke', () => {
     const create = async (payload: object) =>
       fetch(`${baseUrl}/api/admin/combos`, {
         method: 'POST', headers: { 'content-type': 'application/json', cookie: csrfCookies },
-        body: JSON.stringify({ mode: 'fallback', members: [{ modelId: model.id, position: 0, weight: 1, enabled: true }], ...payload }),
+        body: JSON.stringify({ mode: 'fallback', members: [{ modelId: model.id, position: 0, enabled: true }], ...payload }),
       });
 
     // No slug → public id is the normalized name, dots preserved.
@@ -388,6 +388,50 @@ describe('gateway smoke', () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.choices[0].message.content).toBe('hello');
+  });
+
+  it('combo forwards the selected model upstream ID', async () => {
+    const { reset, pushHandler } = (await import('./_mock-control.js'));
+    const { getDb, schema } = await import('../../src/server/db/index');
+    const { uuid } = await import('../../src/server/auth/ids');
+    const db = getDb();
+    const provider = db.select().from(schema.providers).all().find((p) => p.slug === 'mock')!;
+    const modelId = uuid();
+    const comboId = uuid();
+    db.insert(schema.models).values({
+      id: modelId,
+      providerId: provider.id,
+      upstreamModelId: 'test/gpt-5.5',
+      publicModelId: 'test/gpt-5.5',
+      displayName: 'Test GPT-5.5',
+      enabled: true,
+      upstreamAvailable: true,
+      capabilitiesJson: JSON.stringify({ chat: true }),
+    }).run();
+    db.insert(schema.combos).values({
+      id: comboId,
+      name: 'upstream-id-regression',
+      slug: 'upstream-id-regression',
+      publicModelId: 'combo/upstream-id-regression',
+      mode: 'fallback',
+    }).run();
+    db.insert(schema.comboMembers).values({ id: uuid(), comboId, modelId, position: 0, enabled: true }).run();
+
+    let seenModel = '';
+    reset();
+    pushHandler((_req, res, body) => {
+      seenModel = (JSON.parse(body) as { model: string }).model;
+      res.statusCode = 200;
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'combo-ok' }, finish_reason: 'stop' }] }));
+    });
+    const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey!.secret}` },
+      body: JSON.stringify({ model: 'combo/upstream-id-regression', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    expect(res.status).toBe(200);
+    expect(seenModel).toBe('test/gpt-5.5');
   });
 
   it('chat completions: streaming success', async () => {

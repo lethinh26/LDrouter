@@ -111,7 +111,7 @@ describe('a combo served by its first member is not a fallback', () => {
     const { uuid } = await import('../../src/server/auth/ids');
     const comboId = uuid();
     db.insert(sch.combos).values({ id: comboId, name: 'stats-one', slug: 'stats-one', publicModelId: 'combo/stats-one', mode: 'fallback', enabled: true }).run();
-    db.insert(sch.comboMembers).values({ id: uuid(), comboId, modelId: modelA, position: 0, weight: 1, enabled: true }).run();
+    db.insert(sch.comboMembers).values({ id: uuid(), comboId, modelId: modelA, position: 0, enabled: true }).run();
 
     const http = await import('node:http');
     const srv = http.createServer((_req, res) => {
@@ -160,8 +160,8 @@ describe('a fallback that succeeded is logged as a success', () => {
     const { uuid } = await import('../../src/server/auth/ids');
     const comboId = uuid();
     db.insert(sch.combos).values({ id: comboId, name: 'stats-fb', slug: 'stats-fb', publicModelId: 'combo/stats-fb', mode: 'fallback', enabled: true }).run();
-    db.insert(sch.comboMembers).values({ id: uuid(), comboId, modelId: modelA, position: 0, weight: 1, enabled: true }).run();
-    db.insert(sch.comboMembers).values({ id: uuid(), comboId, modelId: modelB, position: 1, weight: 1, enabled: true }).run();
+    db.insert(sch.comboMembers).values({ id: uuid(), comboId, modelId: modelA, position: 0, enabled: true }).run();
+    db.insert(sch.comboMembers).values({ id: uuid(), comboId, modelId: modelB, position: 1, enabled: true }).run();
 
     const http = await import('node:http');
     let calls = 0;

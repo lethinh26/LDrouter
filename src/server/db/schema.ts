@@ -256,7 +256,7 @@ export const combos = sqliteTable(
     name: text('name').notNull(),
     slug: text('slug').notNull().unique(),
     publicModelId: text('public_model_id').notNull().unique(),
-    mode: text('mode', { enum: ['fallback', 'weighted_round_robin'] }).notNull(),
+    mode: text('mode', { enum: ['fallback'] }).notNull(),
     enabled: integer('enabled', { mode: 'boolean' }).notNull().notNull().default(true),
     maxTotalAttempts: integer('max_total_attempts').notNull().default(3),
     fallbackOnConnection: integer('fallback_on_connection', { mode: 'boolean' }).notNull().notNull().default(true),
@@ -287,7 +287,6 @@ export const comboMembers = sqliteTable(
       .notNull()
       .references(() => models.id, { onDelete: 'restrict' }),
     position: integer('position').notNull(),
-    weight: integer('weight').notNull().default(1),
     enabled: integer('enabled', { mode: 'boolean' }).notNull().notNull().default(true),
   },
   (t) => ({

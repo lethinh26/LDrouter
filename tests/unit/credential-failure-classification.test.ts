@@ -102,7 +102,7 @@ describe('a dead credential disables the account and frees the pool', () => {
       }))[0] as never;
       const accountId = codexRepo.insertCodexAccount('cp', record);
 
-      const candidate = (id: string) => ({ modelId: 'cm', publicModelId: 'codex1/gpt', providerId: 'cp', enabled: true, upstreamAvailable: true, circuitOpen: false, capabilities: {}, providerType: 'codex' as const, codexAccountId: id, codexChatgptAccountId: 'acct-dead' });
+      const candidate = (id: string) => ({ modelId: 'cm', publicModelId: 'codex1/gpt', upstreamModelId: 'gpt', providerId: 'cp', enabled: true, upstreamAvailable: true, circuitOpen: false, capabilities: {}, providerType: 'codex' as const, codexAccountId: id, codexChatgptAccountId: 'acct-dead' });
       // Healthy and offered by the pool before the verdict.
       expect(expandCodexAccountCandidates(candidate(accountId), codexRepo.listCodexAccountsForProvider('cp'))).toHaveLength(1);
 

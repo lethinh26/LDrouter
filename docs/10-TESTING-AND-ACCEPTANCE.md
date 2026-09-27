@@ -12,7 +12,7 @@ Cover pure logic:
 - alias resolution
 - combo candidate filtering
 - fallback decision matrix
-- weighted round robin
+- ordered combo routing
 - retry/backoff calculations
 - circuit breaker transitions
 - CIDR parsing/matching IPv4 + IPv6
@@ -78,7 +78,7 @@ Critical flows:
 2. Add an OpenAI-compatible provider -> Test Connection -> Fetch Models -> select two models only -> import.
 3. Add an Anthropic-compatible provider -> fetch/select/import.
 4. Create fallback combo.
-5. Create weighted round-robin combo.
+5. Reorder combo members and confirm the saved priority is used.
 6. Create API key with model restriction, expiry, CIDR, and limits -> copy-once dialog appears.
 7. Requests page shows success/failure and expandable attempt/error detail.
 8. Statistics preset switching works.
@@ -121,9 +121,10 @@ Expected:
 - B is not selected
 - if A unavailable and no other capable member exists, gateway returns capability/unavailable error rather than routing to B
 
-### Weighted RR
+### Ordered combo routing
 
-With deterministic/injectable selection state, confirm configured weights influence routing and unavailable models are skipped.
+With deterministic member positions, confirm the first eligible model is tried first and unavailable
+models are skipped in favor of later members.
 
 ## Security acceptance
 

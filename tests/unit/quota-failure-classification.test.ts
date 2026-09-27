@@ -93,7 +93,7 @@ describe('quota failure classification', () => {
 describe('quota fallback policy', () => {
   const combo: ComboPlan = {
     comboId: 'quota-policy', mode: 'fallback', maxTotalAttempts: 3,
-    members: [{ id: 'm1', modelId: 'a', position: 0, weight: 1, enabled: true }],
+    members: [{ id: 'm1', modelId: 'a', position: 0, enabled: true }],
     trigger: { connection: true, connectTimeout: true, firstTokenTimeout: true, on408: true, on429: true, on5xx: true },
   };
 
@@ -173,8 +173,8 @@ describe('quota exhaustion disables the account and frees the pool', () => {
       });
 
       // Both accounts are healthy and offered by the pool before the verdict.
-      const codexCandidate = (id: string) => ({ modelId: 'cm', publicModelId: 'codex/gpt', providerId: 'cp', enabled: true, upstreamAvailable: true, circuitOpen: false, capabilities: {}, providerType: 'codex', codexAccountId: id, codexChatgptAccountId: 'acct-quota' });
-      const qoderCandidate = (id: string) => ({ modelId: 'qm', publicModelId: 'qoder/qmodel', providerId: 'qp', enabled: true, upstreamAvailable: true, circuitOpen: false, capabilities: {}, providerType: 'qoder', qoderAccountId: id, qoderUserId: 'u1' });
+      const codexCandidate = (id: string) => ({ modelId: 'cm', publicModelId: 'codex/gpt', upstreamModelId: 'gpt', providerId: 'cp', enabled: true, upstreamAvailable: true, circuitOpen: false, capabilities: {}, providerType: 'codex', codexAccountId: id, codexChatgptAccountId: 'acct-quota' });
+      const qoderCandidate = (id: string) => ({ modelId: 'qm', publicModelId: 'qoder/qmodel', upstreamModelId: 'qmodel', providerId: 'qp', enabled: true, upstreamAvailable: true, circuitOpen: false, capabilities: {}, providerType: 'qoder', qoderAccountId: id, qoderUserId: 'u1' });
       expect(expandCodexAccountCandidates(codexCandidate(codexId), codexRepo.listCodexAccountsForProvider('cp'))).toHaveLength(1);
       expect(expandQoderAccountCandidates(qoderCandidate(qoderId), qoderRepo.listQoderAccountsForProvider('qp'))).toHaveLength(1);
 

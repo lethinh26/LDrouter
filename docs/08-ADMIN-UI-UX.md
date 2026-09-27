@@ -138,7 +138,6 @@ Model detail/edit can override capability metadata.
 List:
 
 - public ID
-- mode
 - enabled
 - member count
 - health/eligible-member summary
@@ -152,15 +151,10 @@ Create/edit form:
 - fallback trigger policy
 - member picker
 
-Fallback mode member editor:
+Member editor:
 
 - drag/drop or explicit up/down ordering
 - numbered priority
-
-Weighted RR member editor:
-
-- weight numeric input
-- show calculated percentage as informative only
 
 Warn when member capability sets differ.
 

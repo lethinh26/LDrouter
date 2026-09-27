@@ -1,4 +1,4 @@
-// Combo routing: fallback (ordered) or weighted round-robin.
+// Combo routing: ordered fallback.
 
 import { eq } from 'drizzle-orm';
 import { getDb, schema } from '../db/index';
@@ -8,13 +8,12 @@ export interface ComboMember {
   id: string;
   modelId: string;
   position: number;
-  weight: number;
   enabled: boolean;
 }
 
 export interface ComboPlan {
   comboId: string;
-  mode: 'fallback' | 'weighted_round_robin';
+  mode: 'fallback';
   maxTotalAttempts: number;
   members: ComboMember[];
   trigger: {
@@ -34,9 +33,9 @@ export function loadCombo(comboId: string): ComboPlan | null {
   const members = db.select().from(schema.comboMembers).where(eq(schema.comboMembers.comboId, comboId)).all();
   return {
     comboId: c.id,
-    mode: c.mode,
+    mode: 'fallback',
     maxTotalAttempts: c.maxTotalAttempts,
-    members: members.map((m) => ({ id: m.id, modelId: m.modelId, position: m.position, weight: m.weight, enabled: m.enabled })),
+    members: members.map((m) => ({ id: m.id, modelId: m.modelId, position: m.position, enabled: m.enabled })),
     trigger: {
       connection: c.fallbackOnConnection,
       connectTimeout: c.fallbackOnConnectTimeout,
@@ -51,6 +50,7 @@ export function loadCombo(comboId: string): ComboPlan | null {
 export interface CandidateModel {
   modelId: string;
   publicModelId: string;
+  upstreamModelId: string;
   providerId: string;
   enabled: boolean;
   upstreamAvailable: boolean;
@@ -135,35 +135,12 @@ export function selectCandidates(
 }
 
 export function orderCandidates(combo: ComboPlan, candidates: CandidateModel[]): CandidateModel[] {
-  if (combo.mode === 'fallback') {
-    // Preserve declared position order
-    return [...candidates].sort((a, b) => {
-      const am = combo.members.find((m) => m.modelId === a.modelId);
-      const bm = combo.members.find((m) => m.modelId === b.modelId);
-      return (am?.position ?? 0) - (bm?.position ?? 0);
-    });
-  }
-  // Weighted round-robin: stable order with weighted lead bias.
-  // We rotate via a process-local cursor keyed by combo id.
-  const cursor = nextCursor(combo.comboId, combo.members, candidates);
-  return cursor;
-}
-
-const comboCursors = new Map<string, number>();
-
-function nextCursor(comboId: string, members: ComboMember[], candidates: CandidateModel[]): CandidateModel[] {
-  if (candidates.length === 0) return [];
-  // Repeat each available member according to its configured positive weight,
-  // then advance one slot per request. This is deterministic weighted RR.
-  const slots = members.flatMap((member) => {
-    const candidate = candidates.find((c) => c.modelId === member.modelId);
-    if (!candidate) return [];
-    return Array.from({ length: Math.max(1, member.weight) }, () => candidate);
+  // Preserve declared position order.
+  return [...candidates].sort((a, b) => {
+    const am = combo.members.find((m) => m.modelId === a.modelId);
+    const bm = combo.members.find((m) => m.modelId === b.modelId);
+    return (am?.position ?? 0) - (bm?.position ?? 0);
   });
-  const cur = (comboCursors.get(comboId) ?? 0) % Math.max(1, slots.length);
-  comboCursors.set(comboId, cur + 1);
-  const selected = slots[cur] ?? candidates[0]!;
-  return [selected, ...candidates.filter((candidate) => candidate !== selected)];
 }
 
 export function shouldFallback(combo: ComboPlan, reason: { type: string; status?: number }): boolean {

@@ -10,7 +10,7 @@ The primary user is usually a single person operating the gateway for a company 
 
 1. Put multiple LLM providers behind one gateway.
 2. Give every provider model a stable, collision-free public ID.
-3. Let the admin construct virtual combo models using fallback or weighted round robin.
+3. Let the admin construct ordered virtual combo models with fallback routing.
 4. Preserve streaming semantics and tool/function calling compatibility.
 5. Restrict API keys by model, expiry, IP/CIDR, request/token rate, and concurrency.
 6. Make failures diagnosable through request logs and upstream attempt logs.
@@ -117,12 +117,8 @@ Unknown capabilities must remain explicitly unknown rather than guessed. The UI 
 
 A combo is a virtual model composed only of physical models.
 
-Required routing modes:
-
-- fallback
-- weighted round robin
-
-Each combo chooses one mode independently.
+Routing is ordered fallback: the first eligible member is tried first, then later members are
+used only when the configured fallback policy allows it.
 
 A combo has a stable public ID:
 

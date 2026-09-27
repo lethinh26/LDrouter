@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { expandQoderAccountCandidates, type QoderAccountCandidate } from '../../src/server/routing/combo';
 
-const candidate = { modelId: 'm1', providerId: 'qp', publicModelId: 'qoder/qmodel_38max', enabled: true, upstreamAvailable: true, circuitOpen: false, capabilities: {}, providerType: 'qoder' };
+const candidate = { modelId: 'm1', providerId: 'qp', publicModelId: 'qoder/qmodel_38max', upstreamModelId: 'qmodel_38max', enabled: true, upstreamAvailable: true, circuitOpen: false, capabilities: {}, providerType: 'qoder' };
 const accounts: QoderAccountCandidate[] = [
   { id: 'b', qoderUserId: 'u2', enabled: true, healthState: 'healthy', priority: 2 },
   { id: 'a', qoderUserId: 'u1', enabled: true, healthState: 'healthy', priority: 1 },

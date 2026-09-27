@@ -97,7 +97,6 @@ Use mock upstreams heavily.
 - aliases
 - combos
 - fallback
-- weighted round robin
 - capability filtering
 - retry policy
 - timeout policy

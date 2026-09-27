@@ -499,6 +499,7 @@ export class GatewayRunner {
     const candidate: CandidateModel = {
       modelId: m.id,
       publicModelId: m.publicModelId,
+      upstreamModelId: m.upstreamModelId,
       providerId: m.providerId,
       enabled: m.enabled,
       providerEnabled: p.enabled,
@@ -551,6 +552,7 @@ export class GatewayRunner {
     return models.map((m) => ({
       modelId: m.id,
       publicModelId: m.publicModelId,
+      upstreamModelId: m.upstreamModelId,
       providerId: m.providerId,
       enabled: m.enabled,
       providerEnabled: providerEnabled.get(m.providerId),
@@ -586,7 +588,7 @@ export class GatewayRunner {
     cfg: ReturnType<typeof providerToUpstreamConfig>,
     ctx: GatewayContext
   ): Promise<{ statusCode: number; ttftMs: number | null; upstreamRequestId: string | null; usage: UsageSummary; result: { text: string; toolCalls: Array<{ id: string; name: string; input: unknown }>; finishReason: string | null } }> {
-    const upstreamModel = candidate.publicModelId.split('/').slice(1).join('/');
+    const upstreamModel = candidate.upstreamModelId;
     if (cfg.type === 'codex') {
       const out = await callCodexNonStreaming({ baseUrl: cfg.baseUrl, accountId: cfg.codexAccountId ?? '', accountRecordId: cfg.accountRecordId, customHeaders: cfg.customHeaders, totalTimeoutMs: cfg.totalTimeoutMs }, { ...req.canonical, model: upstreamModel });
       return { statusCode: out.status, ttftMs: null, upstreamRequestId: out.upstreamRequestId, usage: out.usage, result: { text: out.text, toolCalls: out.toolCalls, finishReason: out.finishReason } };
@@ -657,7 +659,7 @@ export class GatewayRunner {
     onStreamStart: (started: boolean) => void,
     onFirstToken: (ttftMs: number) => void
   ): Promise<{ statusCode: number; ttftMs: number | null; upstreamRequestId: string | null; usage: UsageSummary; result: { text: string; toolCalls: Array<{ id: string; name: string; input: unknown }>; finishReason: string | null } }> {
-    const upstreamModel = candidate.publicModelId.split('/').slice(1).join('/');
+    const upstreamModel = candidate.upstreamModelId;
     const encoder = req.protocol === 'openai' ? openaiStreamEncoder : anthropicStreamEncoder;
 
     // Hard streaming invariant: the client SSE head is NOT written until the

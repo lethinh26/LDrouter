@@ -28,7 +28,7 @@ export interface ModelCapabilities {
   [k: string]: boolean | number | null | undefined;
 }
 
-export type ComboMode = 'fallback' | 'weighted_round_robin';
+export type ComboMode = 'fallback';
 
 export type ContentLogMode = 'off' | 'metadata' | 'prompt' | 'prompt_and_response';
 
@@ -104,7 +104,6 @@ export interface ComboSummary {
 export interface ComboMemberSpec {
   modelId: string;
   position: number;
-  weight: number;
   enabled: boolean;
 }
 

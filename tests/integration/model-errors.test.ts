@@ -48,7 +48,7 @@ const mkCombo = (slug: string, modelIds: string[]) => {
   const id = `c${++seq}`;
   db.insert(sch.combos).values({ id, name: slug, slug, publicModelId: slug, mode: 'fallback', enabled: true, maxTotalAttempts: 3, configVersion: 1 }).run();
   modelIds.forEach((modelId, i) => {
-    db.insert(sch.comboMembers).values({ id: `cm${++seq}`, comboId: id, modelId, position: i, weight: 1, enabled: true }).run();
+    db.insert(sch.comboMembers).values({ id: `cm${++seq}`, comboId: id, modelId, position: i, enabled: true }).run();
   });
   return id;
 };

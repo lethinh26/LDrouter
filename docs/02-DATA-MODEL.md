@@ -88,7 +88,7 @@ Unique constraint on `(provider_id, upstream_model_id)`.
 - `name`
 - `slug` unique
 - `public_model_id` unique, always `combo/<slug>`
-- `mode`: `fallback | weighted_round_robin`
+- `mode`: `fallback`
 - `enabled`
 - `max_total_attempts`
 - fallback-trigger policy
@@ -101,15 +101,13 @@ Unique constraint on `(provider_id, upstream_model_id)`.
 - `combo_id`
 - `model_id`
 - `position`
-- `weight`
 - `enabled`
 
 Constraints:
 
 - model must be physical
 - no duplicate model in a combo
-- weight is positive
-- position is unique within combo for fallback ordering
+- position controls fallback ordering; the lowest position is tried first
 
 ### `qoder_accounts`
 

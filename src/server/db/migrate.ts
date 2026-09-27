@@ -209,7 +209,7 @@ function buildInitialSchemaSql(): string {
       name TEXT NOT NULL,
       slug TEXT NOT NULL UNIQUE,
       public_model_id TEXT NOT NULL UNIQUE,
-      mode TEXT NOT NULL CHECK (mode IN ('fallback','weighted_round_robin')),
+      mode TEXT NOT NULL CHECK (mode IN ('fallback')),
       enabled INTEGER NOT NULL DEFAULT 1,
       max_total_attempts INTEGER NOT NULL DEFAULT 3,
       fallback_on_connection INTEGER NOT NULL DEFAULT 1,
@@ -229,7 +229,6 @@ function buildInitialSchemaSql(): string {
       combo_id TEXT NOT NULL REFERENCES combos(id) ON DELETE CASCADE,
       model_id TEXT NOT NULL REFERENCES models(id) ON DELETE RESTRICT,
       position INTEGER NOT NULL,
-      weight INTEGER NOT NULL DEFAULT 1,
       enabled INTEGER NOT NULL DEFAULT 1
     );
     CREATE UNIQUE INDEX IF NOT EXISTS uniq_combo_model ON combo_members(combo_id, model_id);

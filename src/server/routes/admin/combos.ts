@@ -9,12 +9,12 @@ import { recordAudit } from '../../db/repositories/audit';
 import { uuid } from '../../auth/ids';
 import { GatewayError } from '../../errors';
 
-const MemberSpec = z.object({ modelId: z.string(), position: z.number().int().min(0), weight: z.number().int().min(1).default(1), enabled: z.boolean().default(true) });
+const MemberSpec = z.object({ modelId: z.string(), position: z.number().int().min(0), enabled: z.boolean().default(true) });
 
 const ComboCreate = z.object({
   name: z.string().min(1).max(128),
   slug: z.string().min(1).max(64).optional(),
-  mode: z.enum(['fallback', 'weighted_round_robin']),
+  mode: z.literal('fallback').default('fallback'),
   maxTotalAttempts: z.number().int().min(1).max(8).optional(),
   enabled: z.boolean().optional(),
   fallbackOnConnection: z.boolean().optional(),
@@ -149,7 +149,6 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
           displayName: modelMap.get(m.modelId)?.displayName ?? '',
           providerSlug: '',
           position: m.position,
-          weight: m.weight,
           enabled: m.enabled,
         })),
       },
@@ -187,7 +186,7 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
         configVersion: 1,
       }).run();
       for (const m of body.members) {
-        tx.insert(schema.comboMembers).values({ id: uuid(), comboId: id, modelId: m.modelId, position: m.position, weight: m.weight ?? 1, enabled: m.enabled ?? true }).run();
+        tx.insert(schema.comboMembers).values({ id: uuid(), comboId: id, modelId: m.modelId, position: m.position, enabled: m.enabled ?? true }).run();
       }
     });
     recordAudit({ action: 'combo.create', success: true, targetType: 'combo', targetId: id, targetName: body.name, ip: req.ip, metadata: { members: body.members.length, mode: body.mode } });
@@ -230,7 +229,7 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
         tx.update(schema.combos).set(update).where(eq(schema.combos.id, body.id)).run();
         tx.delete(schema.comboMembers).where(eq(schema.comboMembers.comboId, body.id)).run();
         for (const m of body.members!) {
-          tx.insert(schema.comboMembers).values({ id: uuid(), comboId: body.id, modelId: m.modelId, position: m.position, weight: m.weight ?? 1, enabled: m.enabled ?? true }).run();
+          tx.insert(schema.comboMembers).values({ id: uuid(), comboId: body.id, modelId: m.modelId, position: m.position, enabled: m.enabled ?? true }).run();
         }
       });
     } else {

@@ -56,14 +56,16 @@ describe('Qoder schema migration', () => {
       db.prepare('INSERT INTO schema_migrations (version, name) VALUES (1, ?)').run('initial_schema');
       db.prepare("INSERT INTO providers (id,name,slug,type,base_url,encrypted_api_key,api_key_nonce) VALUES ('p1','OpenAI','openai','openai','https://example.test','e','n')").run();
       db.prepare("INSERT INTO models (id,provider_id,upstream_model_id,public_model_id,display_name) VALUES ('m1','p1','gpt-test','openai/gpt-test','GPT')").run();
-      db.prepare("INSERT INTO combos (id,name,slug,public_model_id,mode) VALUES ('cb1','Combo','combo-a','combo-a','fallback')").run();
-      db.prepare("INSERT INTO combo_members (id,combo_id,model_id,position) VALUES ('cm1','cb1','m1',0)").run();
+      db.prepare("INSERT INTO combos (id,name,slug,public_model_id,mode) VALUES ('cb1','Combo','combo-a','combo-a','weighted_round_robin')").run();
+      db.prepare("INSERT INTO combo_members (id,combo_id,model_id,position,weight) VALUES ('cm1','cb1','m1',0,7)").run();
 
       runMigrations(db, logger, migrationsDir);
 
       expect(db.prepare("SELECT name FROM providers WHERE id='p1'").get()).toEqual({ name: 'OpenAI' });
       expect(db.prepare("SELECT provider_id FROM models WHERE id='m1'").get()).toEqual({ provider_id: 'p1' });
       expect(db.prepare("SELECT combo_id, model_id FROM combo_members WHERE id='cm1'").get()).toEqual({ combo_id: 'cb1', model_id: 'm1' });
+      expect(db.prepare("SELECT mode FROM combos WHERE id='cb1'").get()).toEqual({ mode: 'fallback' });
+      expect(db.prepare("SELECT name FROM pragma_table_info('combo_members') WHERE name='weight'").get()).toBeUndefined();
       expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
     } finally {
       db.close();

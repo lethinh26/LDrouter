@@ -6,9 +6,7 @@ import { Button } from '../../components/ui/button';
 import { Input } from '../../components/ui/input';
 import { Label } from '../../components/ui/label';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../../components/ui/table';
-import { Badge } from '../../components/ui/badge';
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from '../../components/ui/dialog';
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../../components/ui/select';
 import { Switch } from '../../components/ui/switch';
 import { api } from '../../lib/api';
 import { toast } from 'sonner';
@@ -18,13 +16,12 @@ import { restrictToParentElement, restrictToVerticalAxis } from '@dnd-kit/modifi
 import { SortableContext, arrayMove, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable';
 import { cn } from '../../lib/utils';
 
-interface Combo { id: string; name: string; slug: string; publicModelId: string; mode: string; enabled: boolean; memberCount: number; healthyMemberCount: number; }
-interface ComboDetail extends Combo { members: Array<{ id: string; modelId: string; publicModelId: string; displayName: string; providerSlug: string; position: number; weight: number; enabled: boolean }>; }
+interface Combo { id: string; name: string; slug: string; publicModelId: string; enabled: boolean; memberCount: number; healthyMemberCount: number; }
+interface ComboDetail extends Combo { members: Array<{ id: string; modelId: string; publicModelId: string; displayName: string; providerSlug: string; position: number; enabled: boolean }>; }
 interface ModelRow { id: string; publicModelId: string; displayName: string; }
-interface MemberForm { id?: string; modelId: string; position: number; weight: number; enabled: boolean }
+interface MemberForm { id?: string; modelId: string; position: number; enabled: boolean }
 
-// Priority is the array order: index 0 is tried first in fallback mode and leads
-// the rotation in weighted round-robin.
+// Priority is the array order: index 0 is tried first.
 const reindex = (members: MemberForm[]) => members.map((m, i) => ({ ...m, position: i }));
 
 export function Combos() {
@@ -35,8 +32,8 @@ export function Combos() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [editing, setEditing] = useState(false);
-  const [form, setForm] = useState({ name: '', slug: '', mode: 'fallback' as 'fallback' | 'weighted_round_robin', enabled: true, members: [] as MemberForm[] });
-  const [editForm, setEditForm] = useState({ name: '', slug: '', mode: 'fallback' as 'fallback' | 'weighted_round_robin', enabled: true, members: [] as typeof form.members });
+  const [form, setForm] = useState({ name: '', slug: '', enabled: true, members: [] as MemberForm[] });
+  const [editForm, setEditForm] = useState({ name: '', slug: '', enabled: true, members: [] as typeof form.members });
 
   const reload = async () => {
     const [c, m] = await Promise.all([
@@ -52,9 +49,9 @@ export function Combos() {
     if (form.members.length === 0) { toast.error('Add at least one member'); return; }
     setCreating(true);
     try {
-      await api.post('/api/admin/combos', { name: form.name, slug: form.slug || undefined, mode: form.mode, enabled: form.enabled, members: form.members });
+      await api.post('/api/admin/combos', { name: form.name, slug: form.slug || undefined, enabled: form.enabled, members: form.members });
       toast.success('Combo created');
-      setOpen(false); setForm({ name: '', slug: '', mode: 'fallback', enabled: true, members: [] });
+      setOpen(false); setForm({ name: '', slug: '', enabled: true, members: [] });
       void reload();
     } catch (e) { toast.error((e as Error).message); }
     finally { setCreating(false); }
@@ -73,9 +70,8 @@ export function Combos() {
         // box from `slug` made every "open edit → save" round-trip look like the
         // operator had typed a slug, which re-prefixed the model ID.
         slug: d.publicModelId.startsWith('combo/') ? d.slug : '',
-        mode: d.mode as 'fallback' | 'weighted_round_robin',
         enabled: d.enabled,
-        members: d.members.map((m) => ({ modelId: m.modelId, weight: m.weight, position: m.position, enabled: m.enabled })),
+        members: d.members.map((m) => ({ modelId: m.modelId, position: m.position, enabled: m.enabled })),
       });
       setEditOpen(true);
     } catch (e) { toast.error((e as Error).message); }
@@ -86,7 +82,7 @@ export function Combos() {
     if (editForm.members.length === 0) { toast.error('Add at least one member'); return; }
     setEditing(true);
     try {
-      await api.patch('/api/admin/combos', { id: editingId, name: editForm.name, slug: editForm.slug || undefined, mode: editForm.mode, enabled: editForm.enabled, members: editForm.members });
+      await api.patch('/api/admin/combos', { id: editingId, name: editForm.name, slug: editForm.slug || undefined, enabled: editForm.enabled, members: editForm.members });
       toast.success('Combo updated');
       setEditOpen(false); setEditingId(null);
       void reload();
@@ -99,11 +95,11 @@ export function Combos() {
   // mutated the edit form and the create list stayed empty (the button looked
   // dead). Each dialog owns its own member list.
   const addMember = (modelId: string) => {
-    setForm((f) => ({ ...f, members: reindex([...f.members, { modelId, weight: 1, position: f.members.length, enabled: true }]) }));
+    setForm((f) => ({ ...f, members: reindex([...f.members, { modelId, position: f.members.length, enabled: true }]) }));
   };
 
   const addEditMember = (modelId: string) => {
-    setEditForm((f) => ({ ...f, members: reindex([...f.members, { modelId, weight: 1, position: f.members.length, enabled: true }]) }));
+    setEditForm((f) => ({ ...f, members: reindex([...f.members, { modelId, position: f.members.length, enabled: true }]) }));
   };
 
   const del = async (id: string) => {
@@ -122,15 +118,6 @@ export function Combos() {
             <div className="space-y-3">
               <div><Label>Name</Label><Input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></div>
               <div><Label>Slug (optional — empty uses the name as the model ID)</Label><Input value={form.slug} onChange={(e) => setForm({ ...form, slug: e.target.value })} placeholder="empty → gpt-5.5 · set → combo/gpt-5.5" /></div>
-              <div><Label>Mode</Label>
-                <Select value={form.mode} onValueChange={(v) => setForm({ ...form, mode: v as 'fallback' | 'weighted_round_robin' })}>
-                  <SelectTrigger><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="fallback">Fallback (ordered)</SelectItem>
-                    <SelectItem value="weighted_round_robin">Weighted round-robin</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
               <div className="flex items-center gap-2"><Switch checked={form.enabled} onCheckedChange={(v) => setForm({ ...form, enabled: v })} /><Label>Enabled</Label></div>
               <div>
                 <Label>Members — priority order · drag to reorder</Label>
@@ -155,14 +142,13 @@ export function Combos() {
         <CardContent>
           <Table>
             <TableHeader>
-              <TableRow><TableHead>Public ID</TableHead><TableHead>Mode</TableHead><TableHead>Members</TableHead><TableHead>Healthy</TableHead><TableHead>Enabled</TableHead><TableHead /></TableRow>
+              <TableRow><TableHead>Public ID</TableHead><TableHead>Members</TableHead><TableHead>Healthy</TableHead><TableHead>Enabled</TableHead><TableHead /></TableRow>
             </TableHeader>
             <TableBody>
-              {combos.length === 0 && <TableRow><TableCell colSpan={6} className="text-center text-muted-foreground">No combos yet.</TableCell></TableRow>}
+              {combos.length === 0 && <TableRow><TableCell colSpan={5} className="text-center text-muted-foreground">No combos yet.</TableCell></TableRow>}
               {combos.map((c) => (
                 <TableRow key={c.id}>
                   <TableCell className="font-mono text-xs">{c.publicModelId}</TableCell>
-                  <TableCell><Badge variant="outline">{c.mode}</Badge></TableCell>
                   <TableCell>{c.memberCount}</TableCell>
                   <TableCell>{c.healthyMemberCount}</TableCell>
                   <TableCell>{c.enabled ? 'Yes' : 'No'}</TableCell>
@@ -186,15 +172,6 @@ export function Combos() {
           <div className="space-y-3">
             <div><Label>Name</Label><Input value={editForm.name} onChange={(e) => setEditForm({ ...editForm, name: e.target.value })} /></div>
             <div><Label>Slug (optional — leave empty to use the name as the model ID)</Label><Input value={editForm.slug} onChange={(e) => setEditForm({ ...editForm, slug: e.target.value })} placeholder="empty → gpt-5.5 · set → combo/gpt-5.5" /></div>
-            <div><Label>Mode</Label>
-              <Select value={editForm.mode} onValueChange={(v) => setEditForm({ ...editForm, mode: v as 'fallback' | 'weighted_round_robin' })}>
-                <SelectTrigger><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="fallback">Fallback (ordered)</SelectItem>
-                  <SelectItem value="weighted_round_robin">Weighted round-robin</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
             <div className="flex items-center gap-2"><Switch checked={editForm.enabled} onCheckedChange={(v) => setEditForm({ ...editForm, enabled: v })} /><Label>Enabled</Label></div>
             <div>
               <Label>Members — priority order · drag to reorder</Label>
@@ -242,9 +219,7 @@ function MemberList({ members, label, onChange, className }: {
             <MemberRow
               key={m.id ?? m.modelId}
               index={i}
-              member={m}
               label={label(m)}
-              onWeight={(weight) => onChange(members.map((mm, j) => (j === i ? { ...mm, weight } : mm)))}
               onRemove={() => onChange(reindex(members.filter((_, j) => j !== i)))}
             />
           ))}
@@ -255,11 +230,9 @@ function MemberList({ members, label, onChange, className }: {
 }
 
 /** One member row. Separate because useSortable is a hook and must run per row. */
-function MemberRow({ index, member, label, onWeight, onRemove }: {
+function MemberRow({ index, label, onRemove }: {
   index: number;
-  member: MemberForm;
   label: string;
-  onWeight: (weight: number) => void;
   onRemove: () => void;
 }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: index });
@@ -281,7 +254,6 @@ function MemberRow({ index, member, label, onWeight, onRemove }: {
       </button>
       <span className="w-5 text-xs tabular-nums text-muted-foreground">{index + 1}</span>
       <span className="flex-1 font-mono text-xs">{label}</span>
-      <Input type="number" min={1} value={member.weight} onChange={(e) => onWeight(Number(e.target.value))} className="w-20" aria-label={`Weight for ${label}`} />
       <Button size="sm" variant="outline" onClick={onRemove}>Remove</Button>
     </div>
   );

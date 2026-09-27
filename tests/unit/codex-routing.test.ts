@@ -19,11 +19,11 @@ describe('Codex account routing', () => {
   it('keeps a token-expired account (refreshable) and preserves priority order', () => {
     // An expired token is not a routing exclusion: `withCodexCredentials` refreshes before the
     // upstream call. Only disabled / down accounts drop out.
-    const result = expandCodexAccountCandidates({ modelId: 'm', publicModelId: 'codex/gpt', providerId: 'p', enabled: true, upstreamAvailable: true, circuitOpen: false, capabilities: {}, providerType: 'codex' }, accounts);
+    const result = expandCodexAccountCandidates({ modelId: 'm', publicModelId: 'codex/gpt', upstreamModelId: 'gpt', providerId: 'p', enabled: true, upstreamAvailable: true, circuitOpen: false, capabilities: {}, providerType: 'codex' }, accounts);
     expect(result.map((x) => x.codexAccountId)).toEqual(['a', 'c']);
   });
   it('does not expand non-Codex candidates', () => {
-    const candidate = { modelId: 'm', publicModelId: 'openai/gpt', providerId: 'p', enabled: true, upstreamAvailable: true, circuitOpen: false, capabilities: {}, providerType: 'openai' } as const;
+    const candidate = { modelId: 'm', publicModelId: 'openai/gpt', upstreamModelId: 'gpt', providerId: 'p', enabled: true, upstreamAvailable: true, circuitOpen: false, capabilities: {}, providerType: 'openai' } as const;
     expect(expandCodexAccountCandidates(candidate, accounts)).toEqual([candidate]);
   });
 
@@ -46,22 +46,19 @@ describe('Codex account routing', () => {
     expect(isUpstreamHealthFailure(error)).toBe(true);
   });
 
-  it('uses configured member weights for deterministic weighted selection', () => {
+  it('keeps combo members in configured priority order', () => {
     const combo: ComboPlan = {
-      comboId: 'weighted-test', mode: 'weighted_round_robin', maxTotalAttempts: 2,
+      comboId: 'ordered-test', mode: 'fallback', maxTotalAttempts: 2,
       members: [
-        { id: 'member-a', modelId: 'a', position: 0, weight: 2, enabled: true },
-        { id: 'member-b', modelId: 'b', position: 1, weight: 1, enabled: true },
+        { id: 'member-a', modelId: 'a', position: 0, enabled: true },
+        { id: 'member-b', modelId: 'b', position: 1, enabled: true },
       ],
       trigger: { connection: true, connectTimeout: true, firstTokenTimeout: true, on408: true, on429: true, on5xx: true },
     };
     const candidates = [
-      { modelId: 'a', publicModelId: 'openai/a', providerId: 'p', enabled: true, upstreamAvailable: true, circuitOpen: false, capabilities: {} },
-      { modelId: 'b', publicModelId: 'openai/b', providerId: 'p', enabled: true, upstreamAvailable: true, circuitOpen: false, capabilities: {} },
+      { modelId: 'a', publicModelId: 'openai/a', upstreamModelId: 'a', providerId: 'p', enabled: true, upstreamAvailable: true, circuitOpen: false, capabilities: {} },
+      { modelId: 'b', publicModelId: 'openai/b', upstreamModelId: 'b', providerId: 'p', enabled: true, upstreamAvailable: true, circuitOpen: false, capabilities: {} },
     ] satisfies CandidateModel[];
-    const first = orderCandidates(combo, candidates);
-    const second = orderCandidates(combo, candidates);
-    const third = orderCandidates(combo, candidates);
-    expect([first[0]?.modelId, second[0]?.modelId, third[0]?.modelId]).toEqual(['a', 'a', 'b']);
+    expect(orderCandidates(combo, candidates).map((candidate) => candidate.modelId)).toEqual(['a', 'b']);
   });
 });

@@ -55,26 +55,16 @@ Do not fallback by default:
 
 The admin UI must allow toggling retry/fallback error categories per combo/provider where sensible.
 
-## Weighted round robin
+## Ordered fallback
 
-Support positive integer weights.
-
-Example:
-
-```text
-model A weight 5
-model B weight 3
-model C weight 2
-```
-
-Long-run target distribution is approximately 50/30/20 among healthy eligible candidates.
+Combo members are tried in their saved `position` order. The first eligible member is selected;
+later members are attempted only when the configured fallback policy allows it.
 
 Requirements:
 
 - disabled/unhealthy/incompatible candidates are skipped
-- selection state is safe under concurrent requests
+- ordering is deterministic and visible in the admin UI
 - a failed first candidate may still enter fallback/retry behavior according to combo policy
-- distribution tests must avoid asserting exact order under concurrency; test statistically/deterministically through injectable routing state
 
 ## Retry policy
 
