@@ -15,8 +15,6 @@ import { registerAuditRoutes } from './admin/audit';
 import { registerSettingsRoutes } from './admin/settings';
 import { registerBackupRoutes } from './admin/backup';
 import { registerDashboardRoutes } from './admin/dashboard';
-import { registerCodexRoutes, registerCodexOAuthCallbackRoute } from './admin/codex';
-import { registerQoderRoutes } from './admin/qoder';
 
 export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
   // Setup routes are always reachable (used on first run).
@@ -28,11 +26,6 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
   // requireAdminAuth hook that the authenticated scope below adds.
   await app.register(async (instance) => {
     await registerAuthRoutes(instance);
-  });
-
-  // The Codex OAuth loopback callback is hit by the browser's redirect, so it is public too.
-  await app.register(async (instance) => {
-    await registerCodexOAuthCallbackRoute(instance);
   });
 
   // Authenticated admin routes
@@ -51,8 +44,6 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     await registerAuditRoutes(instance);
     await registerSettingsRoutes(instance);
     await registerDashboardRoutes(instance);
-    await registerCodexRoutes(instance);
-    await registerQoderRoutes(instance);
   });
 
   // Backup routes get their own scope. The first-run import (setup.tsx) must be reachable before

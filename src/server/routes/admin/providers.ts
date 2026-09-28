@@ -2,7 +2,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { sql, eq } from 'drizzle-orm';
-import { getDb, getRawDb, schema } from '../../db/index';
+import { getDb, schema } from '../../db/index';
 import { requireAdminAuth } from '../../auth/middleware';
 import { recordAudit } from '../../db/repositories/audit';
 import { encryptSecret, decryptSecret, encryptCustomHeaders, decryptCustomHeaders, isMasterKeyConfigured } from '../../auth/crypto';
@@ -10,15 +10,12 @@ import { uuid, slugify } from '../../auth/ids';
 import { GatewayError } from '../../errors';
 import type { Provider } from '../../db/schema';
 import { probeProvider, discoverProviderModels, type DiscoveredModel, type ProbeResult } from '../../providers/index';
-import { getPooledProvider } from '../../providers/pooled';
-import { redactString } from '../../security/redact';
 
 const ProviderCreate = z.object({
-  // A pool provider is nothing but a group: the admin clicks once and the server owns every field.
-  // Compatible providers still need name, endpoint, and credential up front (checked in the handler).
+  // Providers use one encrypted API key and a compatible HTTP endpoint.
   name: z.string().min(1).max(128).optional(),
   slug: z.string().min(1).max(64).optional(),
-  type: z.enum(['openai', 'anthropic', 'codex', 'qoder']),
+  type: z.enum(['openai', 'anthropic']),
   baseUrl: z.string().url().max(512).optional(),
   apiKey: z.string().min(1).max(20000).optional(),
   customHeaders: z.record(z.string(), z.string()).optional(),
@@ -60,7 +57,7 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
 
   app.get('/api/admin/providers', async () => {
     const db = getDb();
-    const providers = db.select().from(schema.providers).all();
+    const providers = db.select().from(schema.providers).all().filter((provider) => provider.type === 'openai' || provider.type === 'anthropic');
     const modelCounts = db
       .select({ providerId: schema.models.providerId, c: sql<number>`COUNT(*)` })
       .from(schema.models)
@@ -76,16 +73,12 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
 
   app.post('/api/admin/providers', async (req) => {
     const body = ProviderCreate.parse(req.body);
-    const pool = getPooledProvider(body.type);
-    const defaults = pool?.defaults;
-    const name = body.name ?? defaults?.name;
-    // Pool defaults win over the request: a stored Codex base URL pointing anywhere but
-    // chatgpt.com makes every upstream call 404 (see CODEX_BASE_URL).
-    const baseUrl = defaults?.baseUrl ?? body.baseUrl;
+    const name = body.name;
+    const baseUrl = body.baseUrl;
     if (!name) throw new GatewayError('invalid_request_error', 'Provider name is required', { status: 400 });
     // apiKey before baseUrl: a compatible provider created without either must be told the
     // credential is missing (the UI always supplies baseUrl from its dialog default).
-    if (!pool && !body.apiKey) {
+    if (!body.apiKey) {
       throw new GatewayError('invalid_request_error', 'API key is required for this provider type', { status: 400 });
     }
     if (!baseUrl) throw new GatewayError('invalid_request_error', 'Base URL is required', { status: 400 });
@@ -94,13 +87,9 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
     const slug = slugify(body.slug ?? name);
     const dup = db.select().from(schema.providers).where(eq(schema.providers.slug, slug)).get();
     if (dup) {
-      // Pool path carries the code spec §5.7 names, so the UI can render "already added".
-      if (pool) throw new GatewayError('invalid_request_error', `A ${dup.name} provider already exists ('${dup.slug}')`, { status: 400, code: 'slug_taken' });
       throw new GatewayError('invalid_request_error', `Provider slug '${slug}' is already in use`, { status: 400 });
     }
-    // A pool type has no API-key field (spec §5.7): a key sent with `{type}` must not be encrypted
-    // onto the row.
-    const enc = !pool && body.apiKey ? encryptSecret(body.apiKey) : null;
+    const enc = encryptSecret(body.apiKey);
     const headersEnc = body.customHeaders ? encryptCustomHeaders(body.customHeaders) : null;
     const id = uuid();
     db.insert(schema.providers).values({
@@ -134,12 +123,9 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
     const p = db.select().from(schema.providers).where(eq(schema.providers.id, body.id)).get();
     if (!p) throw new GatewayError('invalid_request_error', 'Provider not found', { status: 404 });
     const update: Partial<typeof schema.providers.$inferInsert> = { updatedAt: new Date().toISOString() };
-    // A pool type has no API-key field (spec §5.7). Same rule as the create path: skip the whole
-    // encryption block, so an existing key on the row is not disturbed either.
-    const pool = getPooledProvider(p.type);
     if (body.name) update.name = body.name;
     if (body.slug) update.slug = slugify(body.slug);
-    if (body.baseUrl) update.baseUrl = pool?.defaults.baseUrl ?? body.baseUrl;
+    if (body.baseUrl) update.baseUrl = body.baseUrl;
     if (body.enabled !== undefined) update.enabled = body.enabled;
     if (body.connectTimeoutMs !== undefined) update.connectTimeoutMs = body.connectTimeoutMs;
     if (body.firstTokenTimeoutMs !== undefined) update.firstTokenTimeoutMs = body.firstTokenTimeoutMs;
@@ -148,7 +134,7 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
     if (body.maxRetries !== undefined) update.maxRetries = body.maxRetries;
     if (body.cbFailureThreshold !== undefined) update.cbFailureThreshold = body.cbFailureThreshold;
     if (body.cbCooldownSeconds !== undefined) update.cbCooldownSeconds = body.cbCooldownSeconds;
-    if (body.apiKey && !pool) {
+    if (body.apiKey) {
       const enc = encryptSecret(body.apiKey);
       update.encryptedApiKey = enc.ciphertext;
       update.apiKeyNonce = enc.nonce;
@@ -176,23 +162,13 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
       recordAudit({ action: 'provider.soft_disable', success: true, targetType: 'provider', targetId: id, targetName: p.name, ip: req.ip });
       return { ok: true, softDisabled: true };
     }
-    // A pool provider owns its account pool. <table>.provider_id is ON DELETE RESTRICT, so the
-    // accounts must go in the same transaction or the delete fails with a raw SQLite constraint
-    // error (which surfaces as an opaque 500 "Gateway error").
-    const pool = getPooledProvider(p.type);
-    let pooledAccountsDeleted = 0;
     try {
-      getRawDb().transaction(() => {
-        // pool.accountsTable is a fixed registry literal, never user input.
-        if (pool) pooledAccountsDeleted = getRawDb().prepare(`DELETE FROM ${pool.accountsTable} WHERE provider_id=?`).run(id).changes;
-        db.delete(schema.providers).where(eq(schema.providers.id, id)).run();
-      })();
+      db.delete(schema.providers).where(eq(schema.providers.id, id)).run();
     } catch (error) {
       throw new GatewayError('invalid_request_error', 'Provider is still referenced and cannot be deleted', { status: 409, cause: error });
     }
-    recordAudit({ action: 'provider.delete', success: true, targetType: 'provider', targetId: id, targetName: p.name, ip: req.ip, metadata: { pooledAccountsDeleted } });
-    // codexAccountsDeleted kept: pre-existing clients and tests read that field name.
-    return { ok: true, pooledAccountsDeleted, codexAccountsDeleted: pooledAccountsDeleted };
+    recordAudit({ action: 'provider.delete', success: true, targetType: 'provider', targetId: id, targetName: p.name, ip: req.ip });
+    return { ok: true };
   });
 
   app.post('/api/admin/providers/:id/test', async (req) => {
@@ -200,13 +176,6 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
     const db = getDb();
     const p = db.select().from(schema.providers).where(eq(schema.providers.id, id)).get();
     if (!p) throw new GatewayError('invalid_request_error', 'Provider not found', { status: 404 });
-    const pool = getPooledProvider(p.type);
-    if (pool) {
-      const result = await pool.probe({ id: p.id, baseUrl: p.baseUrl, totalTimeoutMs: p.totalTimeoutMs });
-      db.update(schema.providers).set({ healthState: result.ok ? 'healthy' : 'down', updatedAt: new Date().toISOString() }).where(eq(schema.providers.id, id)).run();
-      recordAudit({ action: 'provider.test', success: result.ok, targetType: 'provider', targetId: id, targetName: p.name, ip: req.ip, metadata: { detail: redactString(result.detail) } });
-      return { ...result, detail: redactString(result.detail) };
-    }
     if (!p.encryptedApiKey || !p.apiKeyNonce) throw new GatewayError('invalid_request_error', 'Provider credentials are missing', { status: 501 });
     const apiKey = decryptSecret({ ciphertext: p.encryptedApiKey, nonce: p.apiKeyNonce, version: p.apiKeyVersion });
     const headers = decryptCustomHeaders(p.customHeadersEncrypted && p.customHeadersNonce ? { ciphertext: p.customHeadersEncrypted, nonce: p.customHeadersNonce, version: 1 } : null);
@@ -233,22 +202,17 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
     const p = db.select().from(schema.providers).where(eq(schema.providers.id, id)).get();
     if (!p) throw new GatewayError('invalid_request_error', 'Provider not found', { status: 404 });
     let discovered: DiscoveredModel[];
-    const pool = getPooledProvider(p.type);
-    if (pool) {
-      discovered = await pool.discover({ id: p.id, baseUrl: p.baseUrl, totalTimeoutMs: p.totalTimeoutMs });
-    } else {
-      if (!p.encryptedApiKey || !p.apiKeyNonce) throw new GatewayError('invalid_request_error', 'Provider credentials are missing', { status: 501 });
-      const apiKey = decryptSecret({ ciphertext: p.encryptedApiKey, nonce: p.apiKeyNonce, version: p.apiKeyVersion });
-      const headers = decryptCustomHeaders(p.customHeadersEncrypted && p.customHeadersNonce ? { ciphertext: p.customHeadersEncrypted, nonce: p.customHeadersNonce, version: 1 } : null);
-      discovered = await discoverProviderModels({
+    if (!p.encryptedApiKey || !p.apiKeyNonce) throw new GatewayError('invalid_request_error', 'Provider credentials are missing', { status: 501 });
+    const apiKey = decryptSecret({ ciphertext: p.encryptedApiKey, nonce: p.apiKeyNonce, version: p.apiKeyVersion });
+    const headers = decryptCustomHeaders(p.customHeadersEncrypted && p.customHeadersNonce ? { ciphertext: p.customHeadersEncrypted, nonce: p.customHeadersNonce, version: 1 } : null);
+    discovered = await discoverProviderModels({
       type: p.type,
       baseUrl: p.baseUrl,
       apiKey,
       customHeaders: headers,
       connectTimeoutMs: 5000,
       totalTimeoutMs: 30000,
-      } as never);
-    }
+    } as never);
     const existing = db
       .select()
       .from(schema.models)

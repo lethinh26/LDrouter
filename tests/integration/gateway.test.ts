@@ -285,6 +285,9 @@ describe('gateway smoke', () => {
     const metaDetail = await detailOfLatest();
     expect(metaDetail.request.requestPayload).toBeNull();
     expect(metaDetail.request.responsePayload).toBeNull();
+      expect(metaDetail.request.reproductionCurl).toContain('ld-REPLACE_WITH_KEY');
+      expect(metaDetail.request.finalModelUpstreamId).toBe('gpt-mock');
+      expect(metaDetail.request.providerName).toBeTruthy();
 
     // restore default
     await setMode('metadata');

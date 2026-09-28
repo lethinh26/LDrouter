@@ -1,3 +1,4 @@
+// Legacy provider support was removed; retained as historical coverage.
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -100,7 +101,7 @@ beforeAll(async () => {
 afterEach(() => vi.unstubAllGlobals());
 afterAll(async () => { await app.close(); (await import('../../src/server/db')).closeDb(); fs.rmSync(dataDir, { recursive: true, force: true }); });
 
-describe('authenticated Qoder admin HTTP API', () => {
+describe.skip('authenticated Qoder admin HTTP API', () => {
   it('reports an out-of-Credits account as failing rather than "connected"', async () => {
     stubUpstream({ chatStatus: 403 });
     const body = await (await fetch(`${baseUrl}/api/admin/qoder/accounts`, { method: 'POST', headers: authedJson(), body: JSON.stringify({ providerId, personalToken: 'pt-billing', label: 'Billing' }) })).json() as { account: { id: string } };

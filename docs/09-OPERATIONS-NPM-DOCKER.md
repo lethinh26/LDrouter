@@ -40,13 +40,9 @@ latedev-router --host 0.0.0.0 --port 8787
 
 The package build runs `build:web` before `build:server`; `dist/cli.js`, the server bundle, `dist/web` static assets, and root `migrations/` are included in the npm tarball. Verify the file list with `npm pack --dry-run`.
 
-## Codex OAuth operations
+## Retired provider integrations
 
-Create a **Codex** provider in the admin UI without an API key, then import a Codex OAuth `auth.json` as JSON, a JSON array, an `{ "accounts": [...] }` wrapper, or JSONL. Use the preview to inspect masked identity/expiry fields before selecting records. Account/workspace identity is provider-scoped for deduplication; email alone is not an identity key. Re-import updates encrypted credentials without resetting an administrator's enabled/disabled choice.
-
-`LATEDEV_MASTER_KEY` is required to encrypt Codex access, refresh, and optional ID tokens. Tokens are decrypted only immediately before an upstream call and are never returned by the API, rendered by the UI, written to logs/audit metadata, or included in backups. Refresh runs near expiry and once after a 401/403; rotated tokens are persisted atomically. The import endpoint is admin-session and CSRF protected (`x-csrf-token`).
-
-ZIP import and automatic Codex CLI config generation or mutation are deliberately unsupported in this release. The application never edits Codex CLI configuration files. The account **Test** action is a known limitation and returns sanitized HTTP 501 (`not_implemented`) without an upstream call or account-state mutation; normal routed requests are supported.
+Codex and Qoder provider integrations are no longer available in the admin UI or gateway. Existing provider/account tables and migrations remain only so upgrades preserve historical data; legacy providers are hidden from provider management and routed requests fail closed.
 
 ### Backup and restore
 

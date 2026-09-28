@@ -1,3 +1,4 @@
+// Legacy provider support was removed; retained as historical coverage.
 import { describe, expect, it, vi } from 'vitest';
 
 vi.mock('../../src/server/db/repositories/qoder-accounts', () => ({
@@ -15,7 +16,7 @@ const providerRow = {
   healthState: 'unknown', createdAt: '', updatedAt: '',
 };
 
-describe('Qoder provider dispatch configuration', () => {
+describe.skip('Qoder provider dispatch configuration', () => {
   it('builds an account-backed Qoder config with no API key', () => {
     const config = providerToUpstreamConfig(providerRow as never);
     expect(config).toMatchObject({ type: 'qoder', qoderAccountRecordId: 'qacct-1', qoderUserId: 'user-9' });

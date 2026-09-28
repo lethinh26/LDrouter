@@ -8,6 +8,7 @@ import { Label } from '../../components/ui/label';
 import { Badge } from '../../components/ui/badge';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../../components/ui/table';
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from '../../components/ui/dialog';
+import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from '../../components/ui/alert-dialog';
 import { Switch } from '../../components/ui/switch';
 import { api } from '../../lib/api';
 import { toast } from 'sonner';
@@ -17,9 +18,9 @@ import { restrictToParentElement, restrictToVerticalAxis } from '@dnd-kit/modifi
 import { SortableContext, arrayMove, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable';
 import { cn } from '../../lib/utils';
 
-interface Combo { id: string; name: string; slug: string; publicModelId: string; enabled: boolean; memberCount: number; healthyMemberCount: number; }
-interface ComboDetail extends Combo { members: Array<{ id: string; modelId: string; publicModelId: string; upstreamModelId: string; displayName: string; providerSlug: string; position: number; enabled: boolean; upstreamAvailable: boolean }>; }
-interface ModelRow { id: string; publicModelId: string; upstreamModelId: string; displayName: string; providerSlug: string; enabled: boolean; upstreamAvailable: boolean; }
+interface Combo { id: string; name: string; slug: string; publicModelId: string; enabled: boolean; memberCount: number; healthyMemberCount: number; status: string; unavailableReasons: string[]; capabilityWarnings: string[]; }
+interface ComboDetail extends Combo { maxTotalAttempts: number; fallbackOnConnection: boolean; fallbackOnConnectTimeout: boolean; fallbackOnFirstTokenTimeout: boolean; fallbackOn408: boolean; fallbackOn429: boolean; fallbackOn5xx: boolean; members: Array<{ id: string; modelId: string; publicModelId: string; upstreamModelId: string; displayName: string; providerSlug: string; position: number; enabled: boolean; upstreamAvailable: boolean; providerEnabled: boolean; providerHealth: string; circuitOpen: boolean; capabilities: Record<string, unknown>; status: { state: string; reason: string } }>; capabilityWarnings: string[]; }
+interface ModelRow { id: string; publicModelId: string; upstreamModelId: string; displayName: string; providerSlug: string; enabled: boolean; upstreamAvailable: boolean; providerEnabled: boolean; providerHealth: string; circuitOpen: boolean; capabilities: Record<string, unknown>; }
 interface MemberForm { id?: string; modelId: string; position: number; enabled: boolean }
 interface ComboTestResult {
   success: boolean;
@@ -28,6 +29,10 @@ interface ComboTestResult {
   selectedModel: { publicModelId: string; upstreamModelId: string; providerSlug: string } | null;
   attempts: Array<{ publicModelId: string; upstreamModelId: string; providerName: string; latencyMs: number; success: boolean; failureReason: string | null }>;
 }
+
+type ComboSettings = { maxTotalAttempts: number; fallbackOnConnection: boolean; fallbackOnConnectTimeout: boolean; fallbackOnFirstTokenTimeout: boolean; fallbackOn408: boolean; fallbackOn429: boolean; fallbackOn5xx: boolean };
+const defaultComboSettings: ComboSettings = { maxTotalAttempts: 3, fallbackOnConnection: true, fallbackOnConnectTimeout: true, fallbackOnFirstTokenTimeout: true, fallbackOn408: true, fallbackOn429: true, fallbackOn5xx: true };
+const reasonLabels: Record<string, string> = { member_disabled: 'member disabled', model_missing: 'model missing', provider_disabled: 'provider disabled', provider_down: 'provider down', model_disabled: 'model disabled', upstream_unavailable: 'upstream unavailable', circuit_open: 'circuit open', chat_capability_unavailable: 'chat capability unavailable' };
 
 // Priority is the array order: index 0 is tried first.
 const reindex = (members: MemberForm[]) => members.map((m, i) => ({ ...m, position: i }));
@@ -42,8 +47,9 @@ export function Combos() {
   const [editing, setEditing] = useState(false);
   const [testingId, setTestingId] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<ComboTestResult | null>(null);
-  const [form, setForm] = useState({ name: '', slug: '', enabled: true, members: [] as MemberForm[] });
-  const [editForm, setEditForm] = useState({ name: '', slug: '', enabled: true, members: [] as typeof form.members });
+  const [form, setForm] = useState({ name: '', slug: '', enabled: true, ...defaultComboSettings, members: [] as MemberForm[] });
+  const [editForm, setEditForm] = useState({ name: '', slug: '', enabled: true, ...defaultComboSettings, members: [] as typeof form.members });
+  const [deleting, setDeleting] = useState<Combo | null>(null);
 
   const reload = async () => {
     const [c, m] = await Promise.all([
@@ -70,9 +76,9 @@ export function Combos() {
     if (form.members.length === 0) { toast.error('Add at least one member'); return; }
     setCreating(true);
     try {
-      await api.post('/api/admin/combos', { name: form.name, slug: form.slug || undefined, enabled: form.enabled, members: form.members });
+      await api.post('/api/admin/combos', { name: form.name, slug: form.slug || undefined, enabled: form.enabled, ...editSettings(form), members: form.members });
       toast.success('Combo created');
-      setOpen(false); setForm({ name: '', slug: '', enabled: true, members: [] });
+      setOpen(false); setForm({ name: '', slug: '', enabled: true, ...defaultComboSettings, members: [] });
       void reload();
     } catch (e) { toast.error((e as Error).message); }
     finally { setCreating(false); }
@@ -92,6 +98,13 @@ export function Combos() {
         // operator had typed a slug, which re-prefixed the model ID.
         slug: d.publicModelId.startsWith('combo/') ? d.slug : '',
         enabled: d.enabled,
+        maxTotalAttempts: d.maxTotalAttempts,
+        fallbackOnConnection: d.fallbackOnConnection,
+        fallbackOnConnectTimeout: d.fallbackOnConnectTimeout,
+        fallbackOnFirstTokenTimeout: d.fallbackOnFirstTokenTimeout,
+        fallbackOn408: d.fallbackOn408,
+        fallbackOn429: d.fallbackOn429,
+        fallbackOn5xx: d.fallbackOn5xx,
         members: d.members.map((m) => ({ modelId: m.modelId, position: m.position, enabled: m.enabled })),
       });
       setEditOpen(true);
@@ -103,7 +116,7 @@ export function Combos() {
     if (editForm.members.length === 0) { toast.error('Add at least one member'); return; }
     setEditing(true);
     try {
-      await api.patch('/api/admin/combos', { id: editingId, name: editForm.name, slug: editForm.slug || undefined, enabled: editForm.enabled, members: editForm.members });
+      await api.patch('/api/admin/combos', { id: editingId, name: editForm.name, slug: editForm.slug || undefined, enabled: editForm.enabled, ...editSettings(editForm), members: editForm.members });
       toast.success('Combo updated');
       setEditOpen(false); setEditingId(null);
       void reload();
@@ -124,8 +137,7 @@ export function Combos() {
   };
 
   const del = async (id: string) => {
-    if (!confirm('Delete this combo?')) return;
-    try { await api.del(`/api/admin/combos/${id}`); toast.success('Combo removed'); void reload(); }
+    try { await api.del(`/api/admin/combos/${id}`); toast.success('Combo removed'); setDeleting(null); void reload(); }
     catch (e) { toast.error((e as Error).message); }
   };
 
@@ -134,16 +146,17 @@ export function Combos() {
       <PageHeader title="Combos" description="Virtual models combining physical models" actions={
         <Dialog open={open} onOpenChange={setOpen}>
           <DialogTrigger asChild><Button><Plus className="mr-1 h-4 w-4" /> New combo</Button></DialogTrigger>
-          <DialogContent className="max-w-2xl">
+          <DialogContent className="max-h-[calc(100vh-2rem)] max-w-2xl grid-rows-[auto_minmax(0,1fr)_auto] overflow-hidden">
             <DialogHeader><DialogTitle>New combo</DialogTitle></DialogHeader>
-            <div className="space-y-3">
+            <div className="min-h-0 space-y-3 overflow-y-auto pr-1">
               <div><Label>Name</Label><Input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></div>
               <div><Label>Slug (optional — empty uses the name as the model ID)</Label><Input value={form.slug} onChange={(e) => setForm({ ...form, slug: e.target.value })} placeholder="empty → gpt-5.5 · set → combo/gpt-5.5" /></div>
               <div className="flex items-center gap-2"><Switch checked={form.enabled} onCheckedChange={(v) => setForm({ ...form, enabled: v })} /><Label>Enabled</Label></div>
+               <ComboSettingsFields value={form} onChange={(patch) => setForm((current) => ({ ...current, ...patch }))} />
               <div>
                 <Label>Members — priority order · drag to reorder</Label>
                 <MemberPicker models={models} addedIds={form.members.map((m) => m.modelId)} onAdd={addMember} />
-                <RoutePreview members={form.members} modelFor={(m) => models.find((x) => x.id === m.modelId) ?? null} />
+               <RoutePreview members={form.members} modelFor={(m) => models.find((x) => x.id === m.modelId) ?? null} />
                 <MemberList
                   className="mt-2"
                   members={form.members}
@@ -165,7 +178,7 @@ export function Combos() {
         <CardContent>
           <Table>
             <TableHeader>
-              <TableRow><TableHead>Public ID</TableHead><TableHead>Members</TableHead><TableHead>Healthy</TableHead><TableHead>Enabled</TableHead><TableHead /></TableRow>
+               <TableRow><TableHead>Public ID</TableHead><TableHead>Members</TableHead><TableHead>Status</TableHead><TableHead>Enabled</TableHead><TableHead /></TableRow>
             </TableHeader>
             <TableBody>
               {combos.length === 0 && <TableRow><TableCell colSpan={5} className="text-center text-muted-foreground">No combos yet.</TableCell></TableRow>}
@@ -173,15 +186,15 @@ export function Combos() {
                 <TableRow key={c.id}>
                   <TableCell className="font-mono text-xs">{c.publicModelId}</TableCell>
                   <TableCell>{c.memberCount}</TableCell>
-                  <TableCell>{c.healthyMemberCount}</TableCell>
+                   <TableCell><Badge variant={c.status === 'ready' ? 'success' : c.status === 'disabled' ? 'secondary' : 'destructive'}>{c.healthyMemberCount}/{c.memberCount} ready</Badge>{c.capabilityWarnings.length > 0 && <div className="text-xs text-amber-600">Capability metadata differs</div>}{c.status === 'unavailable' && c.unavailableReasons.length > 0 && <div className="text-xs text-muted-foreground">{c.unavailableReasons.map((reason) => reasonLabels[reason] ?? reason).join(', ')}</div>}</TableCell>
                   <TableCell>{c.enabled ? 'Yes' : 'No'}</TableCell>
                   <TableCell className="text-right">
                     <div className="flex items-center justify-end gap-1">
-                      <Button size="sm" variant="outline" onClick={() => void testCombo(c)} disabled={testingId === c.id}>
+                       <Button size="sm" variant="outline" title="Sends a real non-streaming inference request" onClick={() => void testCombo(c)} disabled={testingId === c.id}>
                         {testingId === c.id ? <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" /> : <Play className="mr-1 h-3.5 w-3.5" />} Test
                       </Button>
                       <Button size="sm" variant="outline" onClick={() => void openEdit(c)}><Edit className="h-3.5 w-3.5" /> Sửa</Button>
-                      <Button size="sm" variant="destructive" onClick={() => del(c.id)}><Trash2 className="h-3.5 w-3.5" /> Xoá</Button>
+                       <Button size="sm" variant="destructive" onClick={() => setDeleting(c)}><Trash2 className="h-3.5 w-3.5" /> Delete</Button>
                     </div>
                   </TableCell>
                 </TableRow>
@@ -193,16 +206,17 @@ export function Combos() {
 
       {/* Edit combo dialog */}
       <Dialog open={editOpen} onOpenChange={setEditOpen}>
-        <DialogContent className="max-w-2xl">
+        <DialogContent className="max-h-[calc(100vh-2rem)] max-w-2xl grid-rows-[auto_minmax(0,1fr)_auto] overflow-hidden">
           <DialogHeader><DialogTitle>Edit combo</DialogTitle></DialogHeader>
-          <div className="space-y-3">
+          <div className="min-h-0 space-y-3 overflow-y-auto pr-1">
             <div><Label>Name</Label><Input value={editForm.name} onChange={(e) => setEditForm({ ...editForm, name: e.target.value })} /></div>
             <div><Label>Slug (optional — leave empty to use the name as the model ID)</Label><Input value={editForm.slug} onChange={(e) => setEditForm({ ...editForm, slug: e.target.value })} placeholder="empty → gpt-5.5 · set → combo/gpt-5.5" /></div>
             <div className="flex items-center gap-2"><Switch checked={editForm.enabled} onCheckedChange={(v) => setEditForm({ ...editForm, enabled: v })} /><Label>Enabled</Label></div>
+               <ComboSettingsFields value={editForm} onChange={(patch) => setEditForm((current) => ({ ...current, ...patch }))} />
             <div>
               <Label>Members — priority order · drag to reorder</Label>
               <MemberPicker models={models} addedIds={editForm.members.map((m) => m.modelId)} onAdd={addEditMember} />
-              <RoutePreview members={editForm.members} modelFor={(m) => models.find((x) => x.id === m.modelId) ?? null} />
+               <RoutePreview members={editForm.members} modelFor={(m) => models.find((x) => x.id === m.modelId) ?? null} />
               <MemberList
                 className="mt-2"
                 members={editForm.members}
@@ -221,20 +235,39 @@ export function Combos() {
 
       <Dialog open={testResult !== null} onOpenChange={(value) => { if (!value) setTestResult(null); }}>
         <DialogContent className="max-w-2xl">
-          <DialogHeader><DialogTitle>Combo test result</DialogTitle></DialogHeader>
+           <DialogHeader><DialogTitle>Combo test result</DialogTitle><p className="text-sm text-muted-foreground">Test sends a real non-streaming inference request through this combo.</p></DialogHeader>
           {testResult && <ComboTestResultView result={testResult} />}
           <DialogFooter><Button onClick={() => setTestResult(null)}>Close</Button></DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <AlertDialog open={deleting !== null} onOpenChange={(value) => { if (!value) setDeleting(null); }}>
+        <AlertDialogContent>
+          <AlertDialogHeader><AlertDialogTitle>Delete combo?</AlertDialogTitle><AlertDialogDescription>This removes the virtual model and its ordered fallback configuration. Request history is preserved.</AlertDialogDescription></AlertDialogHeader>
+          <AlertDialogFooter><AlertDialogCancel>Cancel</AlertDialogCancel><AlertDialogAction onClick={() => deleting && void del(deleting.id)}>Delete</AlertDialogAction></AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }
 
+function editSettings(value: ComboSettings): ComboSettings { return value; }
+
+function ComboSettingsFields({ value, onChange }: { value: ComboSettings; onChange: (patch: Partial<ComboSettings>) => void }) {
+  const triggers: Array<[keyof ComboSettings, string]> = [
+    ['fallbackOnConnection', 'Connection failure'], ['fallbackOnConnectTimeout', 'Connect timeout'], ['fallbackOnFirstTokenTimeout', 'First-token timeout'], ['fallbackOn408', 'HTTP 408'], ['fallbackOn429', 'HTTP 429'], ['fallbackOn5xx', 'HTTP 5xx'],
+  ];
+  return <div className="rounded border bg-muted/20 p-3"><div className="mb-2 text-sm font-medium">Fallback policy</div><div className="grid gap-3 sm:grid-cols-[10rem_1fr]"><div><Label>Max total attempts</Label><Input type="number" min={1} max={8} value={value.maxTotalAttempts} onChange={(e) => onChange({ maxTotalAttempts: Math.min(8, Math.max(1, Number(e.target.value) || 1)) })} /></div><div className="grid gap-2 sm:grid-cols-2">{triggers.map(([key, label]) => <label key={key} className="flex items-center gap-2 text-xs"><Switch checked={Boolean(value[key])} onCheckedChange={(checked) => onChange({ [key]: checked })} /><span>{label}</span></label>)}</div></div></div>;
+}
+
 function RoutePreview({ members, modelFor }: { members: MemberForm[]; modelFor: (member: MemberForm) => ModelRow | null }) {
   if (members.length === 0) return null;
+  const selected = members.map(modelFor).filter((model): model is ModelRow => Boolean(model));
+  const capabilityWarnings = ['chat', 'streaming', 'tools', 'structured_output', 'image_input', 'reasoning'].filter((key) => new Set(selected.map((model) => model.capabilities[key] === true ? 'yes' : model.capabilities[key] === false ? 'no' : 'unknown')).size > 1);
   return (
     <div className="rounded border bg-muted/20 p-2 text-xs">
       <div className="mb-1 font-medium">Route preview <span className="font-normal text-muted-foreground">(first available member wins)</span></div>
+      {capabilityWarnings.length > 0 && <div className="mb-2 flex items-center gap-1 text-amber-600"><AlertTriangle className="h-3.5 w-3.5" /> Members differ on: {capabilityWarnings.join(', ')}</div>}
       <div className="space-y-1">
         {members.map((member, index) => {
           const model = modelFor(member);
@@ -354,7 +387,7 @@ function MemberRow({ index, label, model, onRemove }: {
         <div className="truncate font-mono text-xs">{label}</div>
         <div className="truncate text-[11px] text-muted-foreground">{model?.providerSlug || "provider"} · upstream: {model?.upstreamModelId ?? "unknown"}</div>
       </div>
-      <Badge variant={model?.enabled && model.upstreamAvailable ? "success" : "warning"}>{model?.enabled && model.upstreamAvailable ? "Ready" : "Unavailable"}</Badge>
+       <Badge variant={model && model.enabled && model.providerEnabled && model.providerHealth !== 'down' && model.providerHealth !== 'circuit_open' && !model.circuitOpen && model.upstreamAvailable && model.capabilities.chat !== false ? "success" : "warning"}>{model && model.enabled && model.providerEnabled && model.providerHealth !== 'down' && model.providerHealth !== 'circuit_open' && !model.circuitOpen && model.upstreamAvailable && model.capabilities.chat !== false ? "Ready" : "Unavailable"}</Badge>
       <Button size="sm" variant="outline" onClick={onRemove}>Remove</Button>
     </div>
   );

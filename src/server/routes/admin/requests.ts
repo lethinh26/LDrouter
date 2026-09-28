@@ -12,8 +12,8 @@ type RequestRow = typeof schema.requests.$inferSelect;
 
 interface SummaryMaps {
   keyMap: Map<string, { name: string }>;
-  modelMap: Map<string, { providerId: string | null; publicModelId: string }>;
-  providerMap: Map<string, { name: string; type: string }>;
+  modelMap: Map<string, { providerId: string | null; publicModelId: string; upstreamModelId: string }>;
+  providerMap: Map<string, { name: string; slug: string; type: string }>;
 }
 
 export function loadSummaryMaps(): SummaryMaps {
@@ -45,9 +45,12 @@ export function toSummary(r: RequestRow, maps: SummaryMaps): RequestLogSummary {
     endpoint: r.endpoint,
     requestedModel: r.requestedModel,
     resolvedTargetKind: r.resolvedTargetKind,
+    resolvedTargetId: r.resolvedTargetId,
     finalModelPublicId: finalModel?.publicModelId ?? null,
+    finalModelUpstreamId: finalModel?.upstreamModelId ?? null,
     providerId: provider ? finalModel!.providerId : null,
     providerName: provider?.name ?? null,
+    providerSlug: provider?.slug ?? null,
     providerType: provider?.type ?? null,
     streaming: Boolean(r.streaming),
     httpStatus: r.httpStatus,
@@ -65,6 +68,27 @@ export function toSummary(r: RequestRow, maps: SummaryMaps): RequestLogSummary {
     errorMessage: r.errorMessage ?? null,
     gatewayCacheHit: Boolean(r.gatewayCacheHit),
   } satisfies RequestLogSummary as RequestLogSummary;
+}
+
+function quoteCurlJson(value: string): string {
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+function buildReproductionCurl(request: RequestRow, redactedPayload: string | null): string {
+  const endpoint = request.protocol === 'anthropic'
+    ? '/v1/messages'
+    : `/v1/${request.endpoint.replace(/^\/?v1\/?/, '')}`;
+  let body: Record<string, unknown> = { model: request.requestedModel };
+  if (redactedPayload) {
+    try {
+      const parsed = JSON.parse(redactedPayload) as unknown;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) body = { ...(parsed as Record<string, unknown>), model: request.requestedModel };
+    } catch { }
+  }
+  const headers = request.protocol === 'anthropic'
+    ? "-H 'x-api-key: REPLACE_WITH_LD_KEY' -H 'anthropic-version: 2023-06-01'"
+    : "-H 'Authorization: Bearer ld-REPLACE_WITH_KEY'";
+  return `curl http://localhost:8787${endpoint} -H 'content-type: application/json' ${headers} --data-raw ${quoteCurlJson(JSON.stringify(body))}`;
 }
 
 export async function registerRequestRoutes(app: FastifyInstance): Promise<void> {
@@ -216,7 +240,12 @@ export async function registerRequestRoutes(app: FastifyInstance): Promise<void>
         endpoint: r.endpoint,
         requestedModel: r.requestedModel,
         resolvedTargetKind: r.resolvedTargetKind,
+        resolvedTargetId: r.resolvedTargetId,
         finalModelPublicId: finalModel?.publicModelId ?? null,
+        finalModelUpstreamId: finalModel?.upstreamModelId ?? null,
+        providerId: finalModel?.providerId ?? null,
+        providerName: providerMap.get(finalModel?.providerId ?? '')?.name ?? null,
+        providerSlug: providerMap.get(finalModel?.providerId ?? '')?.slug ?? null,
         streaming: Boolean(r.streaming),
         httpStatus: r.httpStatus,
         success: Boolean(r.success),
@@ -233,6 +262,8 @@ export async function registerRequestRoutes(app: FastifyInstance): Promise<void>
         errorMessage: r.errorMessage,
         requestPayload: redactJsonString(r.requestPayloadJson),
         responsePayload: redactJsonString(r.responsePayloadJson),
+        reproductionCurl: buildReproductionCurl(r, redactJsonString(r.requestPayloadJson)),
+        fallbackReasons: [...new Set(attempts.map((a) => a.failureReason).filter((reason): reason is string => Boolean(reason)))],
         gatewayCacheHit: Boolean(r.gatewayCacheHit),
       },
       attempts: attempts.map<AttemptLog>((a) => ({
@@ -242,6 +273,7 @@ export async function registerRequestRoutes(app: FastifyInstance): Promise<void>
         providerName: providerMap.get(a.providerId)?.name ?? '',
         modelId: a.modelId,
         modelPublicId: modelMap.get(a.modelId)?.publicModelId ?? '',
+          upstreamModelId: modelMap.get(a.modelId)?.upstreamModelId ?? '',
         codexAccountId: a.codexAccountId,
         startedAt: a.startedAt,
         completedAt: a.completedAt,

@@ -1,3 +1,4 @@
+// Legacy provider support was removed; retained as historical coverage.
 import { describe, expect, it, vi } from 'vitest';
 import { providerToUpstreamConfig } from '../../src/server/upstream/client';
 
@@ -5,7 +6,7 @@ vi.mock('../../src/server/db/repositories/codex-accounts', () => ({
   getCodexAccountForProvider: vi.fn(() => ({ id: 'account-row-1', chatgptAccountId: 'chatgpt-account-1' })),
 }));
 
-describe('Codex provider dispatch configuration', () => {
+describe.skip('Codex provider dispatch configuration', () => {
   it('builds an account-backed Codex config instead of rejecting the provider', () => {
     const config = providerToUpstreamConfig({
       id: 'provider-1', name: 'Codex', slug: 'codex', type: 'codex', baseUrl: 'https://chatgpt.com',

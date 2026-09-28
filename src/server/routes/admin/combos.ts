@@ -10,6 +10,7 @@ import { uuid } from '../../auth/ids';
 import { GatewayError } from '../../errors';
 import type { GatewayContext, GatewayRequest } from '../../gateway/runner';
 import type { CanonicalRequest } from '../../routing/capabilities';
+import { circuitBlocks } from '../../routing/circuit';
 
 const MemberSpec = z.object({ modelId: z.string(), position: z.number().int().min(0), enabled: z.boolean().default(true) });
 
@@ -100,6 +101,35 @@ function assertModelsExist(db: ComboDb, members: Array<{ modelId: string }>): vo
 
 type ComboDb = ReturnType<typeof getDb>;
 
+const capabilityKeys = ['chat', 'responses', 'streaming', 'tools', 'structured_output', 'image_input', 'audio_input', 'reasoning', 'embeddings'] as const;
+
+function modelCapabilities(model: { capabilitiesJson: string }): Record<string, unknown> {
+  try { return JSON.parse(model.capabilitiesJson) as Record<string, unknown>; } catch { return {}; }
+}
+
+function memberStatus(model: typeof schema.models.$inferSelect | undefined, provider: typeof schema.providers.$inferSelect | undefined, enabled: boolean): { state: 'ready' | 'unavailable'; reason: string } {
+  if (!enabled) return { state: 'unavailable', reason: 'member_disabled' };
+  if (!model) return { state: 'unavailable', reason: 'model_missing' };
+  if (!provider?.enabled) return { state: 'unavailable', reason: 'provider_disabled' };
+  if (provider.healthState === 'down') return { state: 'unavailable', reason: 'provider_down' };
+  if (provider.healthState === 'circuit_open') return { state: 'unavailable', reason: 'circuit_open' };
+  if (!model.enabled) return { state: 'unavailable', reason: 'model_disabled' };
+  if (!model.upstreamAvailable) return { state: 'unavailable', reason: 'upstream_unavailable' };
+  if (circuitBlocks(model.providerId, provider.cbCooldownSeconds)) return { state: 'unavailable', reason: 'circuit_open' };
+  if (modelCapabilities(model).chat === false) return { state: 'unavailable', reason: 'chat_capability_unavailable' };
+  return { state: 'ready', reason: provider.healthState === 'degraded' ? 'provider_degraded' : 'ready' };
+}
+
+function capabilityWarnings(models: Array<typeof schema.models.$inferSelect>): string[] {
+  return capabilityKeys.filter((key) => {
+    const values = new Set(models.map((model) => {
+      const value = modelCapabilities(model)[key];
+      return value === true ? 'yes' : value === false ? 'no' : 'unknown';
+    }));
+    return values.size > 1;
+  });
+}
+
 export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
   app.addHook('preHandler', requireAdminAuth);
 
@@ -109,13 +139,14 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
     const allMembers = db.select().from(schema.comboMembers).all();
     const models = db.select().from(schema.models).all();
     const modelMap = new Map(models.map((m) => [m.id, m]));
+      const providerMap = new Map(db.select().from(schema.providers).all().map((p) => [p.id, p]));
     return {
       combos: combos.map((c) => {
         const members = allMembers.filter((m) => m.comboId === c.id);
-        const healthy = members.filter((m) => {
-          const model = modelMap.get(m.modelId);
-          return model && model.enabled && model.upstreamAvailable;
-        });
+          const statuses = members.map((m) => memberStatus(modelMap.get(m.modelId), providerMap.get(modelMap.get(m.modelId)?.providerId ?? ''), m.enabled));
+          const readyCount = statuses.filter((status) => status.state === 'ready').length;
+          const reasons = [...new Set(statuses.filter((status) => status.state === 'unavailable').map((status) => status.reason))];
+          const comboModels = members.map((m) => modelMap.get(m.modelId)).filter((m): m is typeof models[number] => Boolean(m));
         return {
           id: c.id,
           name: c.name,
@@ -124,7 +155,10 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
           mode: c.mode,
           enabled: c.enabled,
           memberCount: members.length,
-          healthyMemberCount: healthy.length,
+          healthyMemberCount: readyCount,
+          status: !c.enabled ? 'disabled' : readyCount > 0 ? 'ready' : 'unavailable',
+          unavailableReasons: reasons,
+          capabilityWarnings: capabilityWarnings(comboModels),
         };
       }),
     };
@@ -143,7 +177,8 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
     const modelMap = new Map(models.map((m) => [m.id, m]));
     const providers = db.select().from(schema.providers).all();
     const providerMap = new Map(providers.map((p) => [p.id, p]));
-    return {
+     const comboModels = members.map((m) => modelMap.get(m.modelId));
+     return {
       combo: {
         ...c,
         members: members.map((m) => ({
@@ -155,8 +190,14 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
           providerSlug: providerMap.get(modelMap.get(m.modelId)?.providerId ?? '')?.slug ?? '',
           position: m.position,
           enabled: m.enabled,
-          upstreamAvailable: modelMap.get(m.modelId)?.upstreamAvailable ?? false,
+           upstreamAvailable: modelMap.get(m.modelId)?.upstreamAvailable ?? false,
+           providerEnabled: providerMap.get(modelMap.get(m.modelId)?.providerId ?? '')?.enabled ?? false,
+           providerHealth: providerMap.get(modelMap.get(m.modelId)?.providerId ?? '')?.healthState ?? 'unknown',
+           circuitOpen: circuitBlocks(modelMap.get(m.modelId)?.providerId ?? '', providerMap.get(modelMap.get(m.modelId)?.providerId ?? '')?.cbCooldownSeconds ?? 0),
+           capabilities: modelMap.get(m.modelId) ? modelCapabilities(modelMap.get(m.modelId)!) : {},
+           status: memberStatus(modelMap.get(m.modelId), providerMap.get(modelMap.get(m.modelId)?.providerId ?? ''), m.enabled),
         })),
+         capabilityWarnings: capabilityWarnings(comboModels.filter((m): m is typeof models[number] => Boolean(m))),
       },
     };
   });

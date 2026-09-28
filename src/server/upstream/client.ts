@@ -5,8 +5,6 @@ import { decryptSecret, decryptCustomHeaders } from '../auth/crypto';
 import { GatewayError } from '../errors';
 import { buildHeaders, stripSlash } from '../providers/index';
 import { redactString } from '../security/redact';
-import { getCodexAccountForProvider, getCodexAccountById } from '../db/repositories/codex-accounts';
-import { findEligibleQoderAccount } from '../db/repositories/qoder-accounts';
 import { debugUpstream, errorLine, formatError, truncate } from '../logging/debug';
 
 export interface UpstreamConfig {
@@ -31,30 +29,11 @@ export interface UpstreamResult {
   upstreamRequestId: string | null;
 }
 
-export function providerToUpstreamConfig(p: Provider, codexAccountId?: string): UpstreamConfig {
+export function providerToUpstreamConfig(p: Provider, _codexAccountId?: string): UpstreamConfig {
   let apiKey: string;
   let customHeaders: Record<string, string>;
-  if (p.type === 'codex') {
-    const account = codexAccountId ? getCodexAccountById(codexAccountId) : getCodexAccountForProvider(p.id);
-    if (!account) throw new GatewayError('authentication_error', 'No usable Codex account is configured', { status: 503 });
-    return {
-      type: 'codex', baseUrl: p.baseUrl, customHeaders: {},
-      connectTimeoutMs: p.connectTimeoutMs, firstTokenTimeoutMs: p.firstTokenTimeoutMs,
-      streamIdleTimeoutMs: p.streamIdleTimeoutMs, totalTimeoutMs: p.totalTimeoutMs,
-      codexAccountId: account.chatgptAccountId, accountRecordId: account.id,
-    };
-  }
-  if (p.type === 'qoder') {
-    // Account-pool provider: no API key on the row. The runner normally overrides the account
-    // from the expanded candidate; this resolves the first eligible one for direct callers.
-    const account = findEligibleQoderAccount(p.id);
-    if (!account) throw new GatewayError('authentication_error', 'No usable Qoder account is configured', { status: 503 });
-    return {
-      type: 'qoder', baseUrl: p.baseUrl, customHeaders: {},
-      connectTimeoutMs: p.connectTimeoutMs, firstTokenTimeoutMs: p.firstTokenTimeoutMs,
-      streamIdleTimeoutMs: p.streamIdleTimeoutMs, totalTimeoutMs: p.totalTimeoutMs,
-      qoderUserId: account.qoderUserId, qoderAccountRecordId: account.id,
-    };
+  if (p.type === 'codex' || p.type === 'qoder') {
+    throw new GatewayError('invalid_request_error', `${p.type} providers are no longer supported`, { status: 410 });
   }
   if (!p.encryptedApiKey || !p.apiKeyNonce) {
     throw new GatewayError('invalid_request_error', 'Provider credentials are missing', { status: 501 });

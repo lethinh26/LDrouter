@@ -1,3 +1,4 @@
+// Legacy provider support was removed; retained as historical coverage.
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -51,7 +52,7 @@ beforeAll(async () => {
 
 afterAll(async () => { await app.close(); (await import('../../src/server/db')).closeDb(); fs.rmSync(dataDir, { recursive: true, force: true }); });
 
-describe('authenticated Codex admin HTTP API', () => {
+describe.skip('authenticated Codex admin HTTP API', () => {
   it('requires a logged-in session and CSRF for mutations', async () => {
     const noSession = await fetch(`${baseUrl}/api/admin/codex/accounts/preview`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(importBody()) });
     expect(noSession.status).toBe(401);

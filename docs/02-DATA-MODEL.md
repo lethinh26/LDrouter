@@ -51,7 +51,7 @@ Use secure, HttpOnly, SameSite cookies for the browser admin UI. Set Secure when
 - `id`
 - `name`
 - `slug` unique
-- `type`: `openai | anthropic | codex | qoder`
+- `type`: `openai | anthropic` (Codex/Qoder values are legacy rows retained for migration compatibility and are not routable)
 - `base_url`
 - `encrypted_api_key`
 - `encrypted_api_key_nonce` / required AEAD metadata

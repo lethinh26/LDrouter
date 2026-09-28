@@ -73,7 +73,7 @@ const patch = (body: Record<string, unknown>) =>
 const detail = async (id: string) => {
   const r = await fetch(`${baseUrl}/api/admin/combos/${id}`, { headers: { cookie: cookies } });
   expect(r.status).toBe(200);
-  return (await r.json()).combo as { slug: string; publicModelId: string; members: Array<{ modelId: string }> };
+  return (await r.json()).combo as { slug: string; publicModelId: string; maxTotalAttempts: number; fallbackOn429: boolean; members: Array<{ modelId: string; providerEnabled: boolean; status: { state: string } }> };
 };
 
 describe('admin combo create', () => {
@@ -81,6 +81,15 @@ describe('admin combo create', () => {
     const r = await create({ name: 'Smart Combo', members: [member(modelA)] });
     expect(r.status).toBe(200);
     expect((await r.json()).publicModelId).toBe('smart-combo');
+  });
+
+  it('round-trips fallback safety settings and reports member readiness', async () => {
+    const r = await create({ name: 'settings', maxTotalAttempts: 5, fallbackOn429: false, members: [member(modelA)] });
+    expect(r.status).toBe(200);
+    const combo = await detail((await r.json()).id);
+    expect(combo.maxTotalAttempts).toBe(5);
+    expect(combo.fallbackOn429).toBe(false);
+    expect(combo.members[0]).toMatchObject({ providerEnabled: true, status: { state: 'ready' } });
   });
 
   it('rejects a duplicate name with 400, not a 500', async () => {
