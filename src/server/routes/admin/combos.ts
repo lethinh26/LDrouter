@@ -14,9 +14,14 @@ import { circuitBlocks } from '../../routing/circuit';
 
 const MemberSpec = z.object({ modelId: z.string(), position: z.number().int().min(0), enabled: z.boolean().default(true) });
 
+const OptionalSlug = z.preprocess(
+  (value) => typeof value === 'string' && value.trim() === '' ? undefined : value,
+  z.string().min(1).max(64).optional(),
+);
+
 const ComboCreate = z.object({
   name: z.string().min(1).max(128),
-  slug: z.string().min(1).max(64).optional(),
+  slug: OptionalSlug,
   mode: z.literal('fallback').default('fallback'),
   maxTotalAttempts: z.number().int().min(1).max(8).optional(),
   enabled: z.boolean().optional(),

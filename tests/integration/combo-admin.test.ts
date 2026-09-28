@@ -83,6 +83,12 @@ describe('admin combo create', () => {
     expect((await r.json()).publicModelId).toBe('smart-combo');
   });
 
+  it('accepts an explicitly empty slug as omitted', async () => {
+    const r = await create({ name: 'empty-slug', slug: '', members: [member(modelA)] });
+    expect(r.status).toBe(200);
+    expect((await r.json()).publicModelId).toBe('empty-slug');
+  });
+
   it('round-trips fallback safety settings and reports member readiness', async () => {
     const r = await create({ name: 'settings', maxTotalAttempts: 5, fallbackOn429: false, members: [member(modelA)] });
     expect(r.status).toBe(200);

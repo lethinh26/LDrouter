@@ -76,7 +76,7 @@ export function Combos() {
     if (form.members.length === 0) { toast.error('Add at least one member'); return; }
     setCreating(true);
     try {
-      await api.post('/api/admin/combos', { name: form.name, slug: form.slug || undefined, enabled: form.enabled, ...editSettings(form), members: form.members });
+      await api.post('/api/admin/combos', { name: form.name, slug: form.slug.trim() || undefined, enabled: form.enabled, ...editSettings(form), members: form.members });
       toast.success('Combo created');
       setOpen(false); setForm({ name: '', slug: '', enabled: true, ...defaultComboSettings, members: [] });
       void reload();
@@ -116,7 +116,7 @@ export function Combos() {
     if (editForm.members.length === 0) { toast.error('Add at least one member'); return; }
     setEditing(true);
     try {
-      await api.patch('/api/admin/combos', { id: editingId, name: editForm.name, slug: editForm.slug || undefined, enabled: editForm.enabled, ...editSettings(editForm), members: editForm.members });
+      await api.patch('/api/admin/combos', { id: editingId, name: editForm.name, slug: editForm.slug.trim() || undefined, enabled: editForm.enabled, ...editSettings(editForm), members: editForm.members });
       toast.success('Combo updated');
       setEditOpen(false); setEditingId(null);
       void reload();
