@@ -69,13 +69,20 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, argv: string[] 
 
   const isContainer = Boolean(env.LATEDEV_DATA_DIR?.startsWith('/data') || process.env.CONTAINER === '1');
   const dbFile = parsed.LATEDEV_DB_URL ?? path.join(dataDir, 'data.sqlite');
+  const restoredMasterKeyPath = path.join(dataDir, 'master.key.restore');
+  let restoredMasterKey: string | null = null;
+  try {
+    if (fs.existsSync(restoredMasterKeyPath)) restoredMasterKey = fs.readFileSync(restoredMasterKeyPath, 'utf8').trim() || null;
+  } catch {
+    /* ignore unreadable override — use the configured key */
+  }
 
   cached = {
     host: cliArgs.host ?? parsed.LATEDEV_HOST,
     port: cliArgs.port ?? parsed.LATEDEV_PORT,
     dataDir,
     dbFile,
-    masterKey: parsed.LATEDEV_MASTER_KEY ?? readMasterKeyFile(dataDir),
+    masterKey: restoredMasterKey ?? parsed.LATEDEV_MASTER_KEY ?? readMasterKeyFile(dataDir),
     trustProxyHops: parsed.LATEDEV_TRUST_PROXY,
     logLevel: parsed.LOG_LEVEL ?? parsed.LATEDEV_LOG_LEVEL,
     env: parsed.NODE_ENV,

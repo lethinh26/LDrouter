@@ -49,24 +49,22 @@ export function Setup() {
             <Label>Password (12+ chars)</Label>
             <Input type="password" value={password} onChange={(e) => setPassword(e.target.value)} />
           </div>
-          {masterKeyRequired && (
-            <div className="space-y-1">
-              <Label>Master encryption key (required, 32+ chars)</Label>
-              <Input type="password" value={masterKey} onChange={(e) => setMasterKey(e.target.value)} placeholder="Paste or generate a 32+ character key" />
-              <p className="text-xs text-muted-foreground">
-                Provider API keys are encrypted with this key (AES-256-GCM). Store it somewhere safe —
-                if it is lost, stored provider credentials cannot be recovered.
-                Generate one with:{' '}
-                <code className="break-all">{'node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'base64\'))"'}</code>
-              </p>
-            </div>
-          )}
+          <div className="space-y-1">
+            <Label>Master encryption key {masterKeyRequired ? '(required, 32+ chars)' : '(already configured)'}</Label>
+            <Input type="password" value={masterKey} onChange={(e) => setMasterKey(e.target.value)} placeholder="Paste or generate a 32+ character key" />
+            <p className="text-xs text-muted-foreground">
+              Provider API keys are encrypted with this key (AES-256-GCM). Store it somewhere safe —
+              if it is lost, stored provider credentials cannot be recovered.
+              Generate one with:{' '}
+              <code className="break-all">{'node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'base64\'))"'}</code>
+            </p>
+          </div>
         </CardContent>
         <CardFooter className="flex-col items-stretch gap-4">
           <Button disabled={!canSubmit} onClick={async () => {
             setSubmitting(true);
             try {
-              await api.post('/api/admin/setup', { username, password, setupMasterKey: masterKeyRequired ? masterKey.trim() : undefined });
+              await api.post('/api/admin/setup', { username, password, setupMasterKey: masterKey.trim() || undefined });
               toast.success('Admin account created');
               // Hard reload, not router navigate: SetupGate cached setupComplete=false on mount and
               // would bounce a soft navigate('/login') straight back to /setup. A full page load

@@ -215,8 +215,7 @@ export async function registerApiKeyRoutes(app: FastifyInstance): Promise<void> 
     const db = getDb();
     const k = db.select().from(schema.apiKeys).where(eq(schema.apiKeys.id, id)).get();
     if (!k) throw new GatewayError('invalid_request_error', 'API key not found', { status: 404 });
-    // Soft-delete: keep name/prefix snapshot for history; mark disabled
-    db.update(schema.apiKeys).set({ enabled: false, updatedAt: new Date().toISOString(), name: `${k.name} (deleted ${new Date().toISOString().slice(0, 10)})` }).where(eq(schema.apiKeys.id, id)).run();
+    db.delete(schema.apiKeys).where(eq(schema.apiKeys.id, id)).run();
     recordAudit({ action: 'api_key.delete', success: true, targetType: 'api_key', targetId: id, targetName: k.name, ip: req.ip });
     return { ok: true };
   });

@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.18.2] - 2026-10-02
+
+### Fixed
+
+- Restore now adopts the backup's master key, including across restarts.
+- Admin deletion now permanently removes API keys, models, and providers with dependent routing configuration cleaned up first.
+- `/setup` always exposes the master-key input and reports runtime key availability.
+
 ## [1.17.9] - 2026-09-22
 
 ### Fixed

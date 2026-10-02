@@ -6,6 +6,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { sql } from 'drizzle-orm';
 
 const dataDir = path.join(os.tmpdir(), `latedev-br-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
 process.env.LATEDEV_DATA_DIR = dataDir;
@@ -123,5 +124,51 @@ describe('hot restore', () => {
     const all = db.select().from(schema.models).all();
     expect(all.length).toBe(1);
     expect(all[0]!.publicModelId).toBe('p/a');
+  });
+
+  it('switches to the backup master key before serving restored encrypted credentials', async () => {
+    const { setConfigMasterKey, resetConfigForTests } = await import('../../src/server/config/index');
+    const { resetMasterKeyCache } = await import('../../src/server/auth/crypto');
+    const backupKey = 'b'.repeat(32);
+    const liveKey = 'a'.repeat(32);
+
+    setConfigMasterKey(backupKey);
+    resetMasterKeyCache();
+    const db = (await import('../../src/server/db/index')).getDb();
+    const schema = await import('../../src/server/db/schema');
+    const { uuid } = await import('../../src/server/auth/ids');
+    const { encryptSecret } = await import('../../src/server/auth/crypto');
+    const encryptedApiKey = encryptSecret('backup-provider-secret');
+    db.insert(schema.providers).values({
+      id: uuid(), name: 'backup-key-provider', slug: 'backup-key-provider', type: 'openai',
+      baseUrl: 'http://127.0.0.1:9', encryptedApiKey: encryptedApiKey.ciphertext,
+      apiKeyNonce: encryptedApiKey.nonce, apiKeyVersion: encryptedApiKey.version, enabled: true,
+    }).run();
+
+    const createRes = await fetch(`${baseUrl}/api/admin/backup/create`, {
+      method: 'POST', headers: { cookie: cookies, 'content-type': 'application/json' },
+      body: JSON.stringify({ passphrase: '123456' }),
+    });
+    expect(createRes.status).toBe(200);
+    const envelope = await createRes.json() as Record<string, unknown>;
+
+    setConfigMasterKey(liveKey);
+    resetMasterKeyCache();
+    resetConfigForTests();
+    setConfigMasterKey(liveKey);
+
+    const restoreRes = await fetch(`${baseUrl}/api/admin/backup/restore`, {
+      method: 'POST', headers: { 'content-type': 'application/json', cookie: cookies },
+      body: JSON.stringify({ backup: envelope, passphrase: '123456' }),
+    });
+    expect(restoreRes.status).toBe(200);
+
+    const { providerToUpstreamConfig } = await import('../../src/server/upstream/client');
+    const db2 = (await import('../../src/server/db/index')).getDb();
+    const restoredProvider = db2.select().from(schema.providers)
+      .where(sql`slug = 'backup-key-provider'`).get();
+    expect(restoredProvider).toBeTruthy();
+    expect(providerToUpstreamConfig(restoredProvider! as never).apiKey).toBe('backup-provider-secret');
+    expect(process.env.LATEDEV_MASTER_KEY).toBe(Buffer.from(backupKey).toString('base64'));
   });
 });

@@ -209,13 +209,13 @@ export async function registerModelRoutes(app: FastifyInstance): Promise<void> {
     const db = getDb();
     const m = db.select().from(schema.models).where(eq(schema.models.id, id)).get();
     if (!m) throw new GatewayError('invalid_request_error', 'Model not found', { status: 404 });
-    const inCombo = db.select().from(schema.comboMembers).where(eq(schema.comboMembers.modelId, id)).all();
-    if (inCombo.length > 0) {
-      db.update(schema.models).set({ enabled: false, upstreamAvailable: false, updatedAt: new Date().toISOString() }).where(eq(schema.models.id, id)).run();
-      recordAudit({ action: 'model.soft_disable', success: true, targetType: 'model', targetId: id, targetName: m.publicModelId, ip: req.ip, metadata: { reason: 'in_combo' } });
-      return { ok: true, softDisabled: true };
-    }
-    db.delete(schema.models).where(eq(schema.models.id, id)).run();
+    db.transaction((tx) => {
+      tx.delete(schema.comboMembers).where(eq(schema.comboMembers.modelId, id)).run();
+      tx.delete(schema.modelAliases).where(sql`target_kind = 'model' AND target_id = ${id}`).run();
+      tx.delete(schema.apiKeyModelPermissions).where(sql`target_kind = 'model' AND target_id = ${id}`).run();
+      tx.delete(schema.responseCache).where(sql`target_kind = 'model' AND target_id = ${id}`).run();
+      tx.delete(schema.models).where(eq(schema.models.id, id)).run();
+    });
     recordAudit({ action: 'model.delete', success: true, targetType: 'model', targetId: id, targetName: m.publicModelId, ip: req.ip });
     return { ok: true };
   });

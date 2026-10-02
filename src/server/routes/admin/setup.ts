@@ -24,7 +24,10 @@ export async function registerSetupRoutes(app: FastifyInstance): Promise<void> {
     const s = getSettings();
     return {
       setupComplete: s.setupComplete,
-      masterKeyConfigured: s.masterKeyConfigured || isMasterKeyConfigured(),
+      // The database flag can survive removal of the key file or env var. The
+      // setup form needs the runtime truth so it never hides the only recovery
+      // input when encryption is not actually available.
+      masterKeyConfigured: isMasterKeyConfigured(),
     };
   });
 

@@ -382,7 +382,7 @@ export function Models() {
           <DialogHeader><DialogTitle>Xoá model</DialogTitle></DialogHeader>
           <div className="space-y-2 text-sm">
             <p>Bạn có chắc muốn xoá model <span className="font-mono">{deleteTarget?.publicModelId}</span>?</p>
-            <p className="text-muted-foreground">Model đang được dùng trong combo sẽ bị soft-disable (vô hiệu hoá) thay vì xoá hẳn, để giữ lịch sử và tham chiếu combo.</p>
+            <p className="text-muted-foreground">Model sẽ bị xoá khỏi combo, alias, permission và cache trước khi xoá hẳn.</p>
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setDeleteTarget(null)}>Huỷ</Button>

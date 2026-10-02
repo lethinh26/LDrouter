@@ -11,6 +11,7 @@ describe('config master key', () => {
   beforeEach(() => {
     resetConfigForTests();
     try { fs.unlinkSync(path.join(tmpDir, 'master.key')); } catch { /* */ }
+    try { fs.unlinkSync(path.join(tmpDir, 'master.key.restore')); } catch { /* */ }
     delete process.env.LATEDEV_MASTER_KEY;
     process.env.LATEDEV_DATA_DIR = tmpDir;
     process.env.NODE_ENV = 'test';
@@ -30,6 +31,13 @@ describe('config master key', () => {
     process.env.LATEDEV_MASTER_KEY = 'right-key-32-chars-long!';
     const cfg = loadConfig(process.env, []);
     expect(cfg.masterKey).toBe('right-key-32-chars-long!');
+  });
+
+  it('restored master key takes precedence over env after restart', () => {
+    fs.mkdirSync(tmpDir, { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, 'master.key.restore'), 'backup-key-32-chars-long!!!', 'utf8');
+    process.env.LATEDEV_MASTER_KEY = 'instance-key-32-chars-long!!';
+    expect(loadConfig(process.env, []).masterKey).toBe('backup-key-32-chars-long!!!');
   });
 
   it('returns null when neither env nor file exists', () => {

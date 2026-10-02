@@ -1,7 +1,7 @@
 // Admin API: providers CRUD + Test Connection + Fetch Models.
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { sql, eq } from 'drizzle-orm';
+import { sql, eq, inArray } from 'drizzle-orm';
 import { getDb, schema } from '../../db/index';
 import { requireAdminAuth } from '../../auth/middleware';
 import { recordAudit } from '../../db/repositories/audit';
@@ -155,18 +155,20 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
     const db = getDb();
     const p = db.select().from(schema.providers).where(eq(schema.providers.id, id)).get();
     if (!p) throw new GatewayError('invalid_request_error', 'Provider not found', { status: 404 });
-    const used = db.select().from(schema.models).where(eq(schema.models.providerId, id)).all();
-    if (used.length > 0) {
-      // Soft-disable if there are dependent models
-      db.update(schema.providers).set({ enabled: false, updatedAt: new Date().toISOString() }).where(eq(schema.providers.id, id)).run();
-      recordAudit({ action: 'provider.soft_disable', success: true, targetType: 'provider', targetId: id, targetName: p.name, ip: req.ip });
-      return { ok: true, softDisabled: true };
-    }
-    try {
-      db.delete(schema.providers).where(eq(schema.providers.id, id)).run();
-    } catch (error) {
-      throw new GatewayError('invalid_request_error', 'Provider is still referenced and cannot be deleted', { status: 409, cause: error });
-    }
+    const models = db.select({ id: schema.models.id }).from(schema.models).where(eq(schema.models.providerId, id)).all();
+    const modelIds = models.map((model) => model.id);
+    db.transaction((tx) => {
+      tx.delete(schema.codexAccounts).where(eq(schema.codexAccounts.providerId, id)).run();
+      tx.delete(schema.qoderAccounts).where(eq(schema.qoderAccounts.providerId, id)).run();
+      if (modelIds.length > 0) {
+        tx.delete(schema.comboMembers).where(inArray(schema.comboMembers.modelId, modelIds)).run();
+        tx.delete(schema.modelAliases).where(sql`target_kind = 'model' AND target_id IN (${sql.join(modelIds.map((modelId) => sql`${modelId}`), sql`, `)})`).run();
+        tx.delete(schema.apiKeyModelPermissions).where(sql`target_kind = 'model' AND target_id IN (${sql.join(modelIds.map((modelId) => sql`${modelId}`), sql`, `)})`).run();
+        tx.delete(schema.responseCache).where(sql`target_kind = 'model' AND target_id IN (${sql.join(modelIds.map((modelId) => sql`${modelId}`), sql`, `)})`).run();
+        tx.delete(schema.models).where(inArray(schema.models.id, modelIds)).run();
+      }
+      tx.delete(schema.providers).where(eq(schema.providers.id, id)).run();
+    });
     recordAudit({ action: 'provider.delete', success: true, targetType: 'provider', targetId: id, targetName: p.name, ip: req.ip });
     return { ok: true };
   });

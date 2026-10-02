@@ -167,6 +167,10 @@ export async function registerBackupRoutes(app: FastifyInstance): Promise<void> 
       }
     }
     const liveDb = cfg.dbFile;
+    const previousMasterKey = cfg.masterKey;
+    const restoreKeyPath = path.join(cfg.dataDir, 'master.key.restore');
+    const previousRestoreKey = fs.existsSync(restoreKeyPath) ? fs.readFileSync(restoreKeyPath) : null;
+    const restoredKey = restoredMasterKey?.toString('base64');
     // Snapshot current DB before restore (kept for manual rollback).
     const snapshot = path.join(cfg.dataDir, `pre-restore-${Date.now()}.sqlite`);
     const Database = (await import('better-sqlite3')).default;
@@ -198,6 +202,14 @@ export async function registerBackupRoutes(app: FastifyInstance): Promise<void> 
       throw new GatewayError('gateway_error', 'Restore atomic replace failed', { status: 500 });
     }
 
+    // The backup key is authoritative. Apply it before reopening the restored
+    // database so every post-restore read uses the key that encrypted it.
+    if (restoredKey) {
+      fs.writeFileSync(restoreKeyPath, restoredKey, { mode: 0o600, encoding: 'utf8' });
+      setConfigMasterKey(restoredKey);
+      resetMasterKeyCache();
+    }
+
     // Hot-reload the database in-process: reopen the replaced file, validate
     // it, and keep serving. No gateway restart needed.
     try {
@@ -214,6 +226,12 @@ export async function registerBackupRoutes(app: FastifyInstance): Promise<void> 
         }
         fs.copyFileSync(snapshot, liveDb);
         openDb(liveDb);
+        try {
+          if (previousRestoreKey) fs.writeFileSync(restoreKeyPath, previousRestoreKey, { mode: 0o600 });
+          else fs.unlinkSync(restoreKeyPath);
+        } catch { /* no prior override */ }
+        if (previousMasterKey) setConfigMasterKey(previousMasterKey);
+        resetMasterKeyCache();
       } catch (rollbackErr) {
         const err = (e as Error).message;
         const rerr = (rollbackErr as Error).message;
@@ -224,12 +242,6 @@ export async function registerBackupRoutes(app: FastifyInstance): Promise<void> 
       throw new GatewayError('gateway_error', `Restore failed: ${(e as Error).message}`, { status: 500 });
     }
 
-    if (restoredMasterKey) {
-      const restoredKey = restoredMasterKey.toString('base64');
-      fs.writeFileSync(path.join(cfg.dataDir, 'master.key'), restoredKey, { mode: 0o600, encoding: 'utf8' });
-      setConfigMasterKey(restoredKey);
-      resetMasterKeyCache();
-    }
 
     // The swap invalidates the previous admin session (its row lived in the
     // old database). Re-create the current session in the restored database so

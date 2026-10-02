@@ -207,7 +207,7 @@ export function Providers() {
       <AlertDialog open={!!deletingId} onOpenChange={(open) => { if (!open) setDeletingId(null); }}>
         <AlertDialogContent>
           <AlertDialogHeader><AlertDialogTitle>Delete provider?</AlertDialogTitle>
-            <AlertDialogDescription>This will soft-disable the provider if models depend on it.</AlertDialogDescription>
+            <AlertDialogDescription>This permanently removes the provider, its models, and dependent routing configuration.</AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
