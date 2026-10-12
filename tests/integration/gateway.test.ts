@@ -488,6 +488,48 @@ describe('gateway smoke', () => {
     expect(text).toContain('data: [DONE]');
   });
 
+  it('streamed requests ask the upstream for usage so tokens are not lost', async () => {
+    const { reset, pushHandler } = (await import('./_mock-control.js'));
+    const { getDb, schema } = await import('../../src/server/db/index');
+    reset();
+    let upstreamBody = '';
+    // Faithful OpenAI-compatible upstream: it reports usage on a streamed answer
+    // only when the caller opted in with stream_options.include_usage.
+    pushHandler((_req, res, body) => {
+      upstreamBody = body;
+      const wantsUsage = Boolean((JSON.parse(body) as { stream_options?: { include_usage?: boolean } }).stream_options?.include_usage);
+      res.statusCode = 200;
+      res.setHeader('content-type', 'text/event-stream');
+      res.write(`data: {"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}\n\n`);
+      res.write(
+        wantsUsage
+          ? `data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18}}\n\n`
+          : `data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n`
+      );
+      res.write('data: [DONE]\n\n');
+      res.end();
+    });
+    const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey!.secret}` },
+      body: JSON.stringify({ model: 'mock/gpt-mock', stream: true, stream_options: { include_usage: true }, messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    expect(res.status).toBe(200);
+    await res.text();
+    const db = getDb();
+    // Streaming closes the client connection before the gateway persists.
+    for (let i = 0; i < 40; i++) {
+      const row = db.select().from(schema.requests).all().pop();
+      if (row && row.inputTokens > 0) {
+        expect(row.inputTokens).toBe(11);
+        expect(row.outputTokens).toBe(7);
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    throw new Error(`gateway never persisted streamed usage; upstream body was ${upstreamBody}`);
+  });
+
   it('fallback before stream: returns 502 when upstream 429s and no fallback configured', async () => {
     const { reset, pushHandler } = (await import('./_mock-control.js'));
     reset();

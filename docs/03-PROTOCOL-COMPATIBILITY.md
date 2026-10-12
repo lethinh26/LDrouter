@@ -171,6 +171,12 @@ Some providers will omit some categories. Store null/zero according to a consist
 
 Do not fabricate provider-reported usage.
 
+OpenAI-compatible upstreams report `usage` on a streamed answer only when the request opts in
+with `stream_options: { include_usage: true }`. The gateway therefore always sets that flag on
+streamed upstream calls (see `canonicalToOpenAIRequest`); without it those providers return no
+usage at all and the request is logged with zero tokens. Anthropic-compatible upstreams
+(`/v1/messages`) report usage unconditionally and need no equivalent.
+
 ## Token counting endpoint
 
 For Anthropic-compatible `count_tokens`:

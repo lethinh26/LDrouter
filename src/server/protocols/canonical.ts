@@ -14,6 +14,7 @@ export interface OpenAIChatRequest {
   tools?: OpenAITool[];
   tool_choice?: unknown;
   stream?: boolean;
+  stream_options?: { include_usage?: boolean };
   temperature?: number;
   top_p?: number;
   max_tokens?: number;
@@ -117,6 +118,7 @@ export function openAIToCanonical(req: OpenAIChatRequest): CanonicalRequest {
     maxOutputTokens: req.max_tokens,
     stop: Array.isArray(req.stop) ? req.stop : req.stop ? [req.stop] : undefined,
     stream: Boolean(req.stream),
+    streamIncludeUsage: Boolean(req.stream_options?.include_usage),
     responseFormat,
     reasoning: req.reasoning_effort ? { effort: req.reasoning_effort } : undefined,
   };
@@ -128,6 +130,10 @@ export function canonicalToOpenAIRequest(req: CanonicalRequest, targetModel: str
     stream: req.stream,
     messages: [],
   };
+  // OpenAI-compatible upstreams omit `usage` from a streamed answer unless the
+  // request opts in. Without this the gateway persisted 0 tokens for every
+  // streamed request to such a provider (live: "Tokens 0" on the Requests page).
+  if (req.stream) out.stream_options = { include_usage: true };
   if (req.system) out.messages.push({ role: 'system', content: req.system });
   for (const m of req.messages) {
     if (m.role === 'user') {

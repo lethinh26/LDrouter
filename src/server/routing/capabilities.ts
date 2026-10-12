@@ -29,6 +29,9 @@ export interface CanonicalRequest {
   maxOutputTokens?: number;
   stop?: string[];
   stream: boolean;
+  /** OpenAI-compatible upstreams only report `usage` on a streamed answer when
+   * the caller asks for it; the gateway always asks (see canonicalToOpenAIRequest). */
+  streamIncludeUsage?: boolean;
   responseFormat?: { type: 'text' | 'json_object' | 'json_schema'; jsonSchema?: Record<string, unknown> };
   reasoning?: { effort?: 'low' | 'medium' | 'high'; budgetTokens?: number };
   metadata?: Record<string, string>;
