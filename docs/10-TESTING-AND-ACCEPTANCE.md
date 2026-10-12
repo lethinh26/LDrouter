@@ -147,12 +147,47 @@ DB inspection confirms:
 
 ## Backup acceptance
 
+### Legacy safety (must remain passing)
+
 - backup while service is active is consistent
 - checksum mismatch is rejected
 - non-SQLite/random upload is rejected
 - future unsupported schema is rejected
 - restore failure preserves original live DB
 - master key is not contained in backup metadata
+
+Proven by `tests/integration/backup-restore.test.ts` (hot restore, invalid-backup rejection, master-key switch) and `tests/integration/backup-restore-upload.test.ts` (checksum/gzip/SQLite/passphrase rejection without touching live state).
+
+### Compact / full export
+
+- a compact export drops every excluded table (`requests`, `request_attempts`, `audit_logs`, `response_cache`, `admin_sessions`, `csrf_tokens`, `backups`) while retaining configuration and the daily aggregate tables
+- a full export keeps raw request, attempt, audit, and cache rows
+- the compact export is materially smaller than the full export
+- the v2 `.ldb` container manifest and checksum match the compressed payload, and no snapshot/gzip temp files are left behind
+- the create route serves a streamed `.ldb` attachment and rejects a non-six-digit passphrase
+
+Proven by `tests/integration/backup-export.test.ts`; container framing by `tests/unit/backup-container.test.ts`.
+
+### Streamed multipart restore
+
+- a valid v2 `.ldb` multipart upload restores and the live DB reflects it
+- an upload crossing the byte limit is rejected with HTTP **413**, both from `Content-Length` and during streaming when it is absent, leaving no temp files
+- an aborted/cancelled upload leaves no temp files
+- checksum mismatch, non-gzip, non-SQLite, and wrong passphrase are rejected without touching live state
+- the legacy v1 JSON restore body still works
+- the effective maximum upload size is exposed by `GET /api/admin/backup/capabilities`
+
+Proven by `tests/integration/backup-restore-upload.test.ts`. Client progress/cancel behavior by `tests/unit/backup-upload.test.ts` (progress mapping, AbortError + `xhr.abort()`, no manual Content-Type).
+
+### Aggregate statistics and the percentile limitation
+
+- aggregate-only history returns exact totals and averages with unavailable/null percentiles
+- a range partially overlapping a compacted day is rejected with 400 rather than silently omitting statistics
+- a full aggregate day and a raw day merge once in totals, series, and model rankings
+
+Proven by `tests/integration/statistics-fix.test.ts`; the one-time backfill by `tests/integration/daily-aggregate-migration.test.ts` and `tests/unit/daily-aggregate-upsert.test.ts`.
+
+**Documented limitation:** after a compact restore, historical p95 latency and p95 TTFT are unavailable (`percentilesAvailable: false`, `p95LatencyMs`/`p95TtftMs` `null`) for aggregate-only days; average latency and average TTFT remain available because the daily aggregates store sum/count. This limitation is stated in `docs/07-SECURITY-ADMIN-AND-BACKUP.md`, `docs/11-CACHING.md`, and `README.md`, and is asserted by `tests/unit/backup-docs.test.ts`.
 
 ## Packaging acceptance
 

@@ -120,7 +120,12 @@ Gateway response cache stores content even when request-content logging is metad
 
 When gateway response caching is enabled, treat cached content as sensitive application data.
 
-A database backup includes response-cache entries unless the implementation deliberately excludes them through a consistent snapshot/export format. Document the chosen behavior.
+Backup behavior by profile:
+
+- A **compact** backup excludes the gateway response cache (`response_cache`). After a compact restore the cache is empty even when caching is enabled in the restored settings — it refills on demand from new requests.
+- A **full** forensic backup retains the gateway response cache, so restored caching state is preserved.
+
+See `docs/07-SECURITY-ADMIN-AND-BACKUP.md` for the container/profile contract.
 
 ### Logs and statistics
 

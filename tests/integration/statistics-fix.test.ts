@@ -64,6 +64,55 @@ afterAll(async () => {
   try { fs.rmSync(dataDir, { recursive: true, force: true }); } catch { /* ignore */ }
 });
 
+describe('aggregate-only historical statistics', () => {
+  it('returns exact aggregate totals and averages with unavailable percentiles', async () => {
+    const db = (await import('../../src/server/db/index')).getDb();
+    const sch = await import('../../src/server/db/schema');
+    db.insert(sch.dailyModelStats).values({ day: '2026-01-01', modelId: modelA, requests: 4, successfulRequests: 2, failedRequests: 2, inputTokens: 20, outputTokens: 10, latencySuccessSumMs: 400, latencySuccessCount: 2, ttftSumMs: 100, ttftCount: 2 }).run();
+    const from = '2026-01-01T00:00:00.000Z';
+    const to = '2026-01-01T23:59:59.999Z';
+    const response = await fetch(`${baseUrl}/api/admin/stats?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`, { headers: { cookie: cookies } });
+    const body = await response.json() as { summary: { totalRequests: number; averageLatencyMs: number; p95LatencyMs: number | null }; percentilesAvailable: boolean };
+    expect(body.summary.totalRequests).toBe(4);
+    expect(body.summary.averageLatencyMs).toBe(200);
+    expect(body.summary.p95LatencyMs).toBeNull();
+    expect(body.percentilesAvailable).toBe(false);
+  });
+
+  it('rejects a partial range overlapping compacted history rather than omitting its statistics', async () => {
+    const db = (await import('../../src/server/db/index')).getDb();
+    const sch = await import('../../src/server/db/schema');
+    db.insert(sch.dailyModelStats).values({ day: '2026-01-04', modelId: modelA, requests: 2, successfulRequests: 2, failedRequests: 0 }).run();
+    const response = await fetch(`${baseUrl}/api/admin/stats?from=${encodeURIComponent('2026-01-04T12:00:00.000Z')}&to=${encodeURIComponent('2026-01-05T00:00:00.000Z')}`, { headers: { cookie: cookies } });
+    expect(response.status).toBe(400);
+  });
+
+  it('merges a full aggregate day and a raw day once in totals, series, and model rankings', async () => {
+    const db = (await import('../../src/server/db/index')).getDb();
+    const sch = await import('../../src/server/db/schema');
+    const { uuid } = await import('../../src/server/auth/ids');
+    const apiKeyId = db.select().from(sch.apiKeys).all()[0]!.id;
+    db.insert(sch.dailyModelStats).values({ day: '2026-01-02', modelId: modelA, requests: 3, successfulRequests: 3, failedRequests: 0, inputTokens: 30, outputTokens: 15, latencySuccessSumMs: 300, latencySuccessCount: 3 }).run();
+    db.insert(sch.dailyApiKeyStats).values({ day: '2026-01-02', apiKeyId, requests: 3, successfulRequests: 3, failedRequests: 0, inputTokens: 30, outputTokens: 15, totalTokens: 45 }).run();
+    const retainedRowId = uuid();
+    db.insert(sch.requests).values({ id: retainedRowId, createdAt: '2026-01-02T12:00:00.000Z', apiKeyId, clientIp: '127.0.0.1', protocol: 'openai', endpoint: '/v1/chat/completions', requestedModel: 'mockstats/a', resolvedTargetKind: 'model', resolvedTargetId: modelA, finalModelId: modelA, streaming: false, httpStatus: 200, success: true, totalLatencyMs: 900, inputTokens: 70, outputTokens: 10, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, totalTokens: 80, attemptsCount: 1 }).run();
+    const requestId = uuid();
+    db.insert(sch.requests).values({ id: requestId, createdAt: '2026-01-03T12:00:00.000Z', apiKeyId, clientIp: '127.0.0.1', protocol: 'openai', endpoint: '/v1/chat/completions', requestedModel: 'mockstats/b', resolvedTargetKind: 'model', resolvedTargetId: modelB, finalModelId: modelB, streaming: false, httpStatus: 200, success: true, totalLatencyMs: 120, inputTokens: 7, outputTokens: 4, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, totalTokens: 11, attemptsCount: 1 }).run();
+    const from = '2026-01-02T00:00:00.000Z';
+    const to = '2026-01-03T23:59:59.999Z';
+    const response = await fetch(`${baseUrl}/api/admin/stats?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`, { headers: { cookie: cookies } });
+    expect(response.status).toBe(200);
+    const body = await response.json() as { summary: { totalRequests: number; averageLatencyMs: number }; series: Array<{ t: string; requests: number }>; topModels: Array<{ publicId: string; requests: number }>; topApiKeys: Array<{ name: string; requests: number }> };
+        expect(body.summary.totalRequests).toBe(4);
+        expect(body.summary.averageLatencyMs).toBe(105);
+    expect(body.series.find((row) => row.t.startsWith('2026-01-02'))?.requests).toBe(3);
+    expect(body.series.find((row) => row.t.startsWith('2026-01-03'))?.requests).toBe(1);
+    expect(body.topModels.find((row) => row.publicId === 'mockstats/a')?.requests).toBe(3);
+    expect(body.topModels.find((row) => row.publicId === 'mockstats/b')?.requests).toBe(1);
+    expect(body.topApiKeys.find((row) => row.name === 'k')?.requests).toBe(4);
+  });
+});
+
 describe('cache-hit rate denominators follow provider token semantics', () => {
   const tally = (promptTokens: number, cacheReadTokens: number): LiveTally => ({ cacheReadTokens, promptTokens, gatewayCacheHits: 0, fallbacks: 0 });
 
@@ -134,6 +183,13 @@ describe('a combo served by its first member is not a fallback', () => {
       const rowsOne = db.select().from(sch.requests).all().filter((r) => r.requestedModel === 'combo/stats-one');
       const row = rowsOne[rowsOne.length - 1]!;
       expect(row.success).toBe(true);
+      const modelDay = db.select().from(sch.dailyModelStats).all().find((r) => r.day === row.createdAt.slice(0, 10) && r.modelId === row.finalModelId);
+      expect(modelDay?.requests).toBe(1);
+      expect(modelDay?.fallbackRequests).toBe(0);
+      const providerDay = db.select().from(sch.dailyProviderStats).all().find((r) => r.day === row.createdAt.slice(0, 10) && r.providerId === providerId);
+      expect(providerDay?.attempts).toBe(1);
+      const keyDay = db.select().from(sch.dailyApiKeyStats).all().find((r) => r.day === row.createdAt.slice(0, 10) && r.apiKeyId === row.apiKeyId);
+      expect(keyDay?.requests).toBe(1);
       // Member 1 answered, so this is a single attempt: it must not be counted as a retry.
       // (Live data confirms the same holds for multi-member combos: attempts_count equals
       // the highest attempt_number recorded, with no combo inflating the count.)

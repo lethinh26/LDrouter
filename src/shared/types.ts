@@ -204,10 +204,10 @@ export interface StatsSummary {
   cacheWriteTokens: number;
   reasoningTokens: number;
   averageLatencyMs: number;
-  p95LatencyMs: number;
+  p95LatencyMs: number | null;
   averageTtftMs: number | null;
   p95TtftMs: number | null;
-  cacheHitRate: number;
+  cacheHitRate: number | null;
   gatewayCacheHitRate: number;
   fallbackRate: number;
 }

@@ -93,5 +93,8 @@ describe('admin auth surface after setup', () => {
       body: JSON.stringify({ passphrase: '123456' }),
     });
     expect(res.status).toBe(200);
+    // The create route streams a binary .ldb body. Drain it so the connection goes
+    // idle; an unconsumed stream keeps app.close() waiting for the socket.
+    await res.arrayBuffer();
   });
 });

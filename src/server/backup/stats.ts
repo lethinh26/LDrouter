@@ -1,0 +1,25 @@
+import type Database from 'better-sqlite3';
+
+export interface RequestAggregateDelta {
+  day: string; modelId: string | null; apiKeyId: string | null; success: boolean; inputTokens: number; outputTokens: number;
+  cacheReadTokens: number; cacheWriteTokens: number; reasoningTokens: number; cacheHit: boolean; attemptsCount: number; latencyMs: number; ttftMs: number | null;
+}
+export interface AttemptAggregateDelta {
+  day: string; providerId: string; success: boolean; inputTokens: number; outputTokens: number; cacheReadTokens: number;
+  cacheWriteTokens: number; reasoningTokens: number; latencyMs: number;
+}
+
+/** Call within the raw request-log transaction; empty IDs represent missing dimensions. */
+export function upsertDailyAggregates(db: Database.Database, request: RequestAggregateDelta, attempts: AttemptAggregateDelta[]): void {
+  const model = db.prepare(`INSERT INTO daily_model_stats (day,model_id,requests,successful_requests,failed_requests,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,reasoning_tokens,gateway_cache_hits,fallback_requests,latency_success_sum_ms,latency_success_count,ttft_sum_ms,ttft_count)
+    VALUES (@day,@modelId,1,@success,1-@success,@inputTokens,@outputTokens,@cacheReadTokens,@cacheWriteTokens,@reasoningTokens,@cacheHit,@fallback,@latencySum,@latencyCount,@ttftSum,@ttftCount)
+    ON CONFLICT(day,model_id) DO UPDATE SET requests=requests+1,successful_requests=successful_requests+excluded.successful_requests,failed_requests=failed_requests+excluded.failed_requests,input_tokens=input_tokens+excluded.input_tokens,output_tokens=output_tokens+excluded.output_tokens,cache_read_tokens=cache_read_tokens+excluded.cache_read_tokens,cache_write_tokens=cache_write_tokens+excluded.cache_write_tokens,reasoning_tokens=reasoning_tokens+excluded.reasoning_tokens,gateway_cache_hits=gateway_cache_hits+excluded.gateway_cache_hits,fallback_requests=fallback_requests+excluded.fallback_requests,latency_success_sum_ms=latency_success_sum_ms+excluded.latency_success_sum_ms,latency_success_count=latency_success_count+excluded.latency_success_count,ttft_sum_ms=ttft_sum_ms+excluded.ttft_sum_ms,ttft_count=ttft_count+excluded.ttft_count`);
+  model.run({ day: request.day, modelId: request.modelId ?? '', success: Number(request.success), inputTokens: request.inputTokens, outputTokens: request.outputTokens, cacheReadTokens: request.cacheReadTokens, cacheWriteTokens: request.cacheWriteTokens, reasoningTokens: request.reasoningTokens, cacheHit: Number(request.cacheHit), fallback: Number(request.attemptsCount > 1), latencySum: request.success ? request.latencyMs : 0, latencyCount: Number(request.success), ttftSum: request.success ? request.ttftMs ?? 0 : 0, ttftCount: Number(request.success && request.ttftMs !== null) });
+  db.prepare(`INSERT INTO daily_api_key_stats (day,api_key_id,requests,successful_requests,failed_requests,input_tokens,output_tokens,total_tokens) VALUES (@day,@apiKeyId,1,@success,1-@success,@inputTokens,@outputTokens,@totalTokens)
+    ON CONFLICT(day,api_key_id) DO UPDATE SET requests=requests+1,successful_requests=successful_requests+excluded.successful_requests,failed_requests=failed_requests+excluded.failed_requests,input_tokens=input_tokens+excluded.input_tokens,output_tokens=output_tokens+excluded.output_tokens,total_tokens=total_tokens+excluded.total_tokens`)
+    .run({ day: request.day, apiKeyId: request.apiKeyId ?? '', success: Number(request.success), inputTokens: request.inputTokens, outputTokens: request.outputTokens, totalTokens: request.inputTokens + request.outputTokens });
+  const provider = db.prepare(`INSERT INTO daily_provider_stats (day,provider_id,attempts,successful_attempts,failed_attempts,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,reasoning_tokens,latency_success_sum_ms,latency_success_count)
+    VALUES (@day,@providerId,1,@success,1-@success,@inputTokens,@outputTokens,@cacheReadTokens,@cacheWriteTokens,@reasoningTokens,@latencySum,@latencyCount)
+    ON CONFLICT(day,provider_id) DO UPDATE SET attempts=attempts+1,successful_attempts=successful_attempts+excluded.successful_attempts,failed_attempts=failed_attempts+excluded.failed_attempts,input_tokens=input_tokens+excluded.input_tokens,output_tokens=output_tokens+excluded.output_tokens,cache_read_tokens=cache_read_tokens+excluded.cache_read_tokens,cache_write_tokens=cache_write_tokens+excluded.cache_write_tokens,reasoning_tokens=reasoning_tokens+excluded.reasoning_tokens,latency_success_sum_ms=latency_success_sum_ms+excluded.latency_success_sum_ms,latency_success_count=latency_success_count+excluded.latency_success_count`);
+  for (const attempt of attempts) provider.run({ day: attempt.day, providerId: attempt.providerId, success: Number(attempt.success), inputTokens: attempt.inputTokens, outputTokens: attempt.outputTokens, cacheReadTokens: attempt.cacheReadTokens, cacheWriteTokens: attempt.cacheWriteTokens, reasoningTokens: attempt.reasoningTokens, latencySum: attempt.success ? attempt.latencyMs : 0, latencyCount: Number(attempt.success) });
+}

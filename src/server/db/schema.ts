@@ -2,7 +2,7 @@
 // Source of truth: docs/02-DATA-MODEL.md
 
 import { sql } from 'drizzle-orm';
-import { sqliteTable, text, integer, index, uniqueIndex } from 'drizzle-orm/sqlite-core';
+import { sqliteTable, text, integer, index, uniqueIndex, primaryKey } from 'drizzle-orm/sqlite-core';
 
 // ============================================================================
 // Application settings (singleton)
@@ -469,6 +469,26 @@ export const requestAttempts = sqliteTable(
 );
 
 // ============================================================================
+export const dailyModelStats = sqliteTable('daily_model_stats', {
+  day: text('day').notNull(), modelId: text('model_id').notNull().default(''), requests: integer('requests').notNull().default(0),
+  successfulRequests: integer('successful_requests').notNull().default(0), failedRequests: integer('failed_requests').notNull().default(0),
+  inputTokens: integer('input_tokens').notNull().default(0), outputTokens: integer('output_tokens').notNull().default(0), cacheReadTokens: integer('cache_read_tokens').notNull().default(0),
+  cacheWriteTokens: integer('cache_write_tokens').notNull().default(0), reasoningTokens: integer('reasoning_tokens').notNull().default(0), gatewayCacheHits: integer('gateway_cache_hits').notNull().default(0),
+  fallbackRequests: integer('fallback_requests').notNull().default(0), latencySuccessSumMs: integer('latency_success_sum_ms').notNull().default(0), latencySuccessCount: integer('latency_success_count').notNull().default(0),
+  ttftSumMs: integer('ttft_sum_ms').notNull().default(0), ttftCount: integer('ttft_count').notNull().default(0),
+}, (t) => ({ pk: primaryKey({ columns: [t.day, t.modelId] }) }));
+
+export const dailyProviderStats = sqliteTable('daily_provider_stats', {
+  day: text('day').notNull(), providerId: text('provider_id').notNull(), attempts: integer('attempts').notNull().default(0), successfulAttempts: integer('successful_attempts').notNull().default(0),
+  failedAttempts: integer('failed_attempts').notNull().default(0), inputTokens: integer('input_tokens').notNull().default(0), outputTokens: integer('output_tokens').notNull().default(0), cacheReadTokens: integer('cache_read_tokens').notNull().default(0),
+  cacheWriteTokens: integer('cache_write_tokens').notNull().default(0), reasoningTokens: integer('reasoning_tokens').notNull().default(0), latencySuccessSumMs: integer('latency_success_sum_ms').notNull().default(0), latencySuccessCount: integer('latency_success_count').notNull().default(0),
+}, (t) => ({ pk: primaryKey({ columns: [t.day, t.providerId] }) }));
+
+export const dailyApiKeyStats = sqliteTable('daily_api_key_stats', {
+  day: text('day').notNull(), apiKeyId: text('api_key_id').notNull().default(''), requests: integer('requests').notNull().default(0), successfulRequests: integer('successful_requests').notNull().default(0), failedRequests: integer('failed_requests').notNull().default(0),
+  inputTokens: integer('input_tokens').notNull().default(0), outputTokens: integer('output_tokens').notNull().default(0), totalTokens: integer('total_tokens').notNull().default(0),
+}, (t) => ({ pk: primaryKey({ columns: [t.day, t.apiKeyId] }) }));
+
 // Audit logs (immutable, excluded from request retention)
 // ============================================================================
 

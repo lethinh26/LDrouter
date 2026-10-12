@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { PageHeader } from '../../components/ui/skeleton';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '../../components/ui/card';
@@ -8,9 +8,11 @@ import { Label } from '../../components/ui/label';
 import { Switch } from '../../components/ui/switch';
 import { Button } from '../../components/ui/button';
 import { Badge } from '../../components/ui/badge';
+import { Progress } from '../../components/ui/progress';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../../components/ui/select';
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger } from '../../components/ui/alert-dialog';
 import { api, fetchWithCsrf } from '../../lib/api';
+import { uploadBackup, type UploadProgress } from '../../lib/backup-upload';
 import { toast } from 'sonner';
 import { CheckCircle2, Download, Loader2, Bell, Volume2 } from 'lucide-react';
 import { useNotificationPrefs, saveNotificationPrefs, loadNotificationPrefs } from '../../lib/notification-settings';
@@ -98,6 +100,14 @@ export function Settings() {
   const [backupPassphrase, setBackupPassphrase] = useState('');
   const [backupPassphraseConfirm, setBackupPassphraseConfirm] = useState('');
   const [restorePassphrase, setRestorePassphrase] = useState('');
+  const [backupProfile, setBackupProfile] = useState<'compact' | 'full'>('compact');
+  // Restore is a single POST: upload is measurable, then the server validates and
+  // restores in one indeterminate phase. The status names the phase so the operator
+  // sees progress; only "uploading" carries a real percentage.
+  const [restorePhase, setRestorePhase] = useState<'idle' | 'uploading' | 'validating' | 'restoring' | 'complete' | 'failed'>('idle');
+  const [restoreProgress, setRestoreProgress] = useState<UploadProgress | null>(null);
+  const restoreAbort = useRef<AbortController | null>(null);
+  const [maxUploadBytes, setMaxUploadBytes] = useState<number | null>(null);
 
   const reload = async () => {
     const r = await api.get<{ settings: Settings }>('/api/admin/settings');
@@ -115,6 +125,12 @@ export function Settings() {
   // Refresh shared notification prefs store after every settings reload.
   useEffect(() => { void loadNotificationPrefs(true); }, []);
   useEffect(() => { void reload(); void checkUpdate(true); }, []);
+  // Server-side max upload size, for the pre-upload size warning.
+  useEffect(() => {
+    api.get<{ maxUploadBytes: number }>('/api/admin/backup/capabilities')
+      .then((r) => setMaxUploadBytes(r.maxUploadBytes))
+      .catch(() => setMaxUploadBytes(null));
+  }, []);
   if (!s) return <div className="text-muted-foreground">Loading…</div>;
   const update = async (patch: Partial<Settings>) => {
     try { await api.patch('/api/admin/settings', patch); toast.success('Saved'); void reload(); }
@@ -165,6 +181,67 @@ export function Settings() {
     } catch (e) { toast.error((e as Error).message); }
     setTotpRegenerating(false);
   };
+  const downloadBackup = async () => {
+    try {
+      const res = await fetchWithCsrf('/api/admin/backup/create', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ passphrase: backupPassphrase, profile: backupProfile }),
+      });
+      if (!res.ok) throw new Error((await res.json().catch(() => null))?.error?.message ?? 'Backup failed');
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `latedev-backup-${new Date().toISOString().replace(/[:.]/g, '-')}.ldb`;
+      a.click();
+      URL.revokeObjectURL(url);
+      toast.success('Backup downloaded');
+      setBackupPassphrase(''); setBackupPassphraseConfirm('');
+    } catch (e) { toast.error((e as Error).message); }
+  };
+
+  const startRestore = async () => {
+    const file = pendingRestoreFile;
+    if (!file) return;
+    const controller = new AbortController();
+    restoreAbort.current = controller;
+    setRestoreProgress({ loaded: 0, total: file.size, percent: 0 });
+    setRestorePhase('uploading');
+    // ponytail: the server validates then restores in one POST with no phase stream, so
+    // "Validating -> Restoring" is a cosmetic client-side sequence. Real percentage only
+    // exists for the upload; both later phases are indeterminate.
+    let phaseTimer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const result = await uploadBackup({
+        file,
+        passphrase: restorePassphrase || undefined,
+        signal: controller.signal,
+        onProgress: (p) => {
+          setRestoreProgress(p);
+          if (p.percent >= 100) {
+            setRestorePhase('validating');
+            phaseTimer = setTimeout(() => setRestorePhase('restoring'), 1500);
+          }
+        },
+      });
+      clearTimeout(phaseTimer);
+      setRestorePhase('complete');
+      toast.success(result.message || 'Restored. Reloading…');
+      setPendingRestoreFile(null);
+      // Full reload: flush all cached React state so the refreshed UI reads from the restored database.
+      setTimeout(() => location.reload(), 600);
+    } catch (e) {
+      clearTimeout(phaseTimer);
+      if ((e as Error).name === 'AbortError') { toast.info('Restore cancelled'); setRestorePhase('idle'); }
+      else { toast.error((e as Error).message); setRestorePhase('failed'); }
+    } finally {
+      restoreAbort.current = null;
+    }
+  };
+
+  const restoreActive = restorePhase === 'uploading' || restorePhase === 'validating' || restorePhase === 'restoring';
+  const overSizeLimit = maxUploadBytes !== null && pendingRestoreFile !== null && pendingRestoreFile.size > maxUploadBytes;
   const defaultTab = searchParams.get('tab') || 'logging';
   return (
     <div>
@@ -340,34 +417,42 @@ export function Settings() {
             <CardHeader><CardTitle className="text-base">Backup & restore</CardTitle><CardDescription>Download a snapshot or restore from a previous backup</CardDescription></CardHeader>
             <CardContent className="space-y-3">
               <div className="space-y-2 rounded border p-3">
+                <Label>Backup profile</Label>
+                <Select value={backupProfile} onValueChange={(v) => setBackupProfile(v as 'compact' | 'full')}>
+                  <SelectTrigger data-testid="backup-profile"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="compact">Compact (default)</SelectItem>
+                    <SelectItem value="full">Full forensic</SelectItem>
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-muted-foreground">
+                  {backupProfile === 'compact'
+                    ? 'Keeps configuration and daily statistics by model, provider, and API key. Excludes requests, attempts, audit logs, and the response cache — much smaller, less sensitive.'
+                    : 'Keeps everything, including requests, attempts, audit logs, and the response cache. May be much larger and contains sensitive request data.'}
+                </p>
+                {backupProfile === 'full' && (
+                  <p className="rounded bg-amber-50 border border-amber-200 p-2 text-xs text-amber-900 dark:bg-amber-950/20 dark:border-amber-800 dark:text-amber-200">
+                    ⚠️ Full forensic backups include raw request content and audit logs. Store the file securely.
+                  </p>
+                )}
+              </div>
+              <div className="space-y-2 rounded border p-3">
                 <Label>Backup passphrase (6 digits)</Label>
                 <Input inputMode="numeric" maxLength={6} value={backupPassphrase} onChange={(e) => setBackupPassphrase(e.target.value.replace(/\D/g, ''))} placeholder="123456" />
                 <Input inputMode="numeric" maxLength={6} value={backupPassphraseConfirm} onChange={(e) => setBackupPassphraseConfirm(e.target.value.replace(/\D/g, ''))} placeholder="Repeat passphrase" />
                 <p className="text-xs text-muted-foreground">This passphrase encrypts the master key inside the backup. You must enter the same 6 digits when importing on a new instance. Without it, encrypted provider credentials cannot be recovered.</p>
               </div>
-              <Button disabled={backupPassphrase.length !== 6 || backupPassphrase !== backupPassphraseConfirm} onClick={async () => {
-                try {
-                  const res = await fetchWithCsrf('/api/admin/backup/create', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ passphrase: backupPassphrase }) });
-                  if (!res.ok) throw new Error('Backup failed');
-                  const blob = await res.blob();
-                  const url = URL.createObjectURL(blob);
-                  const a = document.createElement('a');
-                  a.href = url; a.download = 'latedev-backup.json'; a.click();
-                  URL.revokeObjectURL(url);
-                  toast.success('Backup downloaded');
-                  setBackupPassphrase(''); setBackupPassphraseConfirm('');
-                } catch (e) { toast.error((e as Error).message); }
-              }}>Download backup</Button>
+              <Button disabled={backupPassphrase.length !== 6 || backupPassphrase !== backupPassphraseConfirm} onClick={downloadBackup}>Download backup</Button>
               <div className="space-y-2 rounded border p-3">
                 <Label>Backup passphrase for restore</Label>
                 <Input inputMode="numeric" maxLength={6} value={restorePassphrase} onChange={(e) => setRestorePassphrase(e.target.value.replace(/\D/g, ''))} placeholder="123456" />
                 <p className="text-xs text-muted-foreground">Use the 6-digit passphrase entered when the backup was created. It is required to restore the master key and administrator access.</p>
               </div>
-              <AlertDialog open={pendingRestoreFile !== null} onOpenChange={(o) => { if (!o) setPendingRestoreFile(null); }}>
+              <AlertDialog open={pendingRestoreFile !== null && !restoreActive} onOpenChange={(o) => { if (!o) setPendingRestoreFile(null); }}>
                 <AlertDialogTrigger asChild>
                   <div>
                     <Label>Restore from backup file</Label>
-                    <Input type="file" accept=".json,application/json" data-testid="restore-file" onChange={(e) => {
+                    <Input type="file" accept=".ldb,.ldb.json,application/octet-stream,application/json" data-testid="restore-file" disabled={restoreActive} onChange={(e) => {
                       const file = e.target.files?.[0];
                       setPendingRestoreFile(file ?? null);
                     }} />
@@ -384,23 +469,42 @@ export function Settings() {
                   </AlertDialogHeader>
                   <AlertDialogFooter>
                     <AlertDialogCancel>Cancel</AlertDialogCancel>
-                    <AlertDialogAction onClick={async () => {
-                      const file = pendingRestoreFile;
-                      if (!file) return;
-                      try {
-                        const backup = JSON.parse(await file.text());
-                        const res = await fetchWithCsrf('/api/admin/backup/restore', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ backup, passphrase: restorePassphrase }) });
-                        if (!res.ok) throw new Error((await res.json())?.error?.message ?? 'Restore failed');
-                        toast.success('Restored. Reloading…');
-                        setPendingRestoreFile(null);
-                        // Full reload: flush all cached React state so the
-                        // refreshed UI reads from the restored database.
-                        setTimeout(() => location.reload(), 600);
-                      } catch (e) { toast.error((e as Error).message); }
-                    }}>Restore</AlertDialogAction>
+                    <AlertDialogAction disabled={overSizeLimit} onClick={startRestore}>Restore</AlertDialogAction>
                   </AlertDialogFooter>
                 </AlertDialogContent>
               </AlertDialog>
+
+              {overSizeLimit && (
+                <p data-testid="size-warning" className="rounded bg-amber-50 border border-amber-200 p-2 text-xs text-amber-900 dark:bg-amber-950/20 dark:border-amber-800 dark:text-amber-200">
+                  ⚠️ This file is {((pendingRestoreFile?.size ?? 0) / 1048576).toFixed(1)} MiB, over the server limit of {(maxUploadBytes! / 1048576).toFixed(0)} MiB. The upload will be rejected — choose a smaller backup.
+                </p>
+              )}
+
+              {restorePhase !== 'idle' && (
+                <div className="space-y-2 rounded border p-3" data-testid="restore-progress">
+                  <div className="flex items-center justify-between text-sm">
+                    <span>
+                      {restorePhase === 'uploading' && 'Uploading…'}
+                      {restorePhase === 'validating' && 'Validating…'}
+                      {restorePhase === 'restoring' && 'Restoring…'}
+                      {restorePhase === 'complete' && 'Complete'}
+                      {restorePhase === 'failed' && 'Failed'}
+                    </span>
+                    {restorePhase === 'uploading' && restoreProgress && (
+                      <span className="text-muted-foreground">
+                        {(restoreProgress.loaded / 1048576).toFixed(1)} / {(restoreProgress.total / 1048576).toFixed(1)} MiB · {restoreProgress.percent}%
+                      </span>
+                    )}
+                  </div>
+                  <Progress value={restorePhase === 'uploading' ? (restoreProgress?.percent ?? 0) : 100} className={restorePhase !== 'uploading' ? 'animate-pulse' : undefined} />
+                  <div className="flex items-center gap-2">
+                    {restorePhase === 'uploading' && (
+                      <Button variant="outline" size="sm" onClick={() => restoreAbort.current?.abort()}>Cancel</Button>
+                    )}
+                    <span className="text-xs text-muted-foreground">Uploads are not resumable — cancelling restarts from the beginning.</span>
+                  </div>
+                </div>
+              )}
             </CardContent>
           </Card>
         </TabsContent>

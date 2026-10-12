@@ -1,12 +1,14 @@
 // Setup page: first-run admin creation. The master encryption key is REQUIRED
 // (unless already configured via LATEDEV_MASTER_KEY) — provider credentials are
 // encrypted with it, so the admin must keep a copy.
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Button } from '../../components/ui/button';
 import { Input } from '../../components/ui/input';
 import { Label } from '../../components/ui/label';
+import { Progress } from '../../components/ui/progress';
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '../../components/ui/card';
 import { api } from '../../lib/api';
+import { uploadBackup, type UploadProgress } from '../../lib/backup-upload';
 import { toast } from 'sonner';
 
 export function Setup() {
@@ -20,6 +22,9 @@ export function Setup() {
   const [importFile, setImportFile] = useState<File | null>(null);
   const [importPassphrase, setImportPassphrase] = useState('');
   const [importing, setImporting] = useState(false);
+  const [importPhase, setImportPhase] = useState<'idle' | 'uploading' | 'validating' | 'restoring' | 'failed'>('idle');
+  const [importProgress, setImportProgress] = useState<UploadProgress | null>(null);
+  const importAbort = useRef<AbortController | null>(null);
 
   useEffect(() => {
     api.get<{ masterKeyConfigured: boolean }>('/api/admin/setup/status')
@@ -29,6 +34,43 @@ export function Setup() {
 
   const keyOk = !masterKeyRequired || masterKey.trim().length >= 32;
   const canSubmit = !submitting && password.length >= 12 && keyOk;
+
+  const runImport = async () => {
+    if (!importFile) return;
+    const controller = new AbortController();
+    importAbort.current = controller;
+    setImporting(true);
+    setImportProgress({ loaded: 0, total: importFile.size, percent: 0 });
+    setImportPhase('uploading');
+    // ponytail: validation + restore are one indeterminate server phase; the
+    // Validating -> Restoring transition is cosmetic (no server phase stream).
+    let phaseTimer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await uploadBackup({
+        file: importFile,
+        passphrase: importPassphrase || undefined,
+        signal: controller.signal,
+        includeCsrf: false, // first run has no admin session; the server exempts this path
+        onProgress: (p) => {
+          setImportProgress(p);
+          if (p.percent >= 100) {
+            setImportPhase('validating');
+            phaseTimer = setTimeout(() => setImportPhase('restoring'), 1500);
+          }
+        },
+      });
+      clearTimeout(phaseTimer);
+      toast.success('Database imported');
+      window.location.assign('/login');
+    } catch (e) {
+      clearTimeout(phaseTimer);
+      if ((e as Error).name === 'AbortError') { toast.info('Import cancelled'); setImportPhase('idle'); }
+      else { toast.error((e as Error).message); setImportPhase('failed'); }
+    } finally {
+      importAbort.current = null;
+      setImporting(false);
+    }
+  };
 
   return (
     <div className="flex min-h-screen items-center justify-center bg-background p-4">
@@ -77,23 +119,30 @@ export function Setup() {
           <div className="border-t pt-4 space-y-2">
             <Label>Import existing database</Label>
             <p className="text-xs text-muted-foreground">Use this to restore the administrator account, password, TOTP settings, providers, models, and master key from a backup without setting up again. Enter the same 6-digit backup passphrase used when the file was created.</p>
-            <Input type="file" accept=".json,application/json" onChange={(e) => setImportFile(e.target.files?.[0] ?? null)} />
+            <Input type="file" accept=".ldb,.ldb.json,application/octet-stream,application/json" disabled={importing} onChange={(e) => setImportFile(e.target.files?.[0] ?? null)} />
             <Input inputMode="numeric" maxLength={6} value={importPassphrase} onChange={(e) => setImportPassphrase(e.target.value.replace(/\D/g, ''))} placeholder="Backup passphrase (6 digits)" />
-            <Button variant="outline" disabled={!importFile || importPassphrase.length !== 6 || importing} onClick={async () => {
-              if (!importFile) return;
-              setImporting(true);
-              try {
-                const backup = JSON.parse(await importFile.text());
-                // Deliberately a bare fetch: on first run there is no admin session, so
-                // fetchWithCsrf's token pre-fetch would fail. The server exempts this path until
-                // setup is complete.
-                const res = await fetch('/api/admin/backup/restore', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ backup, passphrase: importPassphrase }) });
-                if (!res.ok) throw new Error((await res.json())?.error?.message ?? 'Import failed');
-                toast.success('Database imported');
-                window.location.assign('/login');
-              } catch (e) { toast.error((e as Error).message); }
-              finally { setImporting(false); }
-            }}>Import database</Button>
+            <Button variant="outline" disabled={!importFile || importPassphrase.length !== 6 || importing} onClick={runImport}>Import database</Button>
+            {importPhase !== 'idle' && (
+              <div className="space-y-2 rounded border p-3" data-testid="import-progress">
+                <div className="flex items-center justify-between text-sm">
+                  <span>
+                    {importPhase === 'uploading' && 'Uploading…'}
+                    {importPhase === 'validating' && 'Validating…'}
+                    {importPhase === 'restoring' && 'Restoring…'}
+                    {importPhase === 'failed' && 'Failed'}
+                  </span>
+                  {importPhase === 'uploading' && importProgress && (
+                    <span className="text-muted-foreground">
+                      {(importProgress.loaded / 1048576).toFixed(1)} / {(importProgress.total / 1048576).toFixed(1)} MiB · {importProgress.percent}%
+                    </span>
+                  )}
+                </div>
+                <Progress value={importPhase === 'uploading' ? (importProgress?.percent ?? 0) : 100} className={importPhase !== 'uploading' ? 'animate-pulse' : undefined} />
+                {importPhase === 'uploading' && (
+                  <Button variant="outline" size="sm" onClick={() => importAbort.current?.abort()}>Cancel</Button>
+                )}
+              </div>
+            )}
           </div>
         </CardFooter>
       </Card>

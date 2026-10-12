@@ -16,7 +16,7 @@ Lightweight self-hosted LLM gateway with a polished admin UI. Presents stable Op
 - Request + attempt logs, statistics (Today / 7d / 30d), retention cleanup
 - Admin TOTP 2FA, Argon2id passwords, recovery codes
 - Immutable audit logs
-- Consistent backup / restore (SQLite snapshot + checksum + schema validation)
+- Consistent backup / restore: compact `.ldb` default + full forensic profile, streamed upload with progress/cancel
 - Prometheus `/metrics`, structured logs, graceful shutdown
 - One distributable npm package, multi-stage Dockerfile, Docker Compose
 
@@ -52,6 +52,20 @@ The data directory defaults to `~/.latedev-router/` and can be overridden via `L
 | `LATEDEV_MASTER_KEY` | 32-byte base64 key for encrypting provider credentials | _required once providers exist_ |
 | `LATEDEV_TRUST_PROXY` | Number of reverse-proxy hops to trust for X-Forwarded-For | `0` |
 | `LATEDEV_LOG_LEVEL` | trace / debug / info / warn / error / fatal | `info` |
+| `LATEDEV_MAX_BACKUP_UPLOAD_BYTES` | Maximum accepted backup restore upload size (bytes) | `268435456` (256 MiB) |
+
+## Backup & restore
+
+Backups download from Settings > Backup (or first-run Setup). New backups use the binary `.ldb` container; legacy `.ldb.json` files remain restoreable.
+
+- **Compact (default)** — retains all gateway configuration, encrypted provider credentials, API-key configuration, quota usage, and daily statistics by model/provider/API key. It excludes requests, attempts, audit logs, and the gateway response cache, so it is much smaller and is the right choice for routine backups.
+- **Full (forensic)** — retains every raw row, including request/attempt/audit and cached response content. It can be much larger and contains sensitive data; treat the file as confidential.
+
+To restore, upload the `.ldb` file (or legacy `.ldb.json`) and enter the **same six-digit passphrase** used to create it — it decrypts the encrypted master key inside the backup. Without it, restored provider credentials cannot be decrypted. The upload streams to disk with real progress and a Cancel button; **uploads are not resumable**, so an interrupted upload must be restarted. The default upload size limit is 256 MiB (`LATEDEV_MAX_BACKUP_UPLOAD_BYTES`); over-limit uploads are rejected with HTTP 413.
+
+Restore validates the container, checksum, gzip, SQLite integrity, schema version, and key envelope before an atomic swap, and keeps a pre-restore snapshot so a failure rolls back to the previous database.
+
+**Limitation:** a compact backup cannot restore individual request/attempt/audit history or cached responses, and after a compact restore historical p95 latency and p95 TTFT percentiles are unavailable for aggregate-only days (average latency/TTFT and top rankings are retained). Use a full backup if you need that row-level detail or percentile history.
 
 ## Public API examples
 

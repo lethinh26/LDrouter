@@ -8,7 +8,7 @@ import type { LucideIcon } from 'lucide-react';
 interface SummaryCardProps {
   icon: LucideIcon;
   label: string;
-  value: number;
+  value: number | null;
   format?: 'number' | 'percent' | 'latency';
   delta?: number; // relative change vs previous period (> 0 = increase)
   deltaInverse?: boolean; // true for latency/TTFT where decrease = positive
@@ -51,12 +51,13 @@ export function SummaryCard({ icon: Icon, label, value, format = 'number', delta
   useEffect(() => {
     const from = prevRef.current;
     const to = value;
-    prevRef.current = value;
+    if (to === null) return;
+    prevRef.current = to;
     if (from === to) return;
     animateCount(Math.abs(to - from), 600, (v) => setDisplay(from + (to > from ? v : -v)));
   }, [value]);
 
-  const formatted = format === 'percent' ? formatPercent(display)
+  const formatted = value === null ? 'Unavailable' : format === 'percent' ? formatPercent(display)
     : format === 'latency' ? formatLatencyMs(display)
     : formatNumber(Math.round(display));
 

@@ -98,21 +98,34 @@ Audit records must:
 
 No bulk “clear audit log” action in v1.
 
-## Database download
+## Database download (backup)
 
 A DB backup must be produced safely while SQLite is in use. Do not copy the main database file blindly while WAL writes are active.
 
-Use SQLite's backup capability or another consistent snapshot technique.
+Use SQLite's backup capability or another consistent snapshot technique. The exporter takes a consistent `better-sqlite3` snapshot and streams it through gzip without ever buffering the database in memory.
 
-Backup package should include enough metadata to validate:
+### Container format (v2)
 
-- LateDev Router application version
-- schema version
-- creation timestamp
-- checksum
-- an encrypted master key envelope
+New backups use a binary container with the `.ldb` extension:
 
-Before downloading, the admin enters a six-digit backup passphrase. The passphrase is not stored in SQLite, logs, or audit metadata. It derives a key used to encrypt the master key in the backup envelope. The passphrase must be entered again during import; without it, the restored provider credentials cannot be decrypted. The backup database itself contains the admin username, Argon2id password hash, encrypted TOTP secret, and hashed recovery codes.
+1. a fixed magic/version prefix (`LDRB` + version byte + 4-byte big-endian manifest length),
+2. a length-prefixed UTF-8 JSON manifest,
+3. a gzip-compressed standalone SQLite payload.
+
+The manifest carries only: `format` (`latedev-backup`), `version` (2), `profile`, `appVersion`, `schemaVersion`, `createdAt`, `compressedBytes`, `uncompressedBytes`, `checksum` (SHA-256 of exactly the compressed payload bytes), the passphrase-protected `keyEnvelope`, `excludedTables`, and a `statistics` block (`granularity: daily`, dimensions `model`/`provider`/`api_key`, `p95Available: false`). It never contains the plaintext master key, passphrase, provider credential, session cookie, API key, prompt, response, audit metadata, or cache content. See `docs/superpowers/specs/2026-10-11-compact-backup-and-streaming-restore-design.md` for the exact layout.
+
+### Profiles
+
+- **Compact (default)** — retains all gateway configuration and entities, schema migrations/settings, admin credential/TOTP/recovery state, encrypted provider credentials, API-key configuration, quota aggregates, and daily statistics by model, provider, and API key. It excludes the forensic/volatile tables `requests`, `request_attempts`, `audit_logs`, the gateway response cache (`response_cache`), admin sessions (`admin_sessions`), csrf tokens (`csrf_tokens`), and `backups`. A compact backup is materially smaller and is the recommended routine download.
+- **Full (forensic)** — keeps every row, including raw request/attempt/audit/cache content. It can be much larger and contains sensitive logged and cached content, so treat the file as confidential. It is explicitly labeled sensitive in the UI.
+
+A compact backup **cannot restore individual request, attempt, or audit history**; only a full backup preserves that row-level detail. Aggregate statistics survive a compact restore, but per-request detail does not.
+
+Both profiles record an audit event after the response payload is prepared. Audit metadata contains only profile, byte count, checksum, and excluded table names.
+
+### Passphrase and key envelope
+
+Before downloading, the admin enters a six-digit backup passphrase. The passphrase is not stored in SQLite, logs, or audit metadata. It derives a key used to encrypt the master key in the backup envelope. The **same six-digit passphrase** must be entered again during restore; without it the restored provider credentials cannot be decrypted. The backup database itself contains the admin username, Argon2id password hash, encrypted TOTP secret, and hashed recovery codes.
 
 Provider credentials remain encrypted inside the database. The master key is included only in the passphrase-protected envelope, never as plaintext backup metadata.
 
@@ -122,24 +135,37 @@ Downloading a backup generates an audit event.
 
 Do not overwrite the live database immediately after file upload.
 
-Required flow:
+The restore endpoint accepts a streamed `multipart/form-data` body with exactly one `backup` file (`.ldb` or legacy `.ldb.json`) and an optional six-digit `passphrase` field, plus the legacy v1 JSON request body. The lifecycle is:
 
-1. upload to a temporary location with strict size limit
-2. validate file/package format
-3. validate checksum
-4. validate SQLite integrity
-5. read schema/application metadata
-6. reject unsupported future schema versions
-7. create a backup of the currently live DB
-8. enter a controlled maintenance/restore section where writes are blocked
-9. atomically replace/restore
-10. reopen database and verify migrations/integrity
-11. if validation fails, rollback to the pre-restore copy
-12. audit attempt and result
+1. stream the upload to a private temporary file (`<dataDir>/restore-tmp`, directory mode `0700`, file mode `0600`) with strict size limit — the body is never buffered in memory;
+2. validate the file/package format (v2 header/manifest, or legacy v1 envelope);
+3. validate the checksum;
+4. validate gzip decompression;
+5. validate SQLite integrity (`PRAGMA integrity_check` on a read-only connection);
+6. read schema/application metadata and reject unsupported future schema versions;
+7. validate the passphrase-protected master-key envelope;
+8. create a snapshot of the currently live DB;
+9. enter a controlled maintenance/restore section where writes are blocked;
+10. atomically replace/restore;
+11. reopen database and verify migrations/integrity;
+12. if any post-swap validation fails, roll back to the pre-restore copy and restore the previous master-key override;
+13. audit attempt and result.
+
+**Operator rollback guarantee:** the pre-restore snapshot is kept, and any failure after the swap rolls the live database back to it. A rollback failure is reported explicitly and requires a gateway restart; the gateway never stays on a broken database silently.
 
 Never execute SQL text embedded in arbitrary upload formats. Restore only the supported database backup format.
 
 For passphrase-protected backups, the master key is restored from the encrypted envelope. Legacy backups without a key envelope still require the master key from deployment configuration.
+
+### Compatibility window
+
+Legacy **v1 JSON** backups (`.ldb.json`, format `latedev-backup`, `version: 1`) remain restoreable during a compatibility window; their `payload` is checksum-validated before decompression. New exports never create v1 files. The restore endpoint does not accept SQL dumps or arbitrary archive formats.
+
+### Upload limits and UI
+
+The maximum uploaded backup size defaults to **256 MiB** and is configurable via `LATEDEV_MAX_BACKUP_UPLOAD_BYTES`. It is enforced against `Content-Length` when present and during stream writes when absent. An authenticated preflight endpoint `GET /api/admin/backup/capabilities` returns `{ maxUploadBytes }` so the UI can validate a file before upload. Over-limit uploads are rejected with HTTP **413**.
+
+The Settings > Backup and first-run Setup UIs upload via a native XHR multipart request and show real upload progress (percent and uploaded/total bytes) with a **Cancel** button while the upload is active, followed by sequential Uploading → Validating → Restoring → Complete/Failed status. **Uploads are not resumable** — an interrupted upload must be restarted from the file picker. Temporary upload, decompressed payload, and staging files are removed on success, failure, and abort.
 
 ## Web security headers
 

@@ -45,15 +45,17 @@ export function Statistics() {
         </Tabs>
       } />
 
+      {!snapshot.percentilesAvailable && <p className="mb-3 text-sm text-muted-foreground">Percentiles are unavailable for compacted historical data; cache hit rate is unavailable when provider token semantics were not retained.</p>}
+
       {/* Summary cards */}
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
         <SummaryCard icon={Activity} label="Requests" value={s.totalRequests} delta={delta(s.totalRequests, prev.totalRequests)} sparkData={sparkRequests} />
         <SummaryCard icon={CheckCircle2} label="Success rate" format="percent" value={s.successRate} delta={delta(s.successRate, prev.successRate)} sparkData={sparkRequests} sparkStroke="stroke-emerald-500" />
         <SummaryCard icon={Cpu} label="Total tokens" value={s.totalTokens} delta={delta(s.totalTokens, prev.totalTokens)} sparkData={series.map((b) => b.inputTokens + b.outputTokens)} />
-        <SummaryCard icon={Database} label="Cache hit rate" format="percent" value={s.cacheHitRate} delta={delta(s.cacheHitRate, prev.cacheHitRate)} sparkData={series.map((b) => b.cacheRead)} />
+        <SummaryCard icon={Database} label="Cache hit rate" format="percent" value={s.cacheHitRate} delta={s.cacheHitRate !== null && prev.cacheHitRate !== null ? delta(s.cacheHitRate, prev.cacheHitRate) : undefined} sparkData={series.map((b) => b.cacheRead)} />
         <SummaryCard icon={Clock} label="Avg latency" format="latency" value={s.averageLatencyMs} delta={delta(s.averageLatencyMs, prev.averageLatencyMs)} deltaInverse sparkData={sparkLatency} sparkStroke="stroke-amber-500" />
         <SummaryCard icon={Gauge} label="p95 latency" format="latency" value={s.p95LatencyMs} />
-        <SummaryCard icon={TrendingUp} label="Avg TTFT" format="latency" value={s.averageTtftMs ?? 0} />
+        <SummaryCard icon={TrendingUp} label="Avg TTFT" format="latency" value={s.averageTtftMs} />
         <SummaryCard icon={Route} label="Fallback rate" format="percent" value={s.fallbackRate} delta={delta(s.fallbackRate, prev.fallbackRate)} deltaInverse />
       </div>
 

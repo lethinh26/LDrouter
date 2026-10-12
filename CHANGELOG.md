@@ -4,6 +4,26 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.19.0] - 2026-10-12
+
+### Added
+
+- Compact and full database backup profiles, exported as a v2 `.ldb` binary container (manifest + gzip payload + encrypted key envelope).
+- Compact backups keep all gateway configuration and daily statistics (by model, provider and API key) while excluding request/attempt/audit logs, the gateway response cache, admin sessions, CSRF tokens and previous backups.
+- Streamed multipart restore: the upload is written to disk, then validated (checksum, gzip, SQLite integrity, schema, key envelope) before an atomic swap with rollback, with real upload progress and cancel in the admin UI.
+- `LATEDEV_MAX_BACKUP_UPLOAD_BYTES` (default 256 MiB) and a `GET /api/admin/backup/capabilities` preflight.
+- Daily aggregate statistics tables (`daily_model_stats`, `daily_provider_stats`, `daily_api_key_stats`) written in the same transaction as request persistence.
+
+### Changed
+
+- Backup download extension is now `.ldb` (previously `.json`); legacy v1 JSON backups remain restorable.
+- Statistics over a range that includes a compacted day report p95 latency and TTFT as unavailable instead of a misleading zero.
+
+### Notes
+
+- A compact restore cannot recover individual request, attempt or audit history, and the response cache is empty after a compact restore even when caching is enabled.
+- Uploads are not resumable.
+
 ## [1.18.2] - 2026-10-02
 
 ### Fixed

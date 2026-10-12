@@ -9,9 +9,9 @@ export interface StatsSummaryShape {
   totalRequests: number; successfulRequests: number; failedRequests: number; successRate: number;
   inputTokens: number; outputTokens: number; totalTokens: number;
   cacheReadTokens: number; cacheWriteTokens: number; reasoningTokens: number;
-  averageLatencyMs: number; p95LatencyMs: number;
+  averageLatencyMs: number; p95LatencyMs: number | null;
   averageTtftMs: number | null; p95TtftMs: number | null;
-  cacheHitRate: number; gatewayCacheHitRate: number; fallbackRate: number;
+  cacheHitRate: number | null; gatewayCacheHitRate: number; fallbackRate: number;
 }
 
 export interface RoutingProviderShape {
@@ -34,6 +34,7 @@ export interface Pulse { id: string; providerId: string; success: boolean }
 export interface ActiveRoute { id: string; providerId: string; startedAt: number; ttftMs: number }
 
 export interface StatsSnapshot {
+  percentilesAvailable: boolean;
   range: { from: string; to: string; bucket: string };
   summary: StatsSummaryShape;
   previous: StatsSummaryShape;
@@ -177,7 +178,7 @@ export function useLiveStats(preset: Preset): UseLiveStatsResult {
           // it). Rounded: a token count is an integer, so this drops float noise only. With
           // no cache reads the rate is 0 and no inversion is possible — the plain sum is
           // then correct anyway, since nothing was cached.
-          promptTokens: r.summary.cacheHitRate > 0
+          promptTokens: r.summary.cacheHitRate !== null && r.summary.cacheHitRate > 0
             ? Math.round(r.summary.cacheReadTokens / r.summary.cacheHitRate)
             : r.summary.inputTokens,
           gatewayCacheHits: Math.round(r.summary.gatewayCacheHitRate * r.summary.totalRequests),

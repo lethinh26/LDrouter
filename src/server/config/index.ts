@@ -15,6 +15,9 @@ const EnvSchema = z.object({
   // Alias used by docs/13 debug tooling: LOG_LEVEL=debug enables lifecycle lines.
   LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal']).optional(),
   LATEDEV_DB_URL: z.string().optional(),
+  // Maximum accepted database-restore upload. Default 256 MiB, matching the operator expectation
+  // that a full forensic backup of a heavily-logged instance still restores.
+  LATEDEV_MAX_BACKUP_UPLOAD_BYTES: z.coerce.number().int().positive().default(256 * 1024 * 1024),
   NODE_ENV: z.enum(['development', 'production', 'test']).default('production'),
 });
 
@@ -31,6 +34,7 @@ export interface RuntimeConfig {
   env: 'development' | 'production' | 'test';
   isContainer: boolean;
   appVersion: string;
+  maxBackupUploadBytes: number;
 }
 
 let cached: RuntimeConfig | null = null;
@@ -88,6 +92,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, argv: string[] 
     env: parsed.NODE_ENV,
     isContainer,
     appVersion: getAppVersion(),
+    maxBackupUploadBytes: parsed.LATEDEV_MAX_BACKUP_UPLOAD_BYTES,
   };
   return cached;
 }

@@ -1,6 +1,6 @@
 // Gateway execution pipeline: auth -> resolve -> ACL -> limits -> route -> attempt -> persist.
 
-import { getDb, schema } from '../db/index';
+import { getDb, getRawDb, schema } from '../db/index';
 import { eq } from 'drizzle-orm';
 import { GatewayError } from '../errors';
 import { resolveRequestedModel, unwrapAlias } from '../routing/resolver';
@@ -24,6 +24,7 @@ import { uuid } from '../auth/ids';
 import { redactString, redactValue } from '../security/redact';
 import { getSettings } from '../db/repositories/settings';
 import { buildCacheKey, lookupCache, storeCache, cacheAllowed } from '../caching/store';
+import { upsertDailyAggregates } from '../backup/stats';
 import { metrics } from '../metrics/registry';
 import type { FastifyReply } from 'fastify';
 import { emitRequestLogged, emitRequestStarted } from './events';
@@ -1035,6 +1036,33 @@ export class GatewayRunner {
     if (settings.contentLogMode === 'prompt_and_response') {
       responsePayload = JSON.stringify(redactValue({ text: outcome.text, toolCalls: outcome.toolCalls, finishReason: outcome.finishReason }));
     }
+    const persistedAttempts = attempts.map((a) => ({
+      id: uuid(),
+      requestId,
+      attemptNumber: a.attemptNumber,
+      providerId: a.providerId,
+      modelId: a.modelId,
+      codexAccountId: a.codexAccountId ?? null,
+      qoderAccountId: a.qoderAccountId ?? null,
+      startedAt: a.startedAt,
+      completedAt: a.completedAt,
+      statusCode: a.statusCode,
+      success: a.success,
+      latencyMs: a.latencyMs,
+      ttftMs: a.ttftMs,
+      inputTokens: a.usage.input,
+      outputTokens: a.usage.output,
+      cacheReadTokens: a.usage.cacheRead,
+      cacheWriteTokens: a.usage.cacheWrite,
+      reasoningTokens: a.usage.reasoning,
+      streamStarted: a.streamStarted ? 1 : 0,
+      partialResponse: a.partialResponse ? 1 : 0,
+      selectionReason: a.selectionReason,
+      failureReason: a.failureReason,
+      errorMessage: a.sanitizedError ? redactString(a.sanitizedError) : null,
+      upstreamRequestId: a.upstreamRequestId,
+    }));
+    const tx = getRawDb().transaction(() => {
     db.insert(schema.requests).values({
       id: requestId,
       createdAt: now,
@@ -1067,34 +1095,19 @@ export class GatewayRunner {
       gatewayCacheHit: cacheHit ? true : false,
     } as never).run();
 
-    for (const a of attempts) {
-      db.insert(schema.requestAttempts).values({
-        id: uuid(),
-        requestId,
-        attemptNumber: a.attemptNumber,
-        providerId: a.providerId,
-        modelId: a.modelId,
-        codexAccountId: a.codexAccountId ?? null,
-        qoderAccountId: a.qoderAccountId ?? null,
-        startedAt: a.startedAt,
-        completedAt: a.completedAt,
-        statusCode: a.statusCode,
-        success: a.success,
-        latencyMs: a.latencyMs,
-        ttftMs: a.ttftMs,
-        inputTokens: a.usage.input,
-        outputTokens: a.usage.output,
-        cacheReadTokens: a.usage.cacheRead,
-        cacheWriteTokens: a.usage.cacheWrite,
-        reasoningTokens: a.usage.reasoning,
-        streamStarted: a.streamStarted ? 1 : 0,
-        partialResponse: a.partialResponse ? 1 : 0,
-        selectionReason: a.selectionReason,
-        failureReason: a.failureReason,
-        errorMessage: a.sanitizedError ? redactString(a.sanitizedError) : null,
-        upstreamRequestId: a.upstreamRequestId,
-      } as never).run();
-    }
+    for (const attempt of persistedAttempts) db.insert(schema.requestAttempts).values(attempt as never).run();
+    upsertDailyAggregates(getRawDb(), {
+      day: now.slice(0, 10), modelId: outcome.finalModelId, apiKeyId: ctx.key?.id ?? null,
+      success: outcome.success, inputTokens: usage.input, outputTokens: usage.output,
+      cacheReadTokens: usage.cacheRead, cacheWriteTokens: usage.cacheWrite, reasoningTokens: usage.reasoning,
+      cacheHit, attemptsCount: attempts.length, latencyMs: outcome.latencyMs, ttftMs: outcome.ttftMs,
+    }, attempts.map((a) => ({
+      day: a.startedAt.slice(0, 10), providerId: a.providerId, success: a.success,
+      inputTokens: a.usage.input, outputTokens: a.usage.output, cacheReadTokens: a.usage.cacheRead,
+      cacheWriteTokens: a.usage.cacheWrite, reasoningTokens: a.usage.reasoning, latencyMs: a.latencyMs,
+    })));
+    });
+    tx();
 
     emitRequestLogged(requestId);
   }

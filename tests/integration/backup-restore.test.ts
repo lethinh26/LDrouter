@@ -3,9 +3,11 @@
 // Verifies the gateway reloads the restored database in-process — no restart
 // needed — and that the admin session survives the swap.
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import zlib from 'node:zlib';
 import { sql } from 'drizzle-orm';
 
 const dataDir = path.join(os.tmpdir(), `latedev-br-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
@@ -19,6 +21,35 @@ let app: import('fastify').FastifyInstance | undefined;
 let baseUrl = '';
 let cookies = '';
 let providerId = '';
+
+/** Build a v1 JSON envelope exactly as the old create route did: snapshot the live DB,
+ *  gzip it, and passphrase-encrypt the master key. New exports are binary `.ldb`, so this
+ *  keeps the restore path — which must still accept v1 — under test. */
+async function legacyEnvelope(): Promise<Record<string, unknown>> {
+  const { loadConfig } = await import('../../src/server/config/index');
+  const { encryptBackupMasterKey } = await import('../../src/server/auth/backup-crypto');
+  const { parseMasterKey } = await import('../../src/server/auth/crypto');
+  const { getSettings } = await import('../../src/server/db/repositories/settings');
+  const cfg = loadConfig();
+  const Database = (await import('better-sqlite3')).default;
+  const temp = path.join(cfg.dataDir, `.legacy-${Date.now()}.sqlite`);
+  const source = new Database(cfg.dbFile, { readonly: true });
+  try { await source.backup(temp); } finally { source.close(); }
+  const compressed = zlib.gzipSync(fs.readFileSync(temp));
+  fs.unlinkSync(temp);
+  const masterKey = parseMasterKey(cfg.masterKey ?? fs.readFileSync(path.join(cfg.dataDir, 'master.key'), 'utf8').trim());
+  return {
+    format: 'latedev-backup',
+    version: 1,
+    appVersion: '0.0.0',
+    schemaVersion: getSettings().schemaVersion,
+    masterKeyConfigured: true,
+    createdAt: new Date().toISOString(),
+    payload: compressed.toString('base64'),
+    checksum: crypto.createHash('sha256').update(compressed).digest('hex'),
+    keyEnvelope: encryptBackupMasterKey(masterKey, '123456'),
+  };
+}
 
 beforeAll(async () => {
   const { buildApp } = await import('../../src/server/app');
@@ -61,13 +92,9 @@ afterAll(async () => {
 
 describe('hot restore', () => {
   it('replaces the database in-process and keeps the admin session', async () => {
-    // 1. Download a backup of the current (2-row) database.
-    const createRes = await fetch(`${baseUrl}/api/admin/backup/create`, {
-      method: 'POST', headers: { cookie: cookies, 'content-type': 'application/json' },
-      body: JSON.stringify({ passphrase: '123456' }),
-    });
-    expect(createRes.status).toBe(200);
-    const envelope = await createRes.json() as Record<string, unknown>;
+    // 1. Build a legacy v1 envelope of the current (2-row) database. The create
+    //    route now streams a binary .ldb, so this keeps the v1 restore path covered.
+    const envelope = await legacyEnvelope();
     expect(envelope.keyEnvelope).toBeTruthy();
 
     const wrongPassphraseRes = await fetch(`${baseUrl}/api/admin/backup/restore`, {
@@ -145,12 +172,7 @@ describe('hot restore', () => {
       apiKeyNonce: encryptedApiKey.nonce, apiKeyVersion: encryptedApiKey.version, enabled: true,
     }).run();
 
-    const createRes = await fetch(`${baseUrl}/api/admin/backup/create`, {
-      method: 'POST', headers: { cookie: cookies, 'content-type': 'application/json' },
-      body: JSON.stringify({ passphrase: '123456' }),
-    });
-    expect(createRes.status).toBe(200);
-    const envelope = await createRes.json() as Record<string, unknown>;
+    const envelope = await legacyEnvelope();
 
     setConfigMasterKey(liveKey);
     resetMasterKeyCache();
