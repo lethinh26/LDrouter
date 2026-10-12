@@ -87,6 +87,45 @@ describe('aggregate-only historical statistics', () => {
     expect(response.status).toBe(400);
   });
 
+  // A day carrying a daily aggregate row is NOT compacted history: the aggregate is written for
+  // every logged request, so every day with traffic has one. Reading one as "compacted" refused
+  // any range clipping it — and a preset window that starts at "now minus N days" ALWAYS clips
+  // the day it starts on. So the moment a day's raw detail was gone (retention pruning it, or a
+  // compact backup restore leaving only aggregates), EVERY preset the Statistics page can send
+  // answered 400 and the page showed only "Failed to load statistics". Both shapes live in one
+  // window here, because an aggregate-only day and a day that still has its detail must each be
+  // counted exactly once.
+  it('serves a preset over an aggregate-only day and a day that still has raw rows', async () => {
+    const db = (await import('../../src/server/db/index')).getDb();
+    const sch = await import('../../src/server/db/schema');
+    const { uuid } = await import('../../src/server/auth/ids');
+    const apiKeyId = db.select().from(sch.apiKeys).all()[0]!.id;
+    const daysAgo = (n: number) => new Date(Date.now() - n * 24 * 3600 * 1000).toISOString().slice(0, 10);
+    // The window's own start day, pruned to its aggregate (retention, or a compact restore).
+    const prunedDay = daysAgo(6);
+    db.insert(sch.dailyModelStats).values({ day: prunedDay, modelId: modelA, requests: 5, successfulRequests: 5, failedRequests: 0, inputTokens: 25, outputTokens: 10, latencySuccessSumMs: 500, latencySuccessCount: 5 }).run();
+    // A day with detail left: 5 requests logged, 5 raw rows retained, plus its aggregate row.
+    const rawDay = daysAgo(5);
+    for (let i = 0; i < 5; i += 1) {
+      db.insert(sch.requests).values({ id: uuid(), createdAt: `${rawDay}T1${i}:00:00.000Z`, apiKeyId, clientIp: '127.0.0.1', protocol: 'openai', endpoint: '/v1/chat/completions', requestedModel: 'mockstats/a', resolvedTargetKind: 'model', resolvedTargetId: modelA, finalModelId: modelA, streaming: false, httpStatus: 200, success: true, totalLatencyMs: 100, inputTokens: 5, outputTokens: 2, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, totalTokens: 7, attemptsCount: 1 }).run();
+    }
+    db.insert(sch.dailyModelStats).values({ day: rawDay, modelId: modelA, requests: 5, successfulRequests: 5, failedRequests: 0, inputTokens: 25, outputTokens: 10, latencySuccessSumMs: 500, latencySuccessCount: 5 }).run();
+    // A pruned day just past the window: the old rolling start (now - 7d) landed mid-day here, so
+    // this is the row that used to turn every preset into a 400.
+    db.insert(sch.dailyModelStats).values({ day: daysAgo(7), modelId: modelA, requests: 2, successfulRequests: 2, failedRequests: 0 }).run();
+    const response = await fetch(`${baseUrl}/api/admin/stats?preset=7d`, { headers: { cookie: cookies } });
+    expect(response.status).toBe(200);
+    const body = await response.json() as { summary: { totalRequests: number }; percentilesAvailable: boolean; range: { from: string }; series: Array<{ t: string; requests: number }> };
+    // 5 from the aggregate-only day + 5 from raw. The retained day's own aggregate must not be added on top.
+    expect(body.summary.totalRequests).toBe(10);
+    // A selected day has no detail left, so percentiles cannot be reconstructed for the range.
+    expect(body.percentilesAvailable).toBe(false);
+    // Preset windows are UTC-day aligned, so the day they start on is whole rather than clipped.
+    expect(body.range.from).toBe(`${prunedDay}T00:00:00.000Z`);
+    expect(body.series.find((row) => row.t.startsWith(prunedDay))?.requests).toBe(5);
+    expect(body.series.find((row) => row.t.startsWith(rawDay))?.requests).toBe(5);
+  });
+
   it('merges a full aggregate day and a raw day once in totals, series, and model rankings', async () => {
     const db = (await import('../../src/server/db/index')).getDb();
     const sch = await import('../../src/server/db/schema');

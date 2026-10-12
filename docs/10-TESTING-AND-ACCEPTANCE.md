@@ -184,6 +184,9 @@ Proven by `tests/integration/backup-restore-upload.test.ts`. Client progress/can
 - aggregate-only history returns exact totals and averages with unavailable/null percentiles
 - a range partially overlapping a compacted day is rejected with 400 rather than silently omitting statistics
 - a full aggregate day and a raw day merge once in totals, series, and model rankings
+- every date preset (Today, 7 days, 30 days) still answers after a day's raw detail is pruned: a day is
+  served from its aggregate only when its raw rows are actually gone, and preset windows are UTC-day
+  aligned so the day they start on is whole rather than clipped
 
 Proven by `tests/integration/statistics-fix.test.ts`; the one-time backfill by `tests/integration/daily-aggregate-migration.test.ts` and `tests/unit/daily-aggregate-upsert.test.ts`.
 

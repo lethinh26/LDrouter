@@ -9,19 +9,30 @@ import { GatewayError } from '../../errors';
 import { toSummary, loadSummaryMaps } from './requests';
 import type { StatsSummary, StatsRange, RoutingProvider } from '../../../shared/types';
 
+/**
+ * Midnight UTC, `offsetDays` from the day containing `now`.
+ *
+ * Preset windows are day-aligned on purpose. A rolling window always clips its first day, and a
+ * clipped day whose raw rows were pruned cannot be reconstructed from the day-granular aggregate —
+ * so a compacted install answered 400 for every preset the UI can send. Aligning the window makes
+ * the first day whole and leaves only today partial, which is never served from an aggregate.
+ */
+function utcDayStart(now: Date, offsetDays: number): Date {
+  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + offsetDays));
+}
+
 const PRESETS: Record<string, () => { from: Date; to: Date; bucket: 'hour' | 'day' }> = {
   today: () => {
     const now = new Date();
-    const from = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
-    return { from, to: now, bucket: 'hour' };
+    return { from: utcDayStart(now, 0), to: now, bucket: 'hour' };
   },
   '7d': () => {
     const now = new Date();
-    return { from: new Date(now.getTime() - 7 * 24 * 3600 * 1000), to: now, bucket: 'day' };
+    return { from: utcDayStart(now, -6), to: now, bucket: 'day' };
   },
   '30d': () => {
     const now = new Date();
-    return { from: new Date(now.getTime() - 30 * 24 * 3600 * 1000), to: now, bucket: 'day' };
+    return { from: utcDayStart(now, -29), to: now, bucket: 'day' };
   },
 };
 
@@ -59,9 +70,44 @@ function cacheHitRateFor(
 
 function rangeFromQuery(q: Record<string, string | undefined>): { from: Date; to: Date; bucket: 'hour' | 'day' } {
   if (q.preset && PRESETS[q.preset]) return PRESETS[q.preset]!();
-  const from = q.from ? new Date(q.from) : new Date(Date.now() - 7 * 24 * 3600 * 1000);
-  const to = q.to ? new Date(q.to) : new Date();
+  const now = new Date();
+  const from = q.from ? new Date(q.from) : utcDayStart(now, -6);
+  const to = q.to ? new Date(q.to) : now;
   return { from, to, bucket: q.bucket === 'hour' ? 'hour' : 'day' };
+}
+
+/**
+ * UTC days whose raw request detail is gone and that therefore must be answered from the
+ * day-granular aggregate.
+ *
+ * Having a `daily_model_stats` row proves nothing: the aggregate is written for EVERY logged
+ * request, so every day with traffic has one, and treating that as "compacted" made every
+ * rolling preset (whose window always clips its first day) answer 400. Only the raw log
+ * separates the states, and only a day holding FEWER raw rows than it logged needs its
+ * aggregate — which is exactly what retention (cutoff mid-day) and a compact export/restore
+ * leave behind.
+ *
+ * Counted over whole UTC days, never the requested window: a clipped first day still has all
+ * of its raw rows, and comparing a window-scoped count against a whole-day aggregate would
+ * report every such day as pruned. `created_at` is indexed, so this is one grouped range scan.
+ */
+function aggregateRequiredDays(
+  db: BetterSQLite3Database<typeof schema>,
+  aggregateRows: { day: string; requests: number }[]
+): string[] {
+  const loggedByDay = new Map<string, number>();
+  for (const r of aggregateRows) loggedByDay.set(r.day, (loggedByDay.get(r.day) ?? 0) + r.requests);
+  if (loggedByDay.size === 0) return [];
+  // ISO-8601 UTC dates sort lexicographically, so min/max bound the whole-day scan.
+  const days = [...loggedByDay.keys()].sort();
+  const rawCounts = db
+    .select({ day: sql<string>`substr(created_at,1,10)`, c: sql<number>`COUNT(*)` })
+    .from(schema.requests)
+    .where(and(gte(schema.requests.createdAt, `${days[0]}T00:00:00.000Z`), lte(schema.requests.createdAt, `${days[days.length - 1]}T23:59:59.999Z`)))
+    .groupBy(sql`substr(created_at,1,10)`)
+    .all();
+  const rawByDay = new Map(rawCounts.map((r) => [r.day, Number(r.c)]));
+  return [...loggedByDay].filter(([day, logged]) => (rawByDay.get(day) ?? 0) < logged).map(([day]) => day);
 }
 
 export async function registerStatsRoutes(app: FastifyInstance): Promise<void> {
@@ -76,9 +122,12 @@ export async function registerStatsRoutes(app: FastifyInstance): Promise<void> {
     const conds = [gte(schema.requests.createdAt, fromIso), lte(schema.requests.createdAt, toIso)];
     const utcToday = new Date().toISOString().slice(0, 10);
     const aggregateRows = db.select().from(schema.dailyModelStats).where(and(gte(schema.dailyModelStats.day, fromIso.slice(0, 10)), lte(schema.dailyModelStats.day, toIso.slice(0, 10)))).all();
-    const overlappingAggregateDays = [...new Set(aggregateRows.map((r) => r.day))].filter((day) => day < utcToday && `${day}T00:00:00.000Z` <= toIso && `${day}T23:59:59.999Z` >= fromIso);
-    const aggregateDays = overlappingAggregateDays.filter((day) => `${day}T00:00:00.000Z` >= fromIso && `${day}T23:59:59.999Z` <= toIso);
-    if (aggregateDays.length !== overlappingAggregateDays.length) {
+    // Only days whose raw detail is actually gone are answered from the day-granular aggregate.
+    // A day that still has its raw rows is served from raw, exactly like a fresh install.
+    const aggregateDays = aggregateRequiredDays(db, aggregateRows)
+      .filter((day) => day < utcToday && `${day}T00:00:00.000Z` <= toIso && `${day}T23:59:59.999Z` >= fromIso);
+    const clippedDays = aggregateDays.filter((day) => `${day}T00:00:00.000Z` < fromIso || `${day}T23:59:59.999Z` > toIso);
+    if (clippedDays.length > 0) {
       throw new GatewayError('invalid_request_error', 'Statistics ranges overlapping compacted history must include complete UTC days.', { status: 400 });
     }
     const percentilesAvailable = aggregateDays.length === 0;
@@ -295,7 +344,8 @@ export async function registerStatsRoutes(app: FastifyInstance): Promise<void> {
 function buildSummary(db: BetterSQLite3Database<typeof schema>, fromIso: string, toIso: string): StatsSummary {
   // For previous period, use the same aggregate/raw partition as the primary range.
   const days = db.select().from(schema.dailyModelStats).where(and(gte(schema.dailyModelStats.day, fromIso.slice(0, 10)), lte(schema.dailyModelStats.day, toIso.slice(0, 10)))).all();
-  const daySet = [...new Set(days.map((x) => x.day))].filter((day) => day < new Date().toISOString().slice(0, 10) && `${day}T00:00:00.000Z` >= fromIso && `${day}T23:59:59.999Z` <= toIso);
+  // Same rule as the primary range: a day only needs its aggregate when its raw detail is gone.
+  const daySet = aggregateRequiredDays(db, days).filter((day) => day < new Date().toISOString().slice(0, 10) && `${day}T00:00:00.000Z` >= fromIso && `${day}T23:59:59.999Z` <= toIso);
   const aggregates = days.filter((x) => daySet.includes(x.day));
   const rawOnly = daySet.length ? and(gte(schema.requests.createdAt, fromIso), lte(schema.requests.createdAt, toIso), sql`substr(created_at,1,10) NOT IN (${sql.join(daySet.map((day) => sql`${day}`), sql`, `)})`) : and(gte(schema.requests.createdAt, fromIso), lte(schema.requests.createdAt, toIso));
   const agg = aggregates.reduce((a, x) => ({ total: a.total + x.requests, success: a.success + x.successfulRequests, failed: a.failed + x.failedRequests, input: a.input + x.inputTokens, output: a.output + x.outputTokens, cacheRead: a.cacheRead + x.cacheReadTokens, cacheWrite: a.cacheWrite + x.cacheWriteTokens, reasoning: a.reasoning + x.reasoningTokens, gateway: a.gateway + x.gatewayCacheHits, fallback: a.fallback + x.fallbackRequests, latency: a.latency + x.latencySuccessSumMs, latencyCount: a.latencyCount + x.latencySuccessCount, ttft: a.ttft + x.ttftSumMs, ttftCount: a.ttftCount + x.ttftCount }), { total: 0, success: 0, failed: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, gateway: 0, fallback: 0, latency: 0, latencyCount: 0, ttft: 0, ttftCount: 0 });

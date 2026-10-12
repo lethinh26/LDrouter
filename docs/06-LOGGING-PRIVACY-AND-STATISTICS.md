@@ -135,6 +135,17 @@ Date presets:
 
 All date calculations must have explicit timezone semantics. UI may submit browser timezone so “Today” means the admin's local day; backend must avoid ambiguous local-time storage.
 
+Preset windows are aligned to UTC day boundaries: "Today" starts at 00:00 UTC of the current day, and
+"7 days"/"30 days" start at 00:00 UTC six/twenty-nine days back. Only the current day is partial. A
+window that started mid-day would clip the day it starts on, and a clipped day whose raw request rows
+have been pruned or left behind by a compact restore cannot be reconstructed from its day-granular
+aggregate — such a request has to be refused. Day-aligned windows keep every selected day whole except
+today, which is never served from an aggregate.
+
+Historical days are served from their daily aggregates only when their raw detail is actually gone (the
+day holds fewer raw rows than it logged). Having an aggregate row is not evidence of compaction: the
+aggregates are written for every logged request, so every day with traffic has one.
+
 Summary cards:
 
 - requests
