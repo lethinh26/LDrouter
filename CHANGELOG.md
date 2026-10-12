@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.19.1] - 2026-10-12
+
+### Fixed
+
+- **Streamed requests to OpenAI-compatible providers logged `Tokens 0`.** Such providers omit `usage` from a streamed answer unless the caller opts in with `stream_options.include_usage`, and the gateway dropped that field when converting the client body to the canonical request — so the upstream was never asked and every streamed request to those providers persisted 0 tokens. Upstream resale platforms read that as a zero-usage request and flag the key (`zero_usage_rewritten`). The gateway now always sends `stream_options: { include_usage: true }` on streamed OpenAI-compatible upstream calls, so request logs, statistics and the dashboard carry real token counts. Anthropic-compatible providers are unaffected: `/v1/messages` reports usage unconditionally. Non-streaming calls already carried usage in the response body.
+
+- **Statistics failed with `Statistics ranges overlapping compacted history must include complete UTC days.`** A day was treated as compacted history as soon as it had a row in `daily_model_stats` — but that aggregate is written for every logged request, so every day with traffic has one. Any range that clipped such a day was refused with 400, and because the preset windows started at "now minus N days" they always clipped their own first day: the Statistics page showed only "Failed to load statistics" for Today, 7 days and 30 days alike once a day's raw detail had been pruned by retention or left behind by a compact restore. A day is now served from its aggregate only when its raw detail is genuinely gone (it holds fewer raw rows than it logged), and the preset windows are aligned to UTC day boundaries so the day they start on is whole rather than clipped.
+
 ## [1.19.0] - 2026-10-12
 
 ### Added
