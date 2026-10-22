@@ -140,7 +140,7 @@ jobs:
           remote_workdir=$(printf '%q' "$VPS_WORKDIR")
           ssh -i ~/.ssh/deploy_key -p "$VPS_PORT" -o BatchMode=yes \
             "$VPS_USER@$VPS_HOST" \
-            "VPS_WORKDIR=$remote_workdir IMAGE_TAG=$IMAGE_TAG IMAGE=$IMAGE sh -s" <<'REMOTE'
+            "VPS_WORKDIR=$remote_workdir IMAGE_TAG=$IMAGE_TAG IMAGE=$IMAGE bash -s" <<'REMOTE'
           set -Eeuo pipefail
           cd "$VPS_WORKDIR"
 
