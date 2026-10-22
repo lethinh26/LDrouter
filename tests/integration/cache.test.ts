@@ -54,7 +54,7 @@ afterAll(async () => {
 });
 
 describe('cache behavior', () => {
-  it('cache disabled by default', async () => {
+  it('serves repeated identical non-streaming requests from cache', async () => {
     // cache is now enabled in beforeAll; confirm a request stores and serves from cache
     const upstreamCalls: string[] = [];
     // Use a local http server inline
