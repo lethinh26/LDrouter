@@ -22,16 +22,25 @@ export interface RetentionResult {
 
 const BATCH_SIZE = 1000;
 
+function countRequestsOlderThan(cutoff: string): { requests: number; attempts: number } {
+  const db = getDb();
+  const rq = db.select({ c: sql<number>`COUNT(*)` }).from(schema.requests).where(lt(schema.requests.createdAt, cutoff)).get();
+  const at = db.select({ c: sql<number>`COUNT(*)` }).from(schema.requestAttempts)
+    .where(sql`${schema.requestAttempts.requestId} IN (SELECT ${schema.requests.id} FROM ${schema.requests} WHERE ${schema.requests.createdAt} < ${cutoff})`).get();
+  return { requests: Number(rq?.c ?? 0), attempts: Number(at?.c ?? 0) };
+}
+
 export function runRetentionCleanup(now: Date = new Date(), opts: { dryRun?: boolean } = {}): RetentionResult {
   const s = getSettings();
   const cutoff = new Date(now.getTime() - s.retentionDays * 24 * 3600 * 1000).toISOString();
   const db = getDb();
-  let deletedAttempts = 0;
   let deletedRequests = 0;
   if (opts.dryRun) {
-    const row = db.select({ c: sql<number>`COUNT(*)` }).from(schema.requests).where(lt(schema.requests.createdAt, cutoff)).get();
-    return { deletedRequests: Number(row?.c ?? 0), deletedAttempts: 0, dryRun: true, cutoff };
+    const counts = countRequestsOlderThan(cutoff);
+    return { deletedRequests: counts.requests, deletedAttempts: counts.attempts, dryRun: true, cutoff };
   }
+  // Attempts are cascade-deleted with their requests; count once up front.
+  const deletedAttempts = countRequestsOlderThan(cutoff).attempts;
   // Cascade delete attempts
   while (true) {
     const rows = db

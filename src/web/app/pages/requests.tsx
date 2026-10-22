@@ -8,6 +8,7 @@ import { Button } from '../../components/ui/button';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '../../components/ui/dialog';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../../components/ui/select';
 import { Input } from '../../components/ui/input';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '../../components/ui/tabs';
 import { api } from '../../lib/api';
 import { formatDateTime, formatLatencyMs, formatNumber, shortId } from '../../lib/utils';
 import { Link } from 'react-router-dom';
@@ -49,6 +50,7 @@ export function Requests() {
   const [filters, setFilters] = useState<Filters>({ success: 'all', protocol: 'all', streaming: 'all', model: '' });
   const [openId, setOpenId] = useState<string | null>(null);
   const [detail, setDetail] = useState<{ request: RequestDetail; attempts: Array<Record<string, unknown>> } | null>(null);
+  const [detailTab, setDetailTab] = useState('overview');
   const [newCount, setNewCount] = useState(0); // live rows arrived since last reload/filter change
   const limit = 50;
 
@@ -124,8 +126,28 @@ export function Requests() {
 
   const open = async (id: string) => {
     setOpenId(id);
+    setDetailTab('overview');
     const r = await api.get<{ request: RequestDetail; attempts: Array<Record<string, unknown>> }>(`/api/admin/requests/${id}`);
     setDetail(r);
+  };
+
+  const copyText = (value: string, label: string) => {
+    void navigator.clipboard.writeText(value).then(() => toast.success(`${label} copied`));
+  };
+
+  const downloadText = (value: string, filename: string) => {
+    const url = URL.createObjectURL(new Blob([value], { type: 'application/json' }));
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = filename;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const payloadPreview = (value: string, limit = 12000) => {
+    if (value.length <= limit) return { text: value, truncated: false };
+    const half = Math.floor(limit / 2);
+    return { text: `${value.slice(0, half)}\n\n… ${value.length - limit} characters hidden …\n\n${value.slice(-half)}`, truncated: true };
   };
 
   return (
@@ -193,11 +215,19 @@ export function Requests() {
       </Card>
 
       <Dialog open={!!openId} onOpenChange={(o) => { if (!o) { setOpenId(null); setDetail(null); } }}>
-        <DialogContent className="max-h-[90vh] max-w-5xl overflow-y-auto">
+        <DialogContent className="max-h-[90vh] max-w-6xl overflow-y-auto">
           <DialogHeader><DialogTitle>Request {shortId(openId, 16)}</DialogTitle></DialogHeader>
           {!detail ? <div className="text-muted-foreground">Loading…</div> : (
-            <div className="min-w-0 space-y-3 text-sm">
-              <div className="grid grid-cols-2 gap-2">
+            <Tabs value={detailTab} onValueChange={setDetailTab} className="min-w-0">
+              <TabsList className="flex h-auto flex-wrap justify-start gap-1">
+                <TabsTrigger value="overview">Overview</TabsTrigger>
+                <TabsTrigger value="attempts">Attempts ({detail.attempts.length})</TabsTrigger>
+                <TabsTrigger value="request">Request</TabsTrigger>
+                <TabsTrigger value="response">Response</TabsTrigger>
+                <TabsTrigger value="replay">Replay curl</TabsTrigger>
+              </TabsList>
+              <TabsContent value="overview" className="space-y-3 text-sm">
+                <div className="grid grid-cols-2 gap-2">
                 <div><div className="text-muted-foreground text-xs">Requested model</div><span className="font-mono text-xs">{detail.request.requestedModel}</span></div>
                 <div><div className="text-muted-foreground text-xs">Upstream model</div><span className="font-mono text-xs">{detail.request.finalModelUpstreamId ?? '—'}</span></div>
                 <div><div className="text-muted-foreground text-xs">Provider</div>{detail.request.providerId ? <Link className="text-primary underline" to={`/providers?providerId=${encodeURIComponent(detail.request.providerId)}`}>{detail.request.providerName ?? detail.request.providerSlug ?? detail.request.providerId}</Link> : '—'}</div>
@@ -206,51 +236,48 @@ export function Requests() {
                 <div><div className="text-muted-foreground text-xs">Latency</div>{formatLatencyMs(detail.request.totalLatencyMs)}</div>
                 <div><div className="text-muted-foreground text-xs">Tokens</div>in {formatNumber(detail.request.inputTokens)} · out {formatNumber(detail.request.outputTokens)} · cache {formatNumber(detail.request.cacheReadTokens)}</div>
                 <div><div className="text-muted-foreground text-xs">Attempts</div>{detail.request.attemptsCount}</div>
-              </div>
-              {detail.request.errorType && (
+                </div>
+                {detail.request.errorType && (
                 <div className="rounded border border-destructive/40 bg-destructive/10 p-2">
                   <div className="text-xs text-muted-foreground">Error</div>
                   <div className="font-mono text-xs">{detail.request.errorType}: {detail.request.errorMessage}</div>
                 </div>
-              )}
-              {detail.request.fallbackReasons.length > 0 && <div className="rounded border border-amber-500/40 bg-amber-500/10 p-2"><div className="text-xs text-muted-foreground">Fallback reasons</div><div className="text-xs">{detail.request.fallbackReasons.join(', ')}</div></div>}
-              <div className="min-w-0"><div className="mb-1 flex items-center justify-between text-xs text-muted-foreground"><span>Safe replay curl</span><Button size="sm" variant="ghost" onClick={() => { void navigator.clipboard.writeText(detail.request.reproductionCurl).then(() => toast.success('Curl copied')); }}><Copy className="mr-1 h-3.5 w-3.5" /> Copy</Button></div><pre className="max-h-48 overflow-auto whitespace-pre-wrap break-all rounded bg-muted p-2 font-mono text-xs">{detail.request.reproductionCurl}</pre><p className="mt-1 text-xs text-muted-foreground">Replace the placeholder key before running. No stored secret is included.</p></div>
-              {detail.request.requestPayload && (
-                <div>
-                  <div className="text-xs text-muted-foreground">Request content</div>
-                  <pre className="max-h-72 overflow-auto break-all rounded bg-muted p-2 font-mono text-xs whitespace-pre-wrap">{detail.request.requestPayload}</pre>
-                </div>
-              )}
-              {detail.request.responsePayload && (
-                <div>
-                  <div className="text-xs text-muted-foreground">Response content</div>
-                  <pre className="max-h-72 overflow-auto break-all rounded bg-muted p-2 font-mono text-xs whitespace-pre-wrap">{detail.request.responsePayload}</pre>
-                </div>
-              )}
-              {detail.attempts.length > 0 && (
-                <div>
-                  <div className="text-xs text-muted-foreground">Attempts</div>
+                )}
+                {detail.request.fallbackReasons.length > 0 && <div className="rounded border border-amber-500/40 bg-amber-500/10 p-2"><div className="text-xs text-muted-foreground">Fallback reasons</div><div className="text-xs">{detail.request.fallbackReasons.join(', ')}</div></div>}
+              </TabsContent>
+              <TabsContent value="attempts" className="min-w-0 overflow-x-auto">
+                {detail.attempts.length > 0 ? (
                   <Table>
                     <TableHeader><TableRow><TableHead>#</TableHead><TableHead>Provider</TableHead><TableHead>Model</TableHead><TableHead>Status</TableHead><TableHead>Latency</TableHead><TableHead>Reason</TableHead></TableRow></TableHeader>
-                    <TableBody>
-                      {detail.attempts.map((a) => (
-                        <TableRow key={a.id as string}>
-                          <TableCell>{a.attemptNumber as number}</TableCell>
-                          <TableCell>{a.providerName as string}</TableCell>
-                          <TableCell><div className="font-mono text-xs">{a.modelPublicId as string}</div><div className="text-[11px] text-muted-foreground">upstream: {a.upstreamModelId as string}</div></TableCell>
-                          <TableCell>{a.success ? <Badge variant="success">{String(a.statusCode ?? 'OK')}</Badge> : <Badge variant="destructive">{String(a.statusCode ?? 'err')}</Badge>}</TableCell>
-                          <TableCell className="text-xs">{formatLatencyMs(a.latencyMs as number)}</TableCell>
-                          <TableCell className="text-xs">{(a.failureReason as string) ?? a.selectionReason as string}</TableCell>
-                        </TableRow>
-                      ))}
-                    </TableBody>
+                    <TableBody>{detail.attempts.map((a) => <TableRow key={a.id as string}>
+                      <TableCell>{a.attemptNumber as number}</TableCell><TableCell>{a.providerName as string}</TableCell>
+                      <TableCell><div className="font-mono text-xs">{a.modelPublicId as string}</div><div className="text-[11px] text-muted-foreground">upstream: {a.upstreamModelId as string}</div></TableCell>
+                      <TableCell>{a.success ? <Badge variant="success">{String(a.statusCode ?? 'OK')}</Badge> : <Badge variant="destructive">{String(a.statusCode ?? 'err')}</Badge>}</TableCell>
+                      <TableCell className="text-xs">{formatLatencyMs(a.latencyMs as number)}</TableCell>
+                      <TableCell className="text-xs">{(a.failureReason as string) ?? a.selectionReason as string}</TableCell>
+                    </TableRow>)}</TableBody>
                   </Table>
-                </div>
-              )}
-            </div>
+                ) : <div className="text-sm text-muted-foreground">No upstream attempts.</div>}
+              </TabsContent>
+              <TabsContent value="request" className="min-w-0">
+                {detail.request.requestPayload ? (() => { const preview = payloadPreview(detail.request.requestPayload); return <PayloadBlock label="Request content" value={detail.request.requestPayload} preview={preview} onCopy={() => copyText(detail.request.requestPayload!, 'Request JSON')} onDownload={() => downloadText(detail.request.requestPayload!, `request-${detail.request.id}.json`)} />; })() : <div className="text-sm text-muted-foreground">Request content was not retained.</div>}
+              </TabsContent>
+              <TabsContent value="response" className="min-w-0">
+                {detail.request.responsePayload ? (() => { const preview = payloadPreview(detail.request.responsePayload); return <PayloadBlock label="Response content" value={detail.request.responsePayload} preview={preview} onCopy={() => copyText(detail.request.responsePayload!, 'Response JSON')} onDownload={() => downloadText(detail.request.responsePayload!, `response-${detail.request.id}.json`)} />; })() : <div className="text-sm text-muted-foreground">Response content was not retained.</div>}
+              </TabsContent>
+              <TabsContent value="replay" className="min-w-0">
+                <div className="mb-1 flex items-center justify-between text-xs text-muted-foreground"><span>Safe replay curl</span><Button size="sm" variant="ghost" onClick={() => copyText(detail.request.reproductionCurl, 'Curl')}><Copy className="mr-1 h-3.5 w-3.5" /> Copy</Button></div>
+                <pre className="max-h-[55vh] overflow-auto whitespace-pre-wrap break-all rounded bg-muted p-2 font-mono text-xs">{detail.request.reproductionCurl}</pre>
+                <p className="mt-1 text-xs text-muted-foreground">Replace the placeholder key before running. No stored secret is included.</p>
+              </TabsContent>
+            </Tabs>
           )}
         </DialogContent>
       </Dialog>
     </div>
   );
+}
+
+function PayloadBlock({ label, value, preview, onCopy, onDownload }: { label: string; value: string; preview: { text: string; truncated: boolean }; onCopy: () => void; onDownload: () => void }) {
+  return <div className="space-y-2"><div className="flex flex-wrap items-center justify-between gap-2"><div className="text-xs text-muted-foreground">{label}{preview.truncated ? ' (preview)' : ''}</div><div className="flex gap-1"><Button size="sm" variant="ghost" onClick={onCopy}><Copy className="mr-1 h-3.5 w-3.5" /> Copy</Button><Button size="sm" variant="ghost" onClick={onDownload}>Download</Button></div></div><pre className="max-h-[55vh] overflow-auto whitespace-pre-wrap break-all rounded bg-muted p-2 font-mono text-xs">{preview.text}</pre>{preview.truncated && <Button size="sm" variant="outline" onClick={() => { const block = document.getElementById(`full-${label}`); block?.classList.remove('hidden'); }}>Show full content</Button>}<pre id={`full-${label}`} className="hidden max-h-[55vh] overflow-auto whitespace-pre-wrap break-all rounded bg-muted p-2 font-mono text-xs">{value}</pre></div>;
 }

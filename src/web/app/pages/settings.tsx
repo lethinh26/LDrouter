@@ -26,6 +26,8 @@ interface Settings {
   adminIpAllow: string | null; adminIpBlock: string | null;
 }
 
+interface CleanupPreview { deletedRequests: number; deletedAttempts: number; cutoff: string; }
+
 interface SysInfo { appVersion: string; dataDir: string; masterKeyConfigured: boolean; masterKeyVersion: number; environment: string; }
 
 interface UpdateInfo {
@@ -45,6 +47,8 @@ export function Settings() {
   // keystroke would otherwise fire a PATCH and fail CIDR validation).
   const [ipAllowDraft, setIpAllowDraft] = useState('');
   const [ipBlockDraft, setIpBlockDraft] = useState('');
+  const [cleanupPreview, setCleanupPreview] = useState<CleanupPreview | null>(null);
+  const [cleanupBusy, setCleanupBusy] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
   const [updateBusy, setUpdateBusy] = useState(false);
   const [updatePhase, setUpdatePhase] = useState<'idle' | 'checking' | 'installing' | 'restarting' | 'error'>('idle');
@@ -116,6 +120,9 @@ export function Settings() {
     setIpBlockDraft(r.settings.adminIpBlock ?? '');
     const si = await api.get<SysInfo>('/api/admin/settings/system');
     setSys(si);
+    api.get<{ preview: CleanupPreview }>('/api/admin/settings/cleanup/preview')
+      .then((r) => setCleanupPreview(r.preview))
+      .catch(() => setCleanupPreview(null));
     // Check TOTP status by fetching /api/admin/me
     try {
       const me = await api.get<{ totpEnabled: boolean }>('/api/admin/me');
@@ -279,8 +286,36 @@ export function Settings() {
                 <Label>Database size limit (MB)</Label>
                 <Input type="number" min={64} value={s.dbSizeLimitMb} onChange={(e) => update({ dbSizeLimitMb: Number(e.target.value) })} />
               </div>
-              <div className="flex items-center gap-2 pt-2">
-                <Button onClick={async () => { const r = await api.post<{ deletedRequests: number }>('/api/admin/settings/cleanup'); toast.success(`Deleted ${r.deletedRequests} old requests`); }}>Run cleanup now</Button>
+              <div className="flex flex-wrap items-center gap-2 pt-2">
+                {cleanupPreview && (
+                  <span className="text-xs text-muted-foreground">
+                    Pending: {cleanupPreview.deletedRequests} requests / {cleanupPreview.deletedAttempts} attempts older than {cleanupPreview.cutoff.slice(0, 10)} — daily stats and audit logs are kept.
+                  </span>
+                )}
+                <AlertDialog>
+                  <AlertDialogTrigger asChild><Button variant="outline" disabled={cleanupBusy}>Run cleanup now</Button></AlertDialogTrigger>
+                  <AlertDialogContent>
+                    <AlertDialogHeader>
+                      <AlertDialogTitle>Delete old request history?</AlertDialogTitle>
+                      <AlertDialogDescription>
+                        This removes {cleanupPreview?.deletedRequests ?? 0} requests and {cleanupPreview?.deletedAttempts ?? 0} attempts
+                        older than {cleanupPreview?.cutoff.slice(0, 10)}. Daily statistics and audit logs are preserved.
+                      </AlertDialogDescription>
+                    </AlertDialogHeader>
+                    <AlertDialogFooter>
+                      <AlertDialogCancel>Cancel</AlertDialogCancel>
+                      <AlertDialogAction onClick={async () => {
+                        setCleanupBusy(true);
+                        try {
+                          const r = await api.post<{ result: { deletedRequests: number; deletedAttempts: number } }>('/api/admin/settings/cleanup');
+                          toast.success(`Deleted ${r.result.deletedRequests} requests and ${r.result.deletedAttempts} attempts`);
+                          void reload();
+                        } catch (e) { toast.error((e as Error).message); }
+                        finally { setCleanupBusy(false); }
+                      }}>Delete</AlertDialogAction>
+                    </AlertDialogFooter>
+                  </AlertDialogContent>
+                </AlertDialog>
               </div>
             </CardContent>
           </Card>

@@ -98,6 +98,11 @@ export async function registerSettingsRoutes(app: FastifyInstance): Promise<void
     return { ok: true, result };
   });
 
+  app.get('/api/admin/settings/cleanup/preview', async () => {
+    const preview = runRetentionCleanup(new Date(), { dryRun: true });
+    return { preview };
+  });
+
   app.post('/api/admin/settings/cache/clear', async (req) => {
     const { clearAllCache } = await import('../../caching/store');
     const n = clearAllCache();
