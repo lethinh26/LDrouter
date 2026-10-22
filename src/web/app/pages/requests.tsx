@@ -248,14 +248,22 @@ export function Requests() {
               <TabsContent value="attempts" className="min-w-0 overflow-x-auto">
                 {detail.attempts.length > 0 ? (
                   <Table>
-                    <TableHeader><TableRow><TableHead>#</TableHead><TableHead>Provider</TableHead><TableHead>Model</TableHead><TableHead>Status</TableHead><TableHead>Latency</TableHead><TableHead>Reason</TableHead></TableRow></TableHeader>
-                    <TableBody>{detail.attempts.map((a) => <TableRow key={a.id as string}>
-                      <TableCell>{a.attemptNumber as number}</TableCell><TableCell>{a.providerName as string}</TableCell>
-                      <TableCell><div className="font-mono text-xs">{a.modelPublicId as string}</div><div className="text-[11px] text-muted-foreground">upstream: {a.upstreamModelId as string}</div></TableCell>
-                      <TableCell>{a.success ? <Badge variant="success">{String(a.statusCode ?? 'OK')}</Badge> : <Badge variant="destructive">{String(a.statusCode ?? 'err')}</Badge>}</TableCell>
-                      <TableCell className="text-xs">{formatLatencyMs(a.latencyMs as number)}</TableCell>
-                      <TableCell className="text-xs">{(a.failureReason as string) ?? a.selectionReason as string}</TableCell>
-                    </TableRow>)}</TableBody>
+                    <TableHeader><TableRow><TableHead>#</TableHead><TableHead>Provider</TableHead><TableHead>Model</TableHead><TableHead>Status</TableHead><TableHead>Latency</TableHead><TableHead>Selection</TableHead><TableHead>Failure</TableHead></TableRow></TableHeader>
+                    <TableBody>{detail.attempts.map((a) => (
+                      <TableRow key={a.id as string}>
+                        <TableCell>{a.attemptNumber as number}</TableCell>
+                        <TableCell>{a.providerName as string}</TableCell>
+                        <TableCell><div className="font-mono text-xs">{a.modelPublicId as string}</div><div className="text-[11px] text-muted-foreground">upstream: {a.upstreamModelId as string}</div></TableCell>
+                        <TableCell>{a.success ? <Badge variant="success">{String(a.statusCode ?? 'OK')}</Badge> : <Badge variant="destructive">{String(a.statusCode ?? 'err')}</Badge>}</TableCell>
+                        <TableCell className="text-xs">{formatLatencyMs(a.latencyMs as number)}</TableCell>
+                        <TableCell className="text-xs">{a.selectionReason as string}</TableCell>
+                        <TableCell className="min-w-[220px] max-w-[320px] text-xs">
+                          {a.failureReason ? <div className="font-medium text-destructive">{a.failureReason as string}</div> : <span className="text-muted-foreground">—</span>}
+                          {a.sanitizedError ? <div className="mt-1 break-all text-muted-foreground">{a.sanitizedError as string}</div> : null}
+                          {a.upstreamRequestId ? <div className="mt-1 break-all font-mono text-[11px] text-muted-foreground">upstream request: {a.upstreamRequestId as string}</div> : null}
+                        </TableCell>
+                      </TableRow>
+                    ))}</TableBody>
                   </Table>
                 ) : <div className="text-sm text-muted-foreground">No upstream attempts.</div>}
               </TabsContent>
