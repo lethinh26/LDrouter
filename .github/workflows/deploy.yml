@@ -145,8 +145,13 @@ jobs:
           cd "$VPS_WORKDIR"
 
           service=latedev-router
+          override_file=".latedev-deploy.override.yml"
+          cleanup() { rm -f "$override_file"; }
+          trap cleanup EXIT
+          printf 'services:\n  %s:\n    image: %s:%s\n' "$service" "$IMAGE" "$IMAGE_TAG" > "$override_file"
+          compose=(docker compose -f docker-compose.yml -f "$override_file")
           old_image=''
-          container_id="$(docker compose ps -q "$service" 2>/dev/null || true)"
+          container_id="$("${compose[@]}" ps -q "$service" 2>/dev/null || true)"
           if [ -n "$container_id" ]; then
             old_image="$(docker inspect "$container_id" --format '{{.Config.Image}}' 2>/dev/null || true)"
           fi
@@ -154,15 +159,14 @@ jobs:
           rollback() {
             if [ -n "$old_image" ]; then
               echo "Deployment failed; rolling back to $old_image" >&2
-              export LATEDEV_IMAGE="$old_image"
-              docker compose up -d --no-build "$service" || true
+              printf 'services:\n  %s:\n    image: %s\n' "$service" "$old_image" > "$override_file"
+              "${compose[@]}" up -d --no-build "$service" || true
             fi
           }
           trap rollback ERR
 
-          export LATEDEV_IMAGE="$IMAGE:$IMAGE_TAG"
-          docker compose pull "$service"
-          docker compose up -d --no-build "$service"
+          "${compose[@]}" pull "$service"
+          "${compose[@]}" up -d --no-build "$service"
 
           for attempt in $(seq 1 30); do
             if curl --fail --silent http://127.0.0.1:8787/health >/dev/null; then
@@ -175,7 +179,7 @@ jobs:
             sleep 2
           done
 
-          running_image="$(docker inspect "$(docker compose ps -q "$service")" --format '{{.Config.Image}}')"
+          running_image="$(docker inspect "$("${compose[@]}" ps -q "$service")" --format '{{.Config.Image}}')"
           test "$running_image" = "$IMAGE:$IMAGE_TAG"
           trap - ERR
           echo "Deployed $running_image"
