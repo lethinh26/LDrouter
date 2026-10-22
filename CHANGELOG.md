@@ -4,6 +4,15 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.20.0] - 2026-10-22
+
+### Added
+
+- Tabbed request diagnostics with bounded payload previews, safe replay curl, and request/response copy and download actions.
+- Retention preview and manual cleanup reporting for request and attempt history.
+- Routing explainability in request attempts, including selection, failure, sanitized error, and upstream request details.
+- Gateway response-cache coverage for repeated non-streaming requests, with streaming and tool-call bypasses.
+
 ## [1.19.2] - 2026-10-22
 
 ### Fixed
