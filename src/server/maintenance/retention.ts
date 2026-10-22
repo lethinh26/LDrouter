@@ -7,6 +7,12 @@ import { getSettings } from '../db/repositories/settings';
 import fs from 'node:fs';
 import path from 'node:path';
 
+export interface DailyRequestHistoryCleanupResult {
+  deletedRequests: number;
+  deletedAttempts: number;
+  beforeDay: string;
+}
+
 export interface RetentionResult {
   deletedRequests: number;
   deletedAttempts: number;
@@ -41,6 +47,30 @@ export function runRetentionCleanup(now: Date = new Date(), opts: { dryRun?: boo
     if (rows.length < BATCH_SIZE) break;
   }
   return { deletedRequests, deletedAttempts, dryRun: false, cutoff };
+}
+
+/** Delete complete UTC days of request detail while preserving daily aggregates. */
+export function runDailyRequestHistoryCleanup(now: Date = new Date()): DailyRequestHistoryCleanupResult {
+  const beforeDay = now.toISOString().slice(0, 10);
+  const db = getDb();
+  let deletedRequests = 0;
+  let deletedAttempts = 0;
+
+  while (true) {
+    const rows = db
+      .select({ id: schema.requests.id })
+      .from(schema.requests)
+      .where(sql`substr(${schema.requests.createdAt}, 1, 10) < ${beforeDay}`)
+      .limit(BATCH_SIZE)
+      .all();
+    if (rows.length === 0) break;
+    const ids = rows.map((r) => r.id);
+    const idList = sql.join(ids.map((id) => sql`${id}`), sql`, `);
+    deletedAttempts += db.delete(schema.requestAttempts).where(sql`${schema.requestAttempts.requestId} IN (${idList})`).run().changes ?? 0;
+    deletedRequests += db.delete(schema.requests).where(sql`${schema.requests.id} IN (${idList})`).run().changes ?? 0;
+    if (rows.length < BATCH_SIZE) break;
+  }
+  return { deletedRequests, deletedAttempts, beforeDay };
 }
 
 export function applyDbSizeGuard(dataDir: string): { triggered: boolean; before: number; after: number } {

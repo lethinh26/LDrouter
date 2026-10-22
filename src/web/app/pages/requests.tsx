@@ -193,10 +193,10 @@ export function Requests() {
       </Card>
 
       <Dialog open={!!openId} onOpenChange={(o) => { if (!o) { setOpenId(null); setDetail(null); } }}>
-        <DialogContent className="max-w-3xl">
+        <DialogContent className="max-h-[90vh] max-w-5xl overflow-y-auto">
           <DialogHeader><DialogTitle>Request {shortId(openId, 16)}</DialogTitle></DialogHeader>
           {!detail ? <div className="text-muted-foreground">Loading…</div> : (
-            <div className="space-y-3 text-sm">
+            <div className="min-w-0 space-y-3 text-sm">
               <div className="grid grid-cols-2 gap-2">
                 <div><div className="text-muted-foreground text-xs">Requested model</div><span className="font-mono text-xs">{detail.request.requestedModel}</span></div>
                 <div><div className="text-muted-foreground text-xs">Upstream model</div><span className="font-mono text-xs">{detail.request.finalModelUpstreamId ?? '—'}</span></div>
@@ -214,17 +214,17 @@ export function Requests() {
                 </div>
               )}
               {detail.request.fallbackReasons.length > 0 && <div className="rounded border border-amber-500/40 bg-amber-500/10 p-2"><div className="text-xs text-muted-foreground">Fallback reasons</div><div className="text-xs">{detail.request.fallbackReasons.join(', ')}</div></div>}
-              <div><div className="mb-1 flex items-center justify-between text-xs text-muted-foreground"><span>Safe replay curl</span><Button size="sm" variant="ghost" onClick={() => { void navigator.clipboard.writeText(detail.request.reproductionCurl).then(() => toast.success('Curl copied')); }}><Copy className="mr-1 h-3.5 w-3.5" /> Copy</Button></div><pre className="max-h-36 overflow-auto whitespace-pre-wrap rounded bg-muted p-2 font-mono text-xs">{detail.request.reproductionCurl}</pre><p className="mt-1 text-xs text-muted-foreground">Replace the placeholder key before running. No stored secret is included.</p></div>
+              <div className="min-w-0"><div className="mb-1 flex items-center justify-between text-xs text-muted-foreground"><span>Safe replay curl</span><Button size="sm" variant="ghost" onClick={() => { void navigator.clipboard.writeText(detail.request.reproductionCurl).then(() => toast.success('Curl copied')); }}><Copy className="mr-1 h-3.5 w-3.5" /> Copy</Button></div><pre className="max-h-48 overflow-auto whitespace-pre-wrap break-all rounded bg-muted p-2 font-mono text-xs">{detail.request.reproductionCurl}</pre><p className="mt-1 text-xs text-muted-foreground">Replace the placeholder key before running. No stored secret is included.</p></div>
               {detail.request.requestPayload && (
                 <div>
                   <div className="text-xs text-muted-foreground">Request content</div>
-                  <pre className="max-h-60 overflow-auto rounded bg-muted p-2 font-mono text-xs whitespace-pre-wrap">{detail.request.requestPayload}</pre>
+                  <pre className="max-h-72 overflow-auto break-all rounded bg-muted p-2 font-mono text-xs whitespace-pre-wrap">{detail.request.requestPayload}</pre>
                 </div>
               )}
               {detail.request.responsePayload && (
                 <div>
                   <div className="text-xs text-muted-foreground">Response content</div>
-                  <pre className="max-h-60 overflow-auto rounded bg-muted p-2 font-mono text-xs whitespace-pre-wrap">{detail.request.responsePayload}</pre>
+                  <pre className="max-h-72 overflow-auto break-all rounded bg-muted p-2 font-mono text-xs whitespace-pre-wrap">{detail.request.responsePayload}</pre>
                 </div>
               )}
               {detail.attempts.length > 0 && (

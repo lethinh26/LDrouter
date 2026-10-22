@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.19.2] - 2026-10-22
+
+### Fixed
+
+- Request details now stay inside a scrollable, width-constrained dialog so long curl and JSON payloads no longer overflow the admin page.
+- Request and attempt detail from completed UTC days is deleted automatically at startup and once per day; daily statistics and today's request history are preserved.
+
 ## [1.19.1] - 2026-10-12
 
 ### Fixed

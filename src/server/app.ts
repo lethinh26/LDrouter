@@ -23,6 +23,7 @@ import { registerGatewayRoutes } from './routes/gateway';
 import { registerHealthRoutes } from './routes/health';
 import { registerAdminIpGate } from './security/admin-ip-gate';
 import { metricsRegistry } from './metrics/registry';
+import { runDailyRequestHistoryCleanup } from './maintenance/retention';
 import { fatal, lifecycle, formatError, getDebugFlags, errorLine, requestLogFields, requestLogLevel, requestLogMessage } from './logging/debug';
 type App = FastifyInstance;
 
@@ -200,6 +201,27 @@ process.on('unhandledRejection', (reason) => {
       log.info({ dbFile: cfg.dbFile }, 'LateDev Router ready');
     } else {
       log.info({ dbFile: cfg.dbFile }, 'LateDev Router ready (first-run setup required)');
+    }
+    let lastCleanupDay = '';
+    const dailyCleanup = setInterval(() => {
+      const day = new Date().toISOString().slice(0, 10);
+      if (day === lastCleanupDay) return;
+      try {
+        const result = runDailyRequestHistoryCleanup();
+        lastCleanupDay = day;
+        log.info({ ...result }, 'daily request history cleanup completed');
+      } catch (error) {
+        log.warn({ err: String(error) }, 'daily request history cleanup failed');
+      }
+    }, 60_000);
+    dailyCleanup.unref?.();
+    app.addHook('onClose', async () => clearInterval(dailyCleanup));
+    try {
+      const result = runDailyRequestHistoryCleanup();
+      lastCleanupDay = new Date().toISOString().slice(0, 10);
+      log.info({ ...result }, 'daily request history cleanup completed');
+    } catch (error) {
+      log.warn({ err: String(error) }, 'daily request history cleanup failed');
     }
   });
 
