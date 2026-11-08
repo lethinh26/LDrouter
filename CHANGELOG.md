@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.20.2] - 2026-11-08
+
+### Fixed
+
+- Install the native build toolchain only in the Docker builder stage so SQLite can compile when Alpine prebuilt binaries are unavailable.
+- Declare the runtime image version build argument so deployments report the supplied version.
+
 ## [1.20.1] - 2026-11-08
 
 ### Fixed

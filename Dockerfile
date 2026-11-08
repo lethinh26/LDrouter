@@ -3,6 +3,7 @@
 # --- builder ---
 FROM node:22-alpine AS builder
 WORKDIR /app
+RUN apk add --no-cache python3 make g++
 RUN corepack enable && corepack prepare pnpm@11.24.0 --activate
 COPY package.json pnpm-lock.yaml* pnpm-workspace.yaml ./
 COPY tsconfig.json tsconfig.build.json vite.config.ts tailwind.config.cjs postcss.config.cjs ./
@@ -16,6 +17,7 @@ COPY migrations ./dist/migrations
 
 # --- runtime ---
 FROM node:22-alpine AS runner
+ARG APP_VERSION
 WORKDIR /app
 ENV NODE_ENV=production
 ENV LATEDEV_APP_VERSION=${APP_VERSION}
