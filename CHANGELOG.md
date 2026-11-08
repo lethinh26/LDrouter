@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.20.1] - 2026-11-08
+
+### Fixed
+
+- Accept `xhigh` and `max` reasoning effort in Chat Completions and Responses requests, preserving the value through OpenAI-compatible and Codex upstream payloads.
+- Preserve Responses `reasoning.effort` during normalization for streaming and non-streaming requests instead of silently dropping it.
+
 ## [1.20.0] - 2026-10-22
 
 ### Added

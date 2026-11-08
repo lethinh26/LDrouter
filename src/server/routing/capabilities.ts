@@ -33,7 +33,7 @@ export interface CanonicalRequest {
    * the caller asks for it; the gateway always asks (see canonicalToOpenAIRequest). */
   streamIncludeUsage?: boolean;
   responseFormat?: { type: 'text' | 'json_object' | 'json_schema'; jsonSchema?: Record<string, unknown> };
-  reasoning?: { effort?: 'low' | 'medium' | 'high'; budgetTokens?: number };
+  reasoning?: { effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max'; budgetTokens?: number };
   metadata?: Record<string, string>;
 }
 

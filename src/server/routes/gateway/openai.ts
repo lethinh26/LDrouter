@@ -24,7 +24,7 @@ const ChatBody = z.object({
   max_completion_tokens: z.number().int().min(1).optional(),
   stop: z.union([z.array(z.string()), z.string()]).optional(),
   response_format: z.any().optional(),
-  reasoning_effort: z.enum(['low', 'medium', 'high']).optional(),
+  reasoning_effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).optional(),
   // Accept additional Claude Code fields without failing
   parallel_tool_calls: z.any().optional(),
   stream_options: z.any().optional(),
@@ -37,6 +37,7 @@ const ResponsesBody = z.object({
   model: z.string().min(1),
   input: z.any(),
   stream: z.boolean().optional(),
+  reasoning: z.object({ effort: ChatBody.shape.reasoning_effort }).optional(),
   // Accept and pass through; full Responses support is a v1 subset.
 });
 
@@ -163,6 +164,7 @@ export async function registerOpenAIRoutes(app: FastifyInstance): Promise<void> 
       messages: flat.messages,
       tools: flat.tools,
       stream: body.stream,
+      reasoning_effort: body.reasoning?.effort,
     };
     const canonical = openAIToCanonical(chatBody);
     const ctx: GatewayContext = {

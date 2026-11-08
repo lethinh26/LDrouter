@@ -15,7 +15,7 @@ describe('Zod Passthrough', () => {
     max_completion_tokens: z.number().int().min(1).optional(),
     stop: z.union([z.array(z.string()), z.string()]).optional(),
     response_format: z.any().optional(),
-    reasoning_effort: z.enum(['low', 'medium', 'high']).optional(),
+    reasoning_effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).optional(),
     parallel_tool_calls: z.any().optional(),
     stream_options: z.any().optional(),
     metadata: z.any().optional(),

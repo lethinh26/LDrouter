@@ -154,6 +154,11 @@ If an incoming request includes a modality unsupported by all candidates, return
 
 ## Reasoning/thinking
 
+OpenAI Chat Completions accepts `reasoning_effort` and Responses accepts
+`reasoning.effort`: `low`, `medium`, `high`, `xhigh`, or `max`. The effort is preserved
+through normalization and forwarded unchanged to OpenAI-compatible and Codex
+upstreams. The selected upstream model must support the requested effort.
+
 Reasoning/thinking fields vary across vendors. Treat them as provider capabilities/extensions. Map only when semantics are understood and safe. Unknown fields may be forwarded only when the upstream protocol and provider are the same compatible family and forwarding does not violate validation/security rules.
 
 ## Token usage

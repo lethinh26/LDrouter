@@ -34,6 +34,11 @@ describe('codexRequestPayload', () => {
     expect(payload.model).toBe('codex/gpt-5.5');
   });
 
+  it.each(['xhigh', 'max'] as const)('preserves %s reasoning effort', (effort) => {
+    expect(codexRequestPayload(req({ reasoning: { effort } })).reasoning)
+      .toEqual({ effort });
+  });
+
   // The Codex backend answers 400 'Unsupported parameter: <name>' for each of these. Verified live
   // against chatgpt.com; the Models-page Test button failed with exactly this before the fix.
   it.each(['max_output_tokens', 'temperature', 'top_p'])('never forwards %s', (param) => {

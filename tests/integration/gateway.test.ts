@@ -78,7 +78,7 @@ beforeAll(async () => {
   db.insert((await import('../../src/server/db/schema')).models).values({
     id: uuid(), providerId: provider.id, upstreamModelId: 'gpt-mock',
     publicModelId: 'mock/gpt-mock', displayName: 'GPT Mock', enabled: true, upstreamAvailable: true,
-    capabilitiesJson: JSON.stringify({ chat: true, streaming: true, tools: true }),
+    capabilitiesJson: JSON.stringify({ chat: true, streaming: true, tools: true, reasoning: true }),
   }).run();
   // create API key
   const keyRes = await fetch(`${baseUrl}/api/admin/api-keys`, {
@@ -102,6 +102,62 @@ beforeEach(async () => {
 });
 
 describe('gateway smoke', () => {
+  it.each([
+    ['chat/completions', false, 'xhigh'], ['chat/completions', true, 'xhigh'],
+    ['responses', false, 'xhigh'], ['responses', true, 'xhigh'],
+    ['chat/completions', false, 'max'], ['chat/completions', true, 'max'],
+    ['responses', false, 'max'], ['responses', true, 'max'],
+  ] as const)('%s forwards reasoning unchanged (stream=%s, effort=%s)', async (endpoint, stream, effort) => {
+    const { reset, pushHandler } = await import('./_mock-control.js');
+    reset();
+    let upstreamBody: Record<string, unknown> | undefined;
+    pushHandler((_req, res, body) => {
+      upstreamBody = JSON.parse(body);
+      res.setHeader('content-type', stream ? 'text/event-stream' : 'application/json');
+      if (stream) {
+        res.end('data: {"choices":[{"index":0,"delta":{"content":"hello"}}]}\n\ndata: [DONE]\n\n');
+      } else {
+        res.end(JSON.stringify({
+          id: 'cmpl-reasoning', object: 'chat.completion', created: 0, model: 'gpt-mock',
+          choices: [{ index: 0, message: { role: 'assistant', content: 'hello' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 5, completion_tokens: 1, total_tokens: 6 },
+        }));
+      }
+    });
+    const response = await fetch(`${baseUrl}/v1/${endpoint}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey!.secret}` },
+      body: JSON.stringify({
+        model: 'mock/gpt-mock', stream,
+        ...(endpoint === 'responses'
+          ? { input: 'hi', reasoning: { effort } }
+          : { messages: [{ role: 'user', content: 'hi' }], reasoning_effort: effort }),
+      }),
+    });
+    const responseBody = await response.text();
+    expect(response.status, responseBody).toBe(200);
+    expect(responseBody).toContain('hello');
+    expect(upstreamBody).toMatchObject({ model: 'gpt-mock', stream, reasoning_effort: effort });
+  });
+
+  it.each(['chat/completions', 'responses'])('%s rejects invalid reasoning effort before calling upstream', async (endpoint) => {
+    const { reset, callCount } = await import('./_mock-control.js');
+    reset();
+    const response = await fetch(`${baseUrl}/v1/${endpoint}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey!.secret}` },
+      body: JSON.stringify({
+        model: 'mock/gpt-mock',
+        ...(endpoint === 'responses'
+          ? { input: 'hi', reasoning: { effort: 'invalid' } }
+          : { messages: [{ role: 'user', content: 'hi' }], reasoning_effort: 'invalid' }),
+      }),
+    });
+    expect(response.status).toBe(400);
+    expect((await response.json()).error.type).toBe('invalid_request_error');
+    expect(callCount()).toBe(0);
+  });
+
   it('GET /v1/models returns the imported model', async () => {
     const res = await fetch(`${baseUrl}/v1/models`, { headers: { authorization: `Bearer ${apiKey!.secret}` } });
     expect(res.status).toBe(200);

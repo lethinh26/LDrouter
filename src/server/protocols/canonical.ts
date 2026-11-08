@@ -20,7 +20,7 @@ export interface OpenAIChatRequest {
   max_tokens?: number;
   stop?: string[] | string;
   response_format?: { type: 'text' | 'json_object' | 'json_schema'; json_schema?: { name?: string; schema: Record<string, unknown> } };
-  reasoning_effort?: 'low' | 'medium' | 'high';
+  reasoning_effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 }
 
 export interface OpenAIChatResponse {
