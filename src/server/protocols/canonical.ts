@@ -1,6 +1,7 @@
 // Canonical protocol layer: OpenAI <-> canonical, Anthropic <-> canonical.
 
 import type { CanonicalRequest, CanonicalMessage, CanonicalContentBlock, CanonicalTool } from '../routing/capabilities';
+import { normalizeJsonSchema } from './json-schema';
 import { GatewayError } from '../errors';
 
 export interface OpenAITool {
@@ -96,12 +97,12 @@ export function openAIToCanonical(req: OpenAIChatRequest): CanonicalRequest {
   const tools: CanonicalTool[] | undefined = req.tools?.map((t) => ({
     name: t.function.name,
     description: t.function.description,
-    inputSchema: t.function.parameters,
+    inputSchema: normalizeJsonSchema(t.function.parameters),
   }));
   let responseFormat: CanonicalRequest['responseFormat'];
   if (req.response_format) {
     if (req.response_format.type === 'json_schema' && req.response_format.json_schema) {
-      responseFormat = { type: 'json_schema', jsonSchema: req.response_format.json_schema.schema };
+      responseFormat = { type: 'json_schema', jsonSchema: normalizeJsonSchema(req.response_format.json_schema.schema) };
     } else if (req.response_format.type === 'json_object') {
       responseFormat = { type: 'json_object' };
     } else {

@@ -103,6 +103,78 @@ beforeEach(async () => {
 
 describe('gateway smoke', () => {
   it.each([
+    ['chat/completions', false], ['chat/completions', true],
+    ['messages', false], ['messages', true],
+  ] as const)('%s normalizes send_message schema integers (stream=%s)', async (endpoint, stream) => {
+    const { reset, pushHandler } = await import('./_mock-control.js');
+    reset();
+    const parameters = {
+      type: 'object',
+      properties: { recipients: { type: 'array', minItems: '1', items: { type: 'string', minLength: '1', enum: ['1'] } } },
+    };
+    let upstreamBody: Record<string, unknown> | undefined;
+    pushHandler((_req, res, body) => {
+      const parsed = JSON.parse(body);
+      upstreamBody = parsed;
+      if (parsed.tools[0].function.parameters.properties.recipients.minItems !== 1) {
+        res.statusCode = 400;
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ error: { message: 'Invalid schema for function send_message: "1" is not of type integer' } }));
+        return;
+      }
+      res.setHeader('content-type', stream ? 'text/event-stream' : 'application/json');
+      if (stream) {
+        res.end('data: {"choices":[{"index":0,"delta":{"content":"hello"}}]}\n\ndata: [DONE]\n\n');
+      } else {
+        res.end(JSON.stringify({
+          id: 'cmpl-schema', object: 'chat.completion', created: 0, model: 'gpt-mock',
+          choices: [{ index: 0, message: { role: 'assistant', content: 'hello' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 5, completion_tokens: 1, total_tokens: 6 },
+        }));
+      }
+    });
+    const response = await fetch(`${baseUrl}/v1/${endpoint}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey!.secret}` },
+      body: JSON.stringify({
+        model: 'mock/gpt-mock', stream, max_tokens: 128, messages: [{ role: 'user', content: 'hi' }],
+        tools: endpoint === 'messages'
+          ? [{ name: 'send_message', input_schema: parameters }]
+          : [{ type: 'function', function: { name: 'send_message', parameters } }],
+      }),
+    });
+    const responseBody = await response.text();
+    expect(response.status, responseBody).toBe(200);
+    expect(responseBody).toContain('hello');
+    expect(upstreamBody).toMatchObject({
+      tools: [{ type: 'function', function: { name: 'send_message', parameters: {
+        properties: { recipients: { minItems: 1, items: { minLength: 1, enum: ['1'] } } },
+      } } }],
+    });
+  });
+
+  it.each(['chat/completions', 'messages'])('%s rejects unsafe schema integers before calling upstream', async (endpoint) => {
+    const { reset, callCount } = await import('./_mock-control.js');
+    reset();
+    const parameters = { type: 'array', minItems: '9007199254740993', items: { type: 'string' } };
+    const response = await fetch(`${baseUrl}/v1/${endpoint}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey!.secret}` },
+      body: JSON.stringify({
+        model: 'mock/gpt-mock', max_tokens: 128, messages: [{ role: 'user', content: 'hi' }],
+        tools: endpoint === 'messages'
+          ? [{ name: 'send_message', input_schema: parameters }]
+          : [{ type: 'function', function: { name: 'send_message', parameters } }],
+      }),
+    });
+    expect(response.status).toBe(400);
+    const responseBody = await response.json();
+    expect(responseBody.error).toMatchObject({ type: 'invalid_request_error', message: expect.stringContaining('minItems') });
+    expect(JSON.stringify(responseBody)).not.toContain('9007199254740993');
+    expect(callCount()).toBe(0);
+  });
+
+  it.each([
     ['chat/completions', false, 'xhigh'], ['chat/completions', true, 'xhigh'],
     ['responses', false, 'xhigh'], ['responses', true, 'xhigh'],
     ['chat/completions', false, 'max'], ['chat/completions', true, 'max'],

@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.20.3] - 2026-11-10
+
+### Fixed
+
+- Normalize string-encoded integer constraints in OpenAI and Anthropic tool schemas and Chat structured-output schemas for Gemini/Antigravity relay compatibility, including nested definitions and composition branches.
+- Preserve literal schema data and tool arguments; reject invalid or unsafe integer constraints and excessive schema nesting before calling upstream providers.
+
 ## [1.20.2] - 2026-11-08
 
 ### Fixed

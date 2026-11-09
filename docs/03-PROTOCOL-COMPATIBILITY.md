@@ -137,6 +137,18 @@ Preserve:
 
 Candidate models lacking tool support must be excluded when the incoming request requires tools.
 
+For compatibility with Gemini/Antigravity relay clients, tool schemas received through Chat
+Completions and Anthropic Messages normalize decimal strings on `minItems`, `maxItems`,
+`minLength`, `maxLength`, `minProperties`, `maxProperties`, `minContains`, and `maxContains`
+to non-negative safe integers before routing. For example, `"minItems": "1"` becomes
+`"minItems": 1`. This also applies to Chat structured-output schemas.
+
+Normalization visits only schema-bearing keywords, including nested properties, definitions,
+and composition branches. It never coerces tool arguments, property names, `enum`, `const`,
+`default`, examples, or extension data. Invalid or unsafe integer constraints and schema nesting
+beyond 128 levels return HTTP 400 without exposing the rejected value or calling an upstream.
+Other schema validation remains the upstream provider's responsibility.
+
 ## Structured output
 
 When the incoming protocol asks for JSON schema/structured output:

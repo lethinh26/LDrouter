@@ -1,6 +1,7 @@
 // Anthropic <-> canonical protocol layer.
 
 import type { CanonicalRequest, CanonicalMessage, CanonicalContentBlock, CanonicalTool } from '../routing/capabilities';
+import { normalizeJsonSchema } from './json-schema';
 
 export interface AnthropicMessage {
   role: 'user' | 'assistant';
@@ -56,7 +57,7 @@ export function anthropicToCanonical(req: AnthropicRequest): CanonicalRequest {
       messages.push({ role: 'assistant', content: blocks });
     }
   }
-  const tools: CanonicalTool[] | undefined = req.tools?.map((t) => ({ name: t.name, description: t.description, inputSchema: t.input_schema }));
+  const tools: CanonicalTool[] | undefined = req.tools?.map((t) => ({ name: t.name, description: t.description, inputSchema: normalizeJsonSchema(t.input_schema) }));
   let system: string | undefined;
   if (typeof req.system === 'string') system = req.system;
   else if (Array.isArray(req.system)) system = req.system.map((b) => b.text).join('\n');
