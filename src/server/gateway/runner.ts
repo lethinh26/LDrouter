@@ -247,11 +247,16 @@ export class GatewayRunner {
         });
         const cached = lookupCache(cacheKey);
         if (cached.hit && cached.payload) {
-          metrics.cacheHits.inc();
           const g = this.cachedToOutcome(cached.payload, cached.usage, ctx, resolved, start);
-          await this.persistRequest(req, ctx, resolved, g, usageFromCache(cached.usage), attempts, true);
-          metrics.activeRequests.dec();
-          return g;
+          if (isEmptyGeneration(g.usage, { text: g.text ?? '', toolCalls: g.toolCalls ?? [] })) {
+            // An older gateway may have cached a metadata-only HTTP 200 as a success.
+            // Evict that stale entry so the live provider can retry/fallback normally.
+            getDb().delete(schema.responseCache).where(eq(schema.responseCache.cacheKey, cacheKey)).run();
+          } else {
+            metrics.cacheHits.inc();
+            await this.persistRequest(req, ctx, resolved, g, usageFromCache(cached.usage), attempts, true);
+            return g;
+          }
         }
         // remember cacheKey for storing after success
         (req as unknown as { _cacheKey?: string; _cacheConfigVersion?: number })._cacheKey = cacheKey;
@@ -259,29 +264,37 @@ export class GatewayRunner {
       }
 
       // --- Attempt loop with fallback ---
-      const maxAttempts = comboPlan?.maxTotalAttempts ?? (candidates.length > 1 ? 2 : 1);
+      const firstProvider = getDb().select().from(schema.providers).where(eq(schema.providers.id, candidates[0]!.providerId)).get();
+      const maxAttempts = comboPlan?.maxTotalAttempts
+        ?? (candidates.length > 1 ? candidates.length : 1 + (firstProvider?.maxRetries ?? 0));
       let lastError: GatewayError | null = null;
       let sentToClient = false; // semantically committed output sent
       let resultText = '';
       let resultToolCalls: Array<{ id: string; name: string; input: unknown }> = [];
       let resultFinishReason: string | null = null;
       let finalModelId: string | null = null;
+      let completedSuccessfully = false;
 
-      for (let i = 0; i < maxAttempts && i < candidates.length; i++) {
+      let attemptNumber = 0;
+      let candidateRetries = 0;
+      for (let i = 0; i < candidates.length && attemptNumber < maxAttempts;) {
         const candidate = candidates[i]!;
+        attemptNumber++;
         finalModelId = candidate.modelId;
         const provider = getDb().select().from(schema.providers).where(eq(schema.providers.id, candidate.providerId)).get();
         if (!provider || !provider.enabled) {
-          debugHttp(ctx.requestId, 'ATTEMPT SKIP', [`attempt=${i + 1} model=${candidate.publicModelId} reason=skipped_disabled_provider`]);
-          attempts.push(this.failedAttempt(i + 1, candidate, provider?.name ?? '', 'skipped_disabled_provider', null, null, 0, null, null));
+          debugHttp(ctx.requestId, 'ATTEMPT SKIP', [`attempt=${attemptNumber} model=${candidate.publicModelId} reason=skipped_disabled_provider`]);
+          attempts.push(this.failedAttempt(attemptNumber, candidate, provider?.name ?? '', 'skipped_disabled_provider', null, null, 0, null, null));
+          i++;
           continue;
         }
         const eff = getEffectiveState(provider.id, provider.cbCooldownSeconds);
         if (eff === 'open' && !halfOpenProbeAllowed(provider.id)) {
-          debugHttp(ctx.requestId, 'ATTEMPT SKIP', [`attempt=${i + 1} model=${candidate.publicModelId} provider=${provider.name} reason=circuit_open`]);
-          attempts.push(this.failedAttempt(i + 1, candidate, provider.name, 'circuit_open', null, null, 0, null, null));
+          debugHttp(ctx.requestId, 'ATTEMPT SKIP', [`attempt=${attemptNumber} model=${candidate.publicModelId} provider=${provider.name} reason=circuit_open`]);
+          attempts.push(this.failedAttempt(attemptNumber, candidate, provider.name, 'circuit_open', null, null, 0, null, null));
           if (comboPlan && shouldFallback(comboPlan, { type: 'connection_error' })) {
             metrics.fallbackCount.inc();
+            i++;
             continue;
           }
           lastError = new GatewayError('upstream_unavailable', 'Provider circuit is open', { status: 502 });
@@ -293,7 +306,7 @@ export class GatewayRunner {
         // docs/13 §11–§12: provider/account + upstream request summary
         const upstreamModel = candidate.publicModelId.split('/').slice(1).join('/');
         debugHttp(ctx.requestId, 'ATTEMPT', [
-          `attempt=${i + 1}/${maxAttempts}`,
+          `attempt=${attemptNumber}/${maxAttempts}`,
           `provider=${provider.name}`,
           `providerId=${provider.id}`,
           `model=${candidate.publicModelId}`,
@@ -304,7 +317,7 @@ export class GatewayRunner {
           `providerKeyFingerprint=${apiKeyFingerprint(cfg.apiKey ?? '')}`,
         ]);
         const attempt: AttemptOutcome = {
-          attemptNumber: i + 1,
+          attemptNumber,
           providerId: provider.id,
           modelId: candidate.modelId,
           providerName: provider.name,
@@ -337,6 +350,7 @@ export class GatewayRunner {
           });
           attempt.statusCode = (out as { statusCode?: number | null }).statusCode ?? null;
           attempt.success = true;
+          completedSuccessfully = true;
           // A fallback that succeeded answered the client 200: the earlier failed
           // attempt must not keep the request logged (and reported) as a failure.
           lastError = null;
@@ -374,7 +388,7 @@ export class GatewayRunner {
           // the request to a sibling account but must leave this one enabled.
           const credentialFailure = isPermanentCredentialFailure(err);
           debugUpstream(ctx.requestId, 'ATTEMPT ERROR', [
-            `attempt=${i + 1}`,
+            `attempt=${attemptNumber}`,
             `provider=${provider.name}`,
             `model=${candidate.publicModelId}`,
             `type=${err.type}`,
@@ -391,6 +405,18 @@ export class GatewayRunner {
           attempt.completedAt = new Date().toISOString();
           attempt.failureReason = classifyFailure(err);
           attempt.sanitizedError = redactString(err.message);
+          // A malformed 200 response may still report real input tokens. Preserve that
+          // usage on the failed attempt and request instead of discarding it on throw.
+          const failedUsage = (err.cause as { usage?: UsageSummary } | undefined)?.usage;
+          if (failedUsage) {
+            attempt.usage = failedUsage;
+            usage.input += failedUsage.input;
+            usage.output += failedUsage.output;
+            usage.cacheRead += failedUsage.cacheRead;
+            usage.cacheWrite += failedUsage.cacheWrite;
+            usage.reasoning += failedUsage.reasoning;
+            usage.total += failedUsage.total;
+          }
           // If stream already started sending content, do NOT fallback
           if (attempt.streamStarted) {
             attempt.partialResponse = true;
@@ -415,7 +441,20 @@ export class GatewayRunner {
             if (candidate.qoderAccountId) setQoderAccountHealth(candidate.qoderAccountId, 'down', redactString(err.message));
             getDb().update(schema.providers).set({ healthState: 'down', updatedAt: new Date().toISOString() }).where(eq(schema.providers.id, provider.id)).run();
           }
-          if (shouldRetry && i + 1 < maxAttempts) {
+          // Retry an empty 200 on the same model using its provider retry settings.
+          // Reserve one attempt for a combo's next member whenever possible.
+          const reserveFallback = comboPlan && i + 1 < candidates.length ? 1 : 0;
+          if (err.code === 'upstream_empty_response'
+            && candidateRetries < provider.maxRetries
+            && attemptNumber + reserveFallback < maxAttempts) {
+            const delay = Math.min(provider.retryMaxMs, provider.retryBaseMs * 2 ** candidateRetries);
+            candidateRetries++;
+            if (delay > 0) await new Promise<void>((resolve) => setTimeout(resolve, delay));
+            continue;
+          }
+          candidateRetries = 0;
+          i++;
+          if (shouldRetry && attemptNumber < maxAttempts && i < candidates.length) {
             metrics.fallbackCount.inc();
             continue;
           }
@@ -424,6 +463,11 @@ export class GatewayRunner {
       }
 
       // Build outcome
+      // Every candidate may have been skipped between resolution and execution
+      // (disabled provider, open circuit). That is still a failed gateway request.
+      if (!completedSuccessfully && !lastError) {
+        lastError = new GatewayError('upstream_unavailable', 'No upstream candidate completed successfully', { status: 503 });
+      }
       const latencyMs = Date.now() - start;
       const outcome: GatewayOutcome = {
         success: !lastError,
@@ -580,7 +624,11 @@ export class GatewayRunner {
     if (req.canonical.stream) {
       return this.runStreamingAttempt(req, ctx, candidate, cfg, onStreamStart, onFirstToken);
     }
-    return this.runNonStreamingAttempt(req, candidate, cfg, ctx);
+    const outcome = await this.runNonStreamingAttempt(req, candidate, cfg, ctx);
+    if (isEmptyGeneration(outcome.usage, outcome.result)) {
+      throw emptyGenerationError(candidate, outcome.usage);
+    }
+    return outcome;
   }
 
   private async runNonStreamingAttempt(
@@ -686,6 +734,11 @@ export class GatewayRunner {
     const toolBuf: Array<{ id: string; name: string; input: unknown }> = [];
     let finishReason: string | null = null;
     const usage: UsageSummary = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, total: 0 };
+    let meaningfulTtftMs: number | null = null;
+    // Hold only the initial metadata events (role, message_start, usage, etc.).
+    // Committing HTTP 200 for metadata alone makes an empty 200 un-retryable.
+    const initialEvents: string[] = [];
+    let initialBytes = 0;
 
     // docs/13 §15–§16: stream counters + client disconnect tracking
     let chunkCount = 0;
@@ -716,6 +769,7 @@ export class GatewayRunner {
       bytesReceived += chunk.data.length;
       lastChunkTime = Date.now();
       if (isFirst) firstChunkTime = Date.now() - streamStartTs;
+      let hasOutput = false;
       if (loggedFirstChunks.length < 3) {
         loggedFirstChunks.push(chunk.data);
         debugStream(ctx.requestId, `STREAM FIRST CHUNK ${loggedFirstChunks.length}`, [truncate(chunk.data, 2000)]);
@@ -726,7 +780,10 @@ export class GatewayRunner {
         // (see the qoder branch below), so its usage block is parsed here too.
         if (cfg.type === 'openai' || cfg.type === 'qoder') {
           const choice = obj.choices?.[0];
-          if (choice?.delta?.content) textBuf += choice.delta.content;
+          if (choice?.delta?.content) {
+            textBuf += choice.delta.content;
+            hasOutput = true;
+          }
           if (choice?.delta?.tool_calls) {
             for (const tc of choice.delta.tool_calls) {
               const id = typeof tc.id === 'string' ? tc.id : `toolu-${Math.random().toString(36).slice(2)}`;
@@ -738,6 +795,7 @@ export class GatewayRunner {
                 input = tc.function.arguments;
               }
               toolBuf.push({ id, name, input });
+              hasOutput = true;
             }
           }
           if (choice?.finish_reason) finishReason = choice.finish_reason;
@@ -750,8 +808,14 @@ export class GatewayRunner {
           }
         } else {
           // anthropic stream events
-          if (obj.type === 'content_block_delta' && obj.delta?.text) textBuf += obj.delta.text;
-          if (obj.type === 'content_block_start' && obj.content_block?.type === 'tool_use') toolBuf.push({ id: obj.content_block.id, name: obj.content_block.name, input: obj.content_block.input ?? {} });
+          if (obj.type === 'content_block_delta' && obj.delta?.text) {
+            textBuf += obj.delta.text;
+            hasOutput = true;
+          }
+          if (obj.type === 'content_block_start' && obj.content_block?.type === 'tool_use') {
+            toolBuf.push({ id: obj.content_block.id, name: obj.content_block.name, input: obj.content_block.input ?? {} });
+            hasOutput = true;
+          }
           if (obj.type === 'message_delta' && obj.delta?.stop_reason) finishReason = obj.delta.stop_reason;
           if (obj.type === 'message_start' && obj.message?.usage) {
             usage.input = obj.message.usage.input_tokens ?? 0;
@@ -766,14 +830,29 @@ export class GatewayRunner {
         // ignore parse errors in stream
       }
 
-      // First chunk: commit the downstream SSE response and flush any buffered.
-      if (isFirst) {
+      const encoded = encoder(chunk.data, chunk.event);
+      if (!streamStarted) {
+        if (encoded) {
+          initialEvents.push(encoded);
+          initialBytes += encoded.length;
+        }
+        if (!hasOutput) {
+          if (initialBytes > 65536 || initialEvents.length > 128) {
+            throw emptyGenerationError(candidate, usage);
+          }
+          return;
+        }
+        // Only real text/tool output commits the stream. Metadata-only streams
+        // can still retry or fall back with an ordinary HTTP error response.
         streamStarted = true;
         onStreamStart(true);
-        onFirstToken(Date.now() - streamStartTs);
+        meaningfulTtftMs = Date.now() - streamStartTs;
+        onFirstToken(meaningfulTtftMs);
+        writeHead();
+        for (const event of initialEvents) pipe.write(event);
+        initialEvents.length = 0;
+        return;
       }
-      const encoded = encoder(chunk.data, chunk.event);
-      if (!headWritten) writeHead();
       if (encoded) pipe.write(encoded);
       return;
     };
@@ -790,11 +869,11 @@ export class GatewayRunner {
             firstCodexEvent = false;
           }
         });
-        if (!headWritten) writeHead();
+        if (!streamStarted) throw emptyGenerationError(candidate, usage);
         pipe.write('data: [DONE]\n\n');
         pipe.end();
         if (!usage.total) usage.total = usage.input + usage.output;
-        return { statusCode: meta.status, ttftMs: events.length ? Date.now() - streamStartTs : null, upstreamRequestId: meta.upstreamRequestId, usage, result: { text: textBuf, toolCalls: toolBuf, finishReason } };
+        return { statusCode: meta.status, ttftMs: meaningfulTtftMs, upstreamRequestId: meta.upstreamRequestId, usage, result: { text: textBuf, toolCalls: toolBuf, finishReason } };
       }
       if (cfg.type === 'qoder') {
         const accountRecordId = candidate.qoderAccountId ?? cfg.qoderAccountRecordId;
@@ -812,11 +891,11 @@ export class GatewayRunner {
               chunkHandler({ data: chunk.data }, false);
             },
           );
-          if (!headWritten) writeHead();
+          if (!streamStarted) throw emptyGenerationError(candidate, usage);
           pipe.write('data: [DONE]\n\n');
           pipe.end();
           if (!usage.total) usage.total = usage.input + usage.output;
-          return { statusCode: out.status, ttftMs: qoderTtftMs, upstreamRequestId: out.upstreamRequestId, usage, result: { text: out.text, toolCalls: out.toolCalls, finishReason: out.finishReason } };
+          return { statusCode: out.status, ttftMs: meaningfulTtftMs ?? qoderTtftMs, upstreamRequestId: out.upstreamRequestId, usage, result: { text: out.text, toolCalls: out.toolCalls, finishReason: out.finishReason } };
         } catch (error) {
           return qoderAttemptFailure(accountRecordId, error) as never;
         }
@@ -827,7 +906,7 @@ export class GatewayRunner {
       debugStream(ctx.requestId, 'STREAM START', [`upstreamConnected=true`]);
       const meta = await callUpstreamStreaming(cfg, url, payload, chunkHandler, ctx.requestId);
       // Upstream completed cleanly: ensure head + terminator are written.
-      if (!headWritten) writeHead();
+      if (!streamStarted) throw emptyGenerationError(candidate, usage);
       pipe.write('data: [DONE]\n\n');
       pipe.end();
       debugStream(ctx.requestId, 'STREAM END', [
@@ -842,7 +921,7 @@ export class GatewayRunner {
       if (!usage.total) usage.total = usage.input + usage.output;
       return {
         statusCode: 200,
-        ttftMs: meta.ttftMs,
+        ttftMs: meaningfulTtftMs ?? meta.ttftMs,
         upstreamRequestId: meta.upstreamRequestId,
         usage,
         result: { text: textBuf, toolCalls: toolBuf, finishReason },
@@ -1114,7 +1193,7 @@ export class GatewayRunner {
 }
 
 export function isUpstreamHealthFailure(err: GatewayError): boolean {
-  return ['connection_error', 'connect_timeout', 'first_token_timeout', 'http_status', 'upstream_rate_limit'].includes(classifyFailure(err));
+  return ['connection_error', 'connect_timeout', 'first_token_timeout', 'http_status', 'upstream_rate_limit', 'empty_response'].includes(classifyFailure(err));
 }
 
 /**
@@ -1220,10 +1299,12 @@ export function markCredentialsDead(candidate: CandidateModel, message: string):
 export function shouldRetryAttempt(comboPlan: ComboPlan | null, err: GatewayError): boolean {
   if (isCredentialFailure(err)) return true;
   if (isQuotaFailure(err)) return true;
+  if (err.code === 'upstream_empty_response') return comboPlan?.trigger.on5xx ?? false;
   return comboPlan ? shouldFallback(comboPlan, { type: classifyFailure(err), status: err.status }) : false;
 }
 
 export function classifyFailure(err: GatewayError): string {
+  if (err.code === 'upstream_empty_response') return 'empty_response';
   // Checked before the type switch for the same reason as quota: a dead account is not a routing
   // decision the combo's triggers were meant to gate, and `unknown` is not a routing decision at all.
   if (isCredentialFailure(err)) return 'credential';
@@ -1245,6 +1326,23 @@ export function classifyFailure(err: GatewayError): string {
     default:
       return 'unknown';
   }
+}
+
+/** Zero reported output is only an error when the provider produced neither text nor tool calls.
+ * A number of OpenAI-compatible services omit usage even for valid generations. */
+function isEmptyGeneration(
+  usage: UsageSummary,
+  result: { text: string; toolCalls: Array<{ id: string; name: string; input: unknown }> }
+): boolean {
+  return usage.output === 0 && result.text.length === 0 && result.toolCalls.length === 0;
+}
+
+function emptyGenerationError(candidate: CandidateModel, usage: UsageSummary): GatewayError {
+  return new GatewayError(
+    'upstream_error',
+    `Upstream model "${bareModelName(candidate.publicModelId)}" returned no generated output`,
+    { status: 502, code: 'upstream_empty_response', cause: { usage: { ...usage, total: usage.total || usage.input + usage.output } } },
+  );
 }
 
 function hasTools(req: CanonicalRequest): boolean {

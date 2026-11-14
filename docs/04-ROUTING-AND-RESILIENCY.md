@@ -83,6 +83,17 @@ Combo-level safety:
 
 Never multiply retries without a global cap.
 
+An upstream HTTP 200 with zero generated output tokens and no assistant text or tool calls is
+an `upstream_empty_response` failure (HTTP 502 to the client if no attempt succeeds), even if
+the upstream reports consumed input tokens. Retry the same provider model up to its configured
+`max_retries` for this failure, honoring the combo's `max_total_attempts` limit and reserving an
+attempt for the next combo model where possible. Empty-response fallback respects the combo's
+HTTP 5xx fallback setting. Streaming prelude/usage events do not commit a downstream HTTP 200;
+the stream commits on the first actual text or tool call. Once streaming output has been sent,
+fallback is prohibited. A valid tool call or real text still counts as generated output when a
+provider omits usage statistics or reports zero output tokens.
+Legacy cached empty successes are evicted when read, allowing the live upstream to be retried.
+
 ## Timeouts
 
 Separate at least:

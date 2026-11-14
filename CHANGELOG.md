@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.20.4] - 2026-11-14
+
+### Fixed
+
+- Treat upstream HTTP 200 responses with zero output tokens and no generated text or tool calls as `upstream_empty_response` failures (502) while preserving consumed input token accounting.
+- Retry empty responses within provider limits, fall back to the next combo member when permitted, and report a failure when all attempts or candidates are exhausted.
+- Buffer initial streaming metadata until real generated output arrives so empty streams can return errors or fall back before committing HTTP 200; avoid replaying stale cached empty successes.
+
 ## [1.20.3] - 2026-11-10
 
 ### Fixed
