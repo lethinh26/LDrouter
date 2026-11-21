@@ -53,7 +53,7 @@ describe('Codex account routing', () => {
         { id: 'member-a', modelId: 'a', position: 0, enabled: true },
         { id: 'member-b', modelId: 'b', position: 1, enabled: true },
       ],
-      trigger: { connection: true, connectTimeout: true, firstTokenTimeout: true, on408: true, on429: true, on5xx: true },
+      trigger: { connection: true, connectTimeout: true, firstTokenTimeout: true, totalTimeout: true, on408: true, on429: true, on5xx: true },
     };
     const candidates = [
       { modelId: 'a', publicModelId: 'openai/a', upstreamModelId: 'a', providerId: 'p', enabled: true, upstreamAvailable: true, circuitOpen: false, capabilities: {} },

@@ -92,6 +92,11 @@ Unique constraint on `(provider_id, upstream_model_id)`.
 - `enabled`
 - `max_total_attempts`
 - fallback-trigger policy
+- `fallback_on_total_timeout` (default true for new combos; migration 0012 copies the previous `fallback_on_connect_timeout` value for existing combos)
+- `slow_response_fallback_enabled` (default true)
+- `slow_response_threshold_seconds` (default 60)
+- `slow_response_max_count` (default 3)
+- `slow_response_generation` (increments when slow-response settings change, invalidating stale in-flight outcomes)
 - `created_at`
 - `updated_at`
 
@@ -108,6 +113,23 @@ Constraints:
 - model must be physical
 - no duplicate model in a combo
 - position controls fallback ordering; the lowest position is tried first
+
+### `combo_member_slow_states`
+
+Persistent slow-response health for one physical model inside one combo. The composite primary key
+is `(combo_id, model_id)` so a model can have different slow-response history in different combos.
+
+- `consecutive_slow_count`
+- `cooldown_until_ms` (nullable Unix milliseconds)
+- `probe_lease_until_ms` (nullable Unix milliseconds; atomically reserves one recovery probe)
+- `last_latency_ms`
+- `last_outcome`: `slow`, `fast`, `error`, or `unknown`
+- `updated_at_ms`
+
+Combo deletion cascades state deletion. Removing a member cascades its state; re-adding the same
+model creates a new `combo_members.id` and starts with fresh history. In-flight state/probe writes
+must match the membership row ID captured by the request, so an old request cannot mutate the new
+membership. Changing slow-response settings clears the combo's affected history transactionally.
 
 ### `qoder_accounts`
 

@@ -12,7 +12,7 @@ const combo = (): ComboPlan => ({
     { id: 'm2', modelId: 'b', position: 2, enabled: true },
     { id: 'm3', modelId: 'c', position: 3, enabled: true },
   ],
-  trigger: { connection: true, connectTimeout: true, firstTokenTimeout: true, on408: true, on429: true, on5xx: true },
+  trigger: { connection: true, connectTimeout: true, firstTokenTimeout: true, totalTimeout: true, on408: true, on429: true, on5xx: true },
 });
 
 const candidates: CandidateModel[] = [
@@ -49,10 +49,22 @@ describe('combo routing', () => {
     const plan = combo();
     expect(shouldFallback(plan, { type: 'connection_error' })).toBe(true);
     expect(shouldFallback(plan, { type: 'http_status', status: 429 })).toBe(true);
+    expect(shouldFallback(plan, { type: 'http_status', status: 408 })).toBe(true);
     expect(shouldFallback(plan, { type: 'http_status', status: 503 })).toBe(true);
+    expect(shouldFallback(plan, { type: 'connect_timeout' })).toBe(true);
+    expect(shouldFallback(plan, { type: 'first_token_timeout' })).toBe(true);
+    expect(shouldFallback(plan, { type: 'total_timeout' })).toBe(true);
     expect(shouldFallback(plan, { type: 'http_status', status: 400 })).toBe(false);
     expect(shouldFallback(plan, { type: 'stream_partial' })).toBe(false); // never after content sent
     const no429 = { ...plan, trigger: { ...plan.trigger, on429: false } };
     expect(shouldFallback(no429, { type: 'http_status', status: 429 })).toBe(false);
+    const no408 = { ...plan, trigger: { ...plan.trigger, on408: false } };
+    expect(shouldFallback(no408, { type: 'http_status', status: 408 })).toBe(false);
+    const noTotalTimeout = { ...plan, trigger: { ...plan.trigger, totalTimeout: false } };
+    expect(shouldFallback(noTotalTimeout, { type: 'total_timeout' })).toBe(false);
+    const noConnectTimeout = { ...plan, trigger: { ...plan.trigger, connectTimeout: false } };
+    expect(shouldFallback(noConnectTimeout, { type: 'connect_timeout' })).toBe(false);
+    const noFirstTokenTimeout = { ...plan, trigger: { ...plan.trigger, firstTokenTimeout: false } };
+    expect(shouldFallback(noFirstTokenTimeout, { type: 'first_token_timeout' })).toBe(false);
   });
 });

@@ -18,8 +18,9 @@ import { restrictToParentElement, restrictToVerticalAxis } from '@dnd-kit/modifi
 import { SortableContext, arrayMove, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable';
 import { cn } from '../../lib/utils';
 
-interface Combo { id: string; name: string; slug: string; publicModelId: string; enabled: boolean; memberCount: number; healthyMemberCount: number; status: string; unavailableReasons: string[]; capabilityWarnings: string[]; }
-interface ComboDetail extends Combo { maxTotalAttempts: number; fallbackOnConnection: boolean; fallbackOnConnectTimeout: boolean; fallbackOnFirstTokenTimeout: boolean; fallbackOn408: boolean; fallbackOn429: boolean; fallbackOn5xx: boolean; members: Array<{ id: string; modelId: string; publicModelId: string; upstreamModelId: string; displayName: string; providerSlug: string; position: number; enabled: boolean; upstreamAvailable: boolean; providerEnabled: boolean; providerHealth: string; circuitOpen: boolean; capabilities: Record<string, unknown>; status: { state: string; reason: string } }>; capabilityWarnings: string[]; }
+interface Combo { id: string; name: string; slug: string; publicModelId: string; enabled: boolean; memberCount: number; healthyMemberCount: number; slowCooldownCount: number; slowProbeCount: number; status: string; unavailableReasons: string[]; capabilityWarnings: string[]; }
+interface SlowStateView { modelId: string; consecutiveSlowCount: number; cooldownUntilMs: number | null; probeLeaseUntilMs: number | null; lastLatencyMs: number | null; lastOutcome: string; }
+interface ComboDetail extends Combo { maxTotalAttempts: number; fallbackOnConnection: boolean; fallbackOnConnectTimeout: boolean; fallbackOnFirstTokenTimeout: boolean; fallbackOnTotalTimeout: boolean; fallbackOn408: boolean; fallbackOn429: boolean; fallbackOn5xx: boolean; slowResponseFallbackEnabled: boolean; slowResponseThresholdSeconds: number; slowResponseMaxCount: number; members: Array<{ id: string; modelId: string; publicModelId: string; upstreamModelId: string; displayName: string; providerSlug: string; position: number; enabled: boolean; upstreamAvailable: boolean; providerEnabled: boolean; providerHealth: string; circuitOpen: boolean; capabilities: Record<string, unknown>; status: { state: string; reason: string }; slowState: SlowStateView | null }>; capabilityWarnings: string[]; }
 interface ModelRow { id: string; publicModelId: string; upstreamModelId: string; displayName: string; providerSlug: string; enabled: boolean; upstreamAvailable: boolean; providerEnabled: boolean; providerHealth: string; circuitOpen: boolean; capabilities: Record<string, unknown>; }
 interface MemberForm { id?: string; modelId: string; position: number; enabled: boolean }
 interface ComboTestResult {
@@ -30,9 +31,9 @@ interface ComboTestResult {
   attempts: Array<{ publicModelId: string; upstreamModelId: string; providerName: string; latencyMs: number; success: boolean; failureReason: string | null }>;
 }
 
-type ComboSettings = { maxTotalAttempts: number; fallbackOnConnection: boolean; fallbackOnConnectTimeout: boolean; fallbackOnFirstTokenTimeout: boolean; fallbackOn408: boolean; fallbackOn429: boolean; fallbackOn5xx: boolean };
-const defaultComboSettings: ComboSettings = { maxTotalAttempts: 3, fallbackOnConnection: true, fallbackOnConnectTimeout: true, fallbackOnFirstTokenTimeout: true, fallbackOn408: true, fallbackOn429: true, fallbackOn5xx: true };
-const reasonLabels: Record<string, string> = { member_disabled: 'member disabled', model_missing: 'model missing', provider_disabled: 'provider disabled', provider_down: 'provider down', model_disabled: 'model disabled', upstream_unavailable: 'upstream unavailable', circuit_open: 'circuit open', chat_capability_unavailable: 'chat capability unavailable' };
+type ComboSettings = { maxTotalAttempts: number; fallbackOnConnection: boolean; fallbackOnConnectTimeout: boolean; fallbackOnFirstTokenTimeout: boolean; fallbackOnTotalTimeout: boolean; fallbackOn408: boolean; fallbackOn429: boolean; fallbackOn5xx: boolean; slowResponseFallbackEnabled: boolean; slowResponseThresholdSeconds: number; slowResponseMaxCount: number };
+const defaultComboSettings: ComboSettings = { maxTotalAttempts: 3, fallbackOnConnection: true, fallbackOnConnectTimeout: true, fallbackOnFirstTokenTimeout: true, fallbackOnTotalTimeout: true, fallbackOn408: true, fallbackOn429: true, fallbackOn5xx: true, slowResponseFallbackEnabled: true, slowResponseThresholdSeconds: 60, slowResponseMaxCount: 3 };
+const reasonLabels: Record<string, string> = { member_disabled: 'member disabled', model_missing: 'model missing', provider_disabled: 'provider disabled', provider_down: 'provider down', model_disabled: 'model disabled', upstream_unavailable: 'upstream unavailable', circuit_open: 'circuit open', chat_capability_unavailable: 'chat capability unavailable', slow_response_cooldown: 'slow-response cooldown', slow_response_probe_active: 'recovery probe already running', slow_response_timeout: 'slow response' };
 
 // Priority is the array order: index 0 is tried first.
 const reindex = (members: MemberForm[]) => members.map((m, i) => ({ ...m, position: i }));
@@ -47,6 +48,7 @@ export function Combos() {
   const [editing, setEditing] = useState(false);
   const [testingId, setTestingId] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<ComboTestResult | null>(null);
+  const [editSlowStates, setEditSlowStates] = useState<SlowStateView[]>([]);
   const [form, setForm] = useState({ name: '', slug: '', enabled: true, ...defaultComboSettings, members: [] as MemberForm[] });
   const [editForm, setEditForm] = useState({ name: '', slug: '', enabled: true, ...defaultComboSettings, members: [] as typeof form.members });
   const [deleting, setDeleting] = useState<Combo | null>(null);
@@ -102,11 +104,16 @@ export function Combos() {
         fallbackOnConnection: d.fallbackOnConnection,
         fallbackOnConnectTimeout: d.fallbackOnConnectTimeout,
         fallbackOnFirstTokenTimeout: d.fallbackOnFirstTokenTimeout,
+        fallbackOnTotalTimeout: d.fallbackOnTotalTimeout,
         fallbackOn408: d.fallbackOn408,
         fallbackOn429: d.fallbackOn429,
         fallbackOn5xx: d.fallbackOn5xx,
+        slowResponseFallbackEnabled: d.slowResponseFallbackEnabled,
+        slowResponseThresholdSeconds: d.slowResponseThresholdSeconds,
+        slowResponseMaxCount: d.slowResponseMaxCount,
         members: d.members.map((m) => ({ modelId: m.modelId, position: m.position, enabled: m.enabled })),
       });
+      setEditSlowStates(d.members.flatMap((member) => member.slowState ? [{ ...member.slowState, modelId: member.modelId }] : []));
       setEditOpen(true);
     } catch (e) { toast.error((e as Error).message); }
   };
@@ -186,7 +193,7 @@ export function Combos() {
                 <TableRow key={c.id}>
                   <TableCell className="font-mono text-xs">{c.publicModelId}</TableCell>
                   <TableCell>{c.memberCount}</TableCell>
-                   <TableCell><Badge variant={c.status === 'ready' ? 'success' : c.status === 'disabled' ? 'secondary' : 'destructive'}>{c.healthyMemberCount}/{c.memberCount} ready</Badge>{c.capabilityWarnings.length > 0 && <div className="text-xs text-amber-600">Capability metadata differs</div>}{c.status === 'unavailable' && c.unavailableReasons.length > 0 && <div className="text-xs text-muted-foreground">{c.unavailableReasons.map((reason) => reasonLabels[reason] ?? reason).join(', ')}</div>}</TableCell>
+                  <TableCell><Badge variant={c.status === 'ready' ? 'success' : c.status === 'disabled' ? 'secondary' : 'destructive'}>{c.healthyMemberCount}/{c.memberCount} healthy</Badge>{c.slowCooldownCount > 0 && <div className="text-xs text-amber-600">{c.slowCooldownCount} in slow cooldown</div>}{c.slowProbeCount > 0 && <div className="text-xs text-muted-foreground">{c.slowProbeCount} recovery probe running</div>}{c.capabilityWarnings.length > 0 && <div className="text-xs text-amber-600">Capability metadata differs</div>}{c.status === 'unavailable' && c.unavailableReasons.length > 0 && <div className="text-xs text-muted-foreground">{c.unavailableReasons.map((reason) => reasonLabels[reason] ?? reason).join(', ')}</div>}</TableCell>
                   <TableCell>{c.enabled ? 'Yes' : 'No'}</TableCell>
                   <TableCell className="text-right">
                     <div className="flex items-center justify-end gap-1">
@@ -224,6 +231,23 @@ export function Combos() {
                 modelFor={(m) => models.find((x) => x.id === m.modelId) ?? null}
                 onChange={(members) => setEditForm((f) => ({ ...f, members }))}
               />
+              {editSlowStates.length > 0 && <div className="rounded border bg-muted/20 p-2 text-xs">
+                <div className="mb-2 font-medium">Slow-response history</div>
+                <div className="space-y-1">
+                  {editSlowStates.map((state) => {
+                    const model = models.find((item) => item.id === state.modelId);
+                    const now = Date.now();
+                    const cooling = state.cooldownUntilMs !== null && state.cooldownUntilMs > now;
+                    const probing = state.probeLeaseUntilMs !== null && state.probeLeaseUntilMs > now;
+                    const probeReady = state.cooldownUntilMs !== null && state.cooldownUntilMs <= now && !probing;
+                    return <div key={state.modelId} className="flex flex-wrap items-center gap-2">
+                      <span className="min-w-0 flex-1 truncate font-mono">{model?.publicModelId ?? state.modelId}</span>
+                      <span className="text-muted-foreground">{state.consecutiveSlowCount} slow · {state.lastLatencyMs ?? '—'} ms last</span>
+                      {cooling ? <Badge variant="warning">Cooldown until {new Date(state.cooldownUntilMs!).toLocaleTimeString()}</Badge> : probing ? <Badge variant="secondary">Recovery probe</Badge> : probeReady ? <Badge variant="warning">Probe ready</Badge> : <Badge variant="outline">Monitoring</Badge>}
+                    </div>;
+                  })}
+                </div>
+              </div>}
             </div>
           </div>
           <DialogFooter>
@@ -255,9 +279,25 @@ function editSettings(value: ComboSettings): ComboSettings { return value; }
 
 function ComboSettingsFields({ value, onChange }: { value: ComboSettings; onChange: (patch: Partial<ComboSettings>) => void }) {
   const triggers: Array<[keyof ComboSettings, string]> = [
-    ['fallbackOnConnection', 'Connection failure'], ['fallbackOnConnectTimeout', 'Connect timeout'], ['fallbackOnFirstTokenTimeout', 'First-token timeout'], ['fallbackOn408', 'HTTP 408'], ['fallbackOn429', 'HTTP 429'], ['fallbackOn5xx', 'HTTP 5xx'],
+    ['fallbackOnConnection', 'Connection failure'], ['fallbackOnConnectTimeout', 'Connect timeout'], ['fallbackOnFirstTokenTimeout', 'First-token timeout'], ['fallbackOnTotalTimeout', 'Total timeout'], ['fallbackOn408', 'HTTP 408'], ['fallbackOn429', 'HTTP 429'], ['fallbackOn5xx', 'HTTP 5xx'],
   ];
-  return <div className="rounded border bg-muted/20 p-3"><div className="mb-2 text-sm font-medium">Fallback policy</div><div className="grid gap-3 sm:grid-cols-[10rem_1fr]"><div><Label>Max total attempts</Label><Input type="number" min={1} max={8} value={value.maxTotalAttempts} onChange={(e) => onChange({ maxTotalAttempts: Math.min(8, Math.max(1, Number(e.target.value) || 1)) })} /></div><div className="grid gap-2 sm:grid-cols-2">{triggers.map(([key, label]) => <label key={key} className="flex items-center gap-2 text-xs"><Switch checked={Boolean(value[key])} onCheckedChange={(checked) => onChange({ [key]: checked })} /><span>{label}</span></label>)}</div></div></div>;
+  return <div className="space-y-3 rounded border bg-muted/20 p-3">
+    <div>
+      <div className="mb-2 text-sm font-medium">Fallback policy</div>
+      <div className="grid gap-3 sm:grid-cols-[10rem_1fr]">
+        <div><Label>Max total attempts</Label><Input type="number" min={1} max={8} value={value.maxTotalAttempts} onChange={(e) => onChange({ maxTotalAttempts: Math.min(8, Math.max(1, Number(e.target.value) || 1)) })} /></div>
+        <div className="grid gap-2 sm:grid-cols-2">{triggers.map(([key, label]) => <label key={key} className="flex items-center gap-2 text-xs"><Switch checked={Boolean(value[key])} onCheckedChange={(checked) => onChange({ [key]: checked })} /><span>{label}</span></label>)}</div>
+      </div>
+    </div>
+    <div className="border-t pt-3">
+      <label className="mb-2 flex items-center gap-2 text-sm font-medium"><Switch checked={value.slowResponseFallbackEnabled} onCheckedChange={(checked) => onChange({ slowResponseFallbackEnabled: checked })} />Slow-response fallback</label>
+      <div className="grid gap-3 sm:grid-cols-2">
+        <div><Label>Response threshold (seconds)</Label><Input type="number" min={1} max={600} disabled={!value.slowResponseFallbackEnabled} value={value.slowResponseThresholdSeconds} onChange={(e) => onChange({ slowResponseThresholdSeconds: Math.min(600, Math.max(1, Math.round(Number(e.target.value) || 1))) })} /></div>
+        <div><Label>Slow responses before cooldown</Label><Input type="number" min={1} max={20} disabled={!value.slowResponseFallbackEnabled} value={value.slowResponseMaxCount} onChange={(e) => onChange({ slowResponseMaxCount: Math.min(20, Math.max(1, Math.round(Number(e.target.value) || 1))) })} /></div>
+      </div>
+      <p className="mt-2 text-xs text-muted-foreground">Streaming uses request-to-first-content-token time; non-streaming uses full response time. Provider total timeout starts with the request; provider first-token timeout starts after headers. The earliest deadline applies. After the limit, this member is skipped for 5 minutes and one request probes recovery.</p>
+    </div>
+  </div>;
 }
 
 function RoutePreview({ members, modelFor }: { members: MemberForm[]; modelFor: (member: MemberForm) => ModelRow | null }) {

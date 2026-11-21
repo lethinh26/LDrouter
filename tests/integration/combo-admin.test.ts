@@ -73,14 +73,107 @@ const patch = (body: Record<string, unknown>) =>
 const detail = async (id: string) => {
   const r = await fetch(`${baseUrl}/api/admin/combos/${id}`, { headers: { cookie: cookies } });
   expect(r.status).toBe(200);
-  return (await r.json()).combo as { slug: string; publicModelId: string; maxTotalAttempts: number; fallbackOn429: boolean; members: Array<{ modelId: string; providerEnabled: boolean; status: { state: string } }> };
+  return (await r.json()).combo as { slug: string; publicModelId: string; maxTotalAttempts: number; fallbackOn429: boolean; fallbackOnTotalTimeout: boolean; slowResponseFallbackEnabled: boolean; slowResponseThresholdSeconds: number; slowResponseMaxCount: number; members: Array<{ modelId: string; providerEnabled: boolean; status: { state: string }; slowState: unknown }> };
+};
+
+const list = async () => {
+  const r = await fetch(`${baseUrl}/api/admin/combos`, { headers: { cookie: cookies } });
+  expect(r.status).toBe(200);
+  return (await r.json()).combos as Array<{ id: string; status: string; healthyMemberCount: number; slowCooldownCount: number; slowProbeCount: number }>;
 };
 
 describe('admin combo create', () => {
   it('derives the public id from the name when no slug is given', async () => {
     const r = await create({ name: 'Smart Combo', members: [member(modelA)] });
     expect(r.status).toBe(200);
-    expect((await r.json()).publicModelId).toBe('smart-combo');
+    const created = await r.json();
+    expect(created.publicModelId).toBe('smart-combo');
+    await expect(detail(created.id)).resolves.toMatchObject({
+      slowResponseFallbackEnabled: true,
+      fallbackOnTotalTimeout: true,
+      slowResponseThresholdSeconds: 60,
+      slowResponseMaxCount: 3,
+    });
+  });
+
+  it('includes persisted slow-response state in combo member details', async () => {
+    const r = await create({ name: 'Slow state detail', members: [member(modelA)] });
+    expect(r.status).toBe(200);
+    const created = await r.json();
+    const now = Date.now();
+    db.insert(sch.comboMemberSlowStates).values({
+      comboId: created.id,
+      modelId: modelA,
+      consecutiveSlowCount: 2,
+      cooldownUntilMs: now + 300_000,
+      lastLatencyMs: 75_000,
+      lastOutcome: 'slow',
+      updatedAtMs: now,
+    }).run();
+
+    const combo = await detail(created.id);
+    expect(combo.members[0]?.slowState).toMatchObject({
+      consecutiveSlowCount: 2,
+      lastLatencyMs: 75_000,
+      lastOutcome: 'slow',
+    });
+  });
+
+  it('reports healthy members separately from slow cooldowns and active probes in the combo list', async () => {
+    const r = await create({ name: 'Slow list status', members: [member(modelA, 0), member(modelB, 1)] });
+    expect(r.status).toBe(200);
+    const created = await r.json();
+    const now = Date.now();
+    db.insert(sch.comboMemberSlowStates).values([
+      { comboId: created.id, modelId: modelA, consecutiveSlowCount: 3, cooldownUntilMs: now + 300_000, lastOutcome: 'slow', updatedAtMs: now },
+      { comboId: created.id, modelId: modelB, consecutiveSlowCount: 3, cooldownUntilMs: now - 1, probeLeaseUntilMs: now + 30_000, lastOutcome: 'error', updatedAtMs: now },
+    ]).run();
+
+    const listed = await list();
+    expect(listed.find((combo) => combo.id === created.id)).toMatchObject({
+      status: 'ready',
+      healthyMemberCount: 2,
+      slowCooldownCount: 1,
+      slowProbeCount: 1,
+    });
+  });
+
+  it('preserves retained member history and cascades only the removed member history', async () => {
+    const r = await create({ name: 'Slow state member diff', members: [member(modelA, 0), member(modelB, 1)] });
+    expect(r.status).toBe(200);
+    const created = await r.json();
+    const generationBefore = db.select().from(sch.combos).all().find((combo) => combo.id === created.id)!.slowResponseGeneration;
+    const now = Date.now();
+    db.insert(sch.comboMemberSlowStates).values([
+      { comboId: created.id, modelId: modelA, consecutiveSlowCount: 2, lastLatencyMs: 70_000, lastOutcome: 'slow', updatedAtMs: now },
+      { comboId: created.id, modelId: modelB, consecutiveSlowCount: 1, lastLatencyMs: 65_000, lastOutcome: 'slow', updatedAtMs: now },
+    ]).run();
+
+    const updated = await patch({ id: created.id, members: [member(modelB, 0)] });
+    expect(updated.status).toBe(200);
+    const combo = await detail(created.id);
+    expect(combo.members).toHaveLength(1);
+    expect(combo.members[0]?.modelId).toBe(modelB);
+    expect(combo.members[0]?.slowState).toMatchObject({ consecutiveSlowCount: 1, lastLatencyMs: 65_000 });
+    expect(db.select().from(sch.comboMemberSlowStates).all().filter((state) => state.comboId === created.id).map((state) => state.modelId)).toEqual([modelB]);
+    expect(db.select().from(sch.combos).all().find((item) => item.id === created.id)?.slowResponseGeneration).toBe(generationBefore);
+  });
+
+  it('clears slow history atomically when slow-response settings change', async () => {
+    const r = await create({ name: 'Slow settings reset', members: [member(modelA)] });
+    expect(r.status).toBe(200);
+    const created = await r.json();
+    const now = Date.now();
+    db.insert(sch.comboMemberSlowStates).values({
+      comboId: created.id, modelId: modelA, consecutiveSlowCount: 2,
+      cooldownUntilMs: now + 300_000, lastLatencyMs: 75_000, lastOutcome: 'slow', updatedAtMs: now,
+    }).run();
+    const generationBefore = db.select().from(sch.combos).all().find((combo) => combo.id === created.id)!.slowResponseGeneration;
+
+    const updated = await patch({ id: created.id, slowResponseThresholdSeconds: 90 });
+    expect(updated.status).toBe(200);
+    expect(db.select().from(sch.comboMemberSlowStates).all().filter((state) => state.comboId === created.id)).toHaveLength(0);
+    expect(db.select().from(sch.combos).all().find((combo) => combo.id === created.id)?.slowResponseGeneration).toBe(generationBefore + 1);
   });
 
   it('accepts an explicitly empty slug as omitted', async () => {
@@ -90,11 +183,15 @@ describe('admin combo create', () => {
   });
 
   it('round-trips fallback safety settings and reports member readiness', async () => {
-    const r = await create({ name: 'settings', maxTotalAttempts: 5, fallbackOn429: false, members: [member(modelA)] });
+    const r = await create({ name: 'settings', maxTotalAttempts: 5, fallbackOn429: false, fallbackOnTotalTimeout: false, slowResponseFallbackEnabled: false, slowResponseThresholdSeconds: 90, slowResponseMaxCount: 4, members: [member(modelA)] });
     expect(r.status).toBe(200);
     const combo = await detail((await r.json()).id);
     expect(combo.maxTotalAttempts).toBe(5);
     expect(combo.fallbackOn429).toBe(false);
+    expect(combo.fallbackOnTotalTimeout).toBe(false);
+    expect(combo.slowResponseFallbackEnabled).toBe(false);
+    expect(combo.slowResponseThresholdSeconds).toBe(90);
+    expect(combo.slowResponseMaxCount).toBe(4);
     expect(combo.members[0]).toMatchObject({ providerEnabled: true, status: { state: 'ready' } });
   });
 

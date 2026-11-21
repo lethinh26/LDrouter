@@ -29,6 +29,29 @@ type App = FastifyInstance;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+const processHandlersRegisteredKey = Symbol.for('latedev-router.process-handlers-registered');
+
+function registerProcessHandlers(): void {
+  // buildApp is a factory and tests create multiple instances in one process.
+  // The process symbol also survives Vitest's isolated module contexts.
+  if (Reflect.get(process, processHandlersRegisteredKey) === true) return;
+  Object.defineProperty(process, processHandlersRegisteredKey, { value: true });
+
+  process.on('uncaughtException', (err) => {
+    fatal('FATAL', ['uncaughtException', ...formatError(err)]);
+    const log = getLogger();
+    log.error({ err: { name: err.name, message: err.message, stack: err.stack } }, 'uncaught exception');
+    // Don't exit immediately - let Fastify error handler process
+    setTimeout(() => process.exit(1), 1000);
+  });
+
+  process.on('unhandledRejection', (reason) => {
+    fatal('FATAL', ['unhandledRejection', ...formatError(reason)]);
+    const log = getLogger();
+    log.error({ err: { reason: String(reason) } }, 'unhandled rejection');
+  });
+}
+
 export interface AppOptions {
   skipOpenDb?: boolean;
 }
@@ -36,6 +59,7 @@ export interface AppOptions {
 export async function buildApp(opts: AppOptions = {}): Promise<App> {
   const cfg = loadConfig();
   const log = getLogger();
+  registerProcessHandlers();
   if (!opts.skipOpenDb) openDb(cfg.dbFile);
 
   // Initialize metrics registry after logger is available
@@ -46,7 +70,6 @@ export async function buildApp(opts: AppOptions = {}): Promise<App> {
     bodyLimit: 64 * 1024 * 1024,
     trustProxy: cfg.trustProxyHops > 0,
     genReqId: (req: { headers: Record<string, string | string[] | undefined> }) => (req.headers['x-request-id'] as string) || generateRequestId(),
-    disableRequestLogging: false,
   } as never) as unknown as App;
 
   await app.register(cookie, { secret: cfg.masterKey ?? 'latedev-dev-secret' });
@@ -172,22 +195,7 @@ export async function buildApp(opts: AppOptions = {}): Promise<App> {
     reply.code(404).send(toOpenAIError(err, req.id as string));
   });
 
-  // Process-level crash prevention
-process.on('uncaughtException', (err) => {
-  fatal('FATAL', ['uncaughtException', ...formatError(err)]);
-  const log = getLogger();
-  log.error({ err: { name: err.name, message: err.message, stack: err.stack } }, 'uncaught exception');
-  // Don't exit immediately - let Fastify error handler process
-  setTimeout(() => process.exit(1), 1000);
-});
-
-process.on('unhandledRejection', (reason) => {
-  fatal('FATAL', ['unhandledRejection', ...formatError(reason)]);
-  const log = getLogger();
-  log.error({ err: { reason: String(reason) } }, 'unhandled rejection');
-});
-
-// On startup: ensure settings row + detect master key status
+  // On startup: ensure settings row + detect master key status
   app.addHook('onReady', async () => {
     const s = getSettings();
     if (!s.masterKeyConfigured && isMasterKeyConfigured()) {

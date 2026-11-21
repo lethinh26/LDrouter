@@ -140,7 +140,7 @@ List:
 - public ID
 - enabled
 - member count
-- health/eligible-member summary
+- healthy-member count, with active slow-response cooldown and recovery-probe counts shown separately
 
 Create/edit form:
 
@@ -149,12 +149,19 @@ Create/edit form:
 - mode
 - max total attempts
 - fallback trigger policy
+- total-timeout fallback toggle
+- slow-response fallback toggle
+- slow-response threshold in seconds (default 60)
+- consecutive slow-response count before cooldown (default 3)
 - member picker
 
 Member editor:
 
 - drag/drop or explicit up/down ordering
 - numbered priority
+
+Show each member's recent slow-response count, last latency, cooldown, and recovery-probe state
+when editing a combo.
 
 Warn when member capability sets differ.
 

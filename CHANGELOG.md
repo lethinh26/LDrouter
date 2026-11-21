@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.20.5] - 2026-11-21
+
+### Added
+
+- Add per-combo slow-response fallback with configurable TTFT/response thresholds, consecutive-slow limits, five-minute cooldowns, and single-request recovery probes.
+- Expose slow-response fallback configuration and per-member cooldown/probe state in the admin combo interface.
+
+### Fixed
+
+- Preserve total-timeout fallback configuration during upgrades and enforce composite combo-member foreign keys with cascading slow-state cleanup.
+- Abort OpenAI, Anthropic, Codex, and Qoder upstream streams when the downstream client disconnects; preserve disconnect classification across credential refresh and error handling.
+- Preserve token, cache, and reasoning usage received before a post-content stream timeout without retrying after response content is committed.
+- Register process-level exception handlers once per process and remove a deprecated Fastify request-logging option.
+
 ## [1.20.4] - 2026-11-14
 
 ### Fixed

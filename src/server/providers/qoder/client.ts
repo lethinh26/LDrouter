@@ -7,7 +7,7 @@
 //   - A missing live model_config is a hard error. Sending the wrong block makes the
 //     upstream silently serve a different model.
 import { createHash, randomUUID } from 'node:crypto';
-import { GatewayError } from '../../errors';
+import { GatewayError, clientDisconnectedError } from '../../errors';
 import { redactString } from '../../security/redact';
 import type { CanonicalRequest } from '../../routing/capabilities';
 import type { DiscoveredModel, ProbeResult } from '../index';
@@ -44,7 +44,7 @@ export interface QoderCanonicalResult {
   usage: QoderUsage;
 }
 
-export interface QoderDeps { fetchImpl?: typeof fetch }
+export interface QoderDeps { fetchImpl?: typeof fetch; signal?: AbortSignal }
 
 const emptyUsage = (): QoderUsage => ({ input: 0, output: 0, total: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 });
 
@@ -180,7 +180,7 @@ async function openSignedStream(
   cfg: QoderProviderConfig,
   req: CanonicalRequest,
   deps: QoderDeps,
-): Promise<{ response: Response; reader: QoderEnvelopeReader; status: number; upstreamRequestId: string | null }> {
+): Promise<{ response: Response; reader: QoderEnvelopeReader; status: number; upstreamRequestId: string | null; cleanup: () => void }> {
   // Accept both a public id (`qoder/qmodel_38max`) and the bare upstream key the runner passes.
   // Qoder model keys never contain a slash, so the last segment is the key either way — taking it
   // unconditionally is what makes this idempotent instead of stripping a prefix that may be gone.
@@ -188,17 +188,32 @@ async function openSignedStream(
   const { payload } = qoderRequestPayload(req, modelKey, cfg.catalog);
   const { init } = signedInit(cfg, payload, modelKey);
   const controller = new AbortController();
+  const abortForDownstream = () => controller.abort();
+  if (deps.signal?.aborted) abortForDownstream();
+  else deps.signal?.addEventListener('abort', abortForDownstream, { once: true });
+  const cleanup = () => deps.signal?.removeEventListener('abort', abortForDownstream);
   const timer = setTimeout(() => controller.abort(), cfg.totalTimeoutMs);
   let response: Response;
   try {
     response = await (deps.fetchImpl ?? fetch)(QODER_CHAT_URL, { ...init, signal: controller.signal });
   } catch (error) {
     clearTimeout(timer);
+    cleanup();
+    if (deps.signal?.aborted) {
+      throw clientDisconnectedError(error);
+    }
     throw new GatewayError('timeout_error', 'Qoder upstream request failed', { status: 504, cause: error });
   }
   // Headers are in: the total timeout no longer applies (Qoder streams can be long).
   clearTimeout(timer);
+  if (deps.signal?.aborted) {
+    cleanup();
+    throw clientDisconnectedError();
+  }
   if (!response.ok || !response.body) {
+    if (response.body) await response.body.cancel().catch(() => undefined);
+    cleanup();
+    if (deps.signal?.aborted) throw clientDisconnectedError();
     throw new QoderUpstreamError(response.status, `Qoder upstream HTTP ${response.status}`);
   }
   return {
@@ -206,6 +221,7 @@ async function openSignedStream(
     reader: new QoderEnvelopeReader({ model: `qoder/${modelKey}` }),
     status: response.status,
     upstreamRequestId: response.headers.get('x-request-id'),
+    cleanup,
   };
 }
 
@@ -264,9 +280,18 @@ export async function callQoderStreaming(
   onChunk: (chunk: { data: string }) => void,
   deps: QoderDeps = {},
 ): Promise<QoderCanonicalResult & { status: number; upstreamRequestId: string | null }> {
-  const { response, reader, status, upstreamRequestId } = await openSignedStream(cfg, { ...req, stream: true }, deps);
-  await drainEnvelope(reader, response, onChunk);
-  return { status, upstreamRequestId, text: reader.text, toolCalls: reader.toolCalls, finishReason: reader.finishReason, usage: reader.usage ?? emptyUsage() };
+  const opened = await openSignedStream(cfg, { ...req, stream: true }, deps);
+  try {
+    await drainEnvelope(opened.reader, opened.response, onChunk);
+    return { status: opened.status, upstreamRequestId: opened.upstreamRequestId, text: opened.reader.text, toolCalls: opened.reader.toolCalls, finishReason: opened.reader.finishReason, usage: opened.reader.usage ?? emptyUsage() };
+  } catch (error) {
+    if (deps.signal?.aborted) {
+      throw clientDisconnectedError(error);
+    }
+    throw error;
+  } finally {
+    opened.cleanup();
+  }
 }
 
 /** Qoder only speaks SSE; the non-streaming shape is assembled from the same reader. */
@@ -275,8 +300,18 @@ export async function callQoderNonStreaming(
   req: CanonicalRequest,
   deps: QoderDeps = {},
 ): Promise<QoderCanonicalResult & { status: number; upstreamRequestId: string | null }> {
-  const { response, reader, status, upstreamRequestId } = await openSignedStream(cfg, { ...req, stream: false }, deps);
-  await drainEnvelope(reader, response);
+  const opened = await openSignedStream(cfg, { ...req, stream: false }, deps);
+  const { response, reader, status, upstreamRequestId } = opened;
+  try {
+    await drainEnvelope(reader, response);
+  } catch (error) {
+    if (deps.signal?.aborted) {
+      throw clientDisconnectedError(error);
+    }
+    throw error;
+  } finally {
+    opened.cleanup();
+  }
   // The caller invoked this with stream disabled, so the origin may honour the stream
   // preference and answer with the full completion in one body rather than SSE frames.
   // The reader buffers those bytes as an unparsed trailing line (it only understands

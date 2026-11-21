@@ -1,8 +1,17 @@
 import { describe, expect, it, vi, afterEach } from 'vitest';
 import { callCodexNonStreaming, callCodexStreaming, type CodexProviderConfig } from '../../src/server/providers/codex';
 
+const mocks = vi.hoisted(() => ({ withCodexCredentials: vi.fn() }));
+vi.mock('../../src/server/providers/codex-refresh', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/server/providers/codex-refresh')>();
+  return { ...actual, withCodexCredentials: mocks.withCodexCredentials };
+});
+
 // restoreAllMocks does not un-stub stubGlobal; a leaked fetch stub breaks later integration files.
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  mocks.withCodexCredentials.mockReset();
+});
 const cfg: CodexProviderConfig = { baseUrl: 'https://chatgpt.com', accountId: 'a1', accessToken: 'tok', customHeaders: {}, totalTimeoutMs: 5_000 };
 const request = { model: 'gpt-5-codex', messages: [{ role: 'user' as const, content: [{ type: 'text' as const, text: 'hello' }] }], stream: false };
 
@@ -102,6 +111,56 @@ describe('Codex upstream HTTP', () => {
     await callCodexStreaming(cfg, { ...request, stream: true }, (event) => events.push(event));
     expect(events).toHaveLength(2);
     expect(events[0]).toMatchObject({ text: 'a', isLast: false });
+  });
+
+  it('aborts the upstream Codex stream when the downstream signal fires', async () => {
+    const downstream = new AbortController();
+    let firstEventResolve!: () => void;
+    const firstEvent = new Promise<void>((resolve) => { firstEventResolve = resolve; });
+    let upstreamAborted = false;
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const upstreamSignal = init?.signal as AbortSignal;
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('data: {"type":"response.output_text.delta","delta":"partial"}\n\n'));
+          upstreamSignal.addEventListener('abort', () => {
+            upstreamAborted = true;
+            try { controller.error(new DOMException('aborted', 'AbortError')); } catch { /* already closed */ }
+          }, { once: true });
+        },
+      });
+      return new Response(body, { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const pending = callCodexStreaming(cfg, { ...request, stream: true }, () => firstEventResolve(), downstream.signal);
+    await firstEvent;
+    downstream.abort();
+
+    await expect(pending).rejects.toMatchObject({ code: 'client_disconnected', status: 499 });
+    expect(upstreamAborted).toBe(true);
+  });
+
+  it('maps a credential refresh failure to client_disconnected when the client leaves during preflight', async () => {
+    const downstream = new AbortController();
+    let rejectRefresh!: (error: Error) => void;
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    mocks.withCodexCredentials.mockReturnValueOnce(new Promise<never>((_resolve, reject) => {
+      rejectRefresh = reject;
+    }));
+
+    const pending = callCodexStreaming(
+      { ...cfg, accountRecordId: 'codex-account-1' },
+      { ...request, stream: true },
+      () => {},
+      downstream.signal,
+    );
+    downstream.abort();
+    rejectRefresh(new Error('oauth_refresh_unavailable'));
+
+    await expect(pending).rejects.toMatchObject({ code: 'client_disconnected', status: 499 });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it('redacts secret-bearing non-2xx response bodies from thrown errors', async () => {

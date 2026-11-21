@@ -13,6 +13,7 @@ requested model/alias
   -> remove models with open circuit
   -> derive required capabilities from request
   -> remove incompatible candidates
+  -> skip combo members in slow-response cooldown
   -> apply combo routing algorithm
 ```
 
@@ -40,6 +41,7 @@ Fallback:
 - connection failure
 - connection timeout
 - first-token timeout before stream starts
+- total request timeout before downstream content is committed
 - HTTP 408
 - HTTP 429
 - HTTP 500-599
@@ -80,6 +82,7 @@ Provider-level retry config:
 Combo-level safety:
 
 - `max_total_attempts` caps the entire client request across retries and fallbacks
+- `fallback_on_total_timeout` is independent from connect and first-token timeout triggers; migration 0012 seeds existing combos from their former `fallback_on_connect_timeout` preference to preserve behavior
 
 Never multiply retries without a global cap.
 
@@ -94,6 +97,37 @@ fallback is prohibited. A valid tool call or real text still counts as generated
 provider omits usage statistics or reports zero output tokens.
 Legacy cached empty successes are evicted when read, allowing the live upstream to be retried.
 
+## Slow-response fallback
+
+Each combo can enable slow-response fallback (enabled by default) with:
+
+- `slow_response_threshold_seconds`: default 60 seconds, range 1–600
+- `slow_response_max_count`: default 3 consecutive slow outcomes, range 1–20
+
+The measured interval depends on the response mode:
+
+- streaming: request start until the first actual text or tool-call content (TTFT); SSE metadata,
+  role/start events, and usage-only events do not satisfy the first-token watchdog
+- non-streaming: request start until the complete response body is received
+
+Provider `first_token_timeout` starts after response headers, while the combo TTFT threshold starts
+at the upstream request. Provider `total_timeout` also starts at the request. The first absolute
+deadline reached applies; a numerically shorter provider first-token timeout can still expire later
+when connection/header latency is high.
+
+When the threshold is reached, the current attempt is aborted before downstream content is
+committed and the combo advances to the next member. A slow outcome increments that member's
+consecutive count. A fast streaming TTFT or completed non-streaming response resets the count.
+After the configured count, the member is skipped for five minutes. When cooldown expires, one
+request obtains an atomic probe lease; concurrent requests skip that member until the probe ends.
+A fast probe clears the state, while a failed or slow probe starts another five-minute cooldown.
+Slow-response timeouts are tracked per combo-member and do not open the provider-wide circuit.
+Slow-state writes and recovery-probe operations are bound to the captured `combo_members.id`, so a
+late request from a removed membership cannot mutate a later re-added membership for the same model.
+
+The normal `max_total_attempts` cap still applies to all attempts in a request, including slow
+response fallbacks. A combo must have enough attempts configured to reach its later members.
+
 ## Timeouts
 
 Separate at least:
@@ -106,6 +140,10 @@ Separate at least:
 Defaults must be conservative and editable.
 
 Timeouts must use abort signals so abandoned upstream requests do not continue consuming resources unnecessarily.
+Connect timeout ends when upstream response headers arrive. The first-token watchdog remains
+armed through metadata-only SSE events and ends only on actual generated content.
+For a non-2xx response, the known HTTP status remains the fallback signal even if reading its error
+body reaches the provider total deadline; the total deadline still aborts that body read.
 
 ## Health
 

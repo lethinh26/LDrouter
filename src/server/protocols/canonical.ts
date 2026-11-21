@@ -34,6 +34,7 @@ export interface OpenAIChatResponse {
     message: {
       role: 'assistant';
       content: string | null;
+      refusal?: string | null;
       tool_calls?: Array<{ id: string; type: 'function'; function: { name: string; arguments: string } }>;
     };
     finish_reason: 'stop' | 'length' | 'tool_calls' | 'content_filter' | null;
@@ -199,7 +200,9 @@ export function openAIResponseToCanonical(res: OpenAIChatResponse, requestedMode
 
   return {
     model: requestedModel,
-    text: typeof choice.message.content === 'string' ? choice.message.content : '',
+    text: typeof choice.message.content === 'string'
+      ? choice.message.content
+      : typeof choice.message.refusal === 'string' ? choice.message.refusal : '',
     toolCalls: ((choice.message.tool_calls ?? []) as Array<{ id?: string; type?: string; function?: { name?: string; arguments?: string } }>).map((tc) => ({
       id: typeof tc.id === 'string' ? tc.id : `toolu-${Math.random().toString(36).slice(2)}`,
       name: typeof tc.function?.name === 'string' ? tc.function.name : 'unknown',

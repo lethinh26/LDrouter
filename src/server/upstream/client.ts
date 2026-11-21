@@ -16,6 +16,8 @@ export interface UpstreamConfig {
   firstTokenTimeoutMs: number;
   streamIdleTimeoutMs: number;
   totalTimeoutMs: number;
+  /** Combo-only deadline: TTFT for streaming, full response time otherwise. */
+  slowResponseTimeoutMs?: number;
   codexAccountId?: string;
   qoderUserId?: string;
   qoderAccountRecordId?: string;
@@ -101,8 +103,26 @@ export function upstreamHttpError(status: number, bodyExcerpt: string, cause?: u
 
 export async function callUpstreamNonStreaming(cfg: UpstreamConfig, url: string, payload: unknown, requestId = '-'): Promise<UpstreamCall> {
   const ctl = new AbortController();
-  const timer = setTimeout(() => ctl.abort(), cfg.totalTimeoutMs);
   const start = Date.now();
+  let headersReceived = false;
+  let responseStatus: number | null = null;
+  const abortReason: { value: 'connect' | 'slow_response' | 'total' } = { value: 'total' };
+  let aborted = false;
+  const abortWithReason = (reason: 'connect' | 'slow_response' | 'total') => {
+    if (aborted) return;
+    aborted = true;
+    abortReason.value = reason;
+    ctl.abort();
+  };
+  const connectTimer = setTimeout(() => {
+    if (!headersReceived) {
+      abortWithReason('connect');
+    }
+  }, Math.max(0, start + cfg.connectTimeoutMs - Date.now()));
+  const totalTimer = setTimeout(() => abortWithReason('total'), Math.max(0, start + cfg.totalTimeoutMs - Date.now()));
+  const slowResponseTimer = cfg.slowResponseTimeoutMs === undefined
+    ? null
+    : setTimeout(() => abortWithReason('slow_response'), Math.max(0, start + cfg.slowResponseTimeoutMs - Date.now()));
   try {
     const res = await fetch(url, {
       method: 'POST',
@@ -110,6 +130,10 @@ export async function callUpstreamNonStreaming(cfg: UpstreamConfig, url: string,
       body: JSON.stringify(payload),
       signal: ctl.signal,
     });
+    responseStatus = res.status;
+    headersReceived = true;
+    clearTimeout(connectTimer);
+    if (!res.ok && slowResponseTimer) clearTimeout(slowResponseTimer);
     const text = await res.text();
     const ttft = Date.now() - start;
     logUpstreamResponse(requestId, res.status, res.statusText, res.headers, ttft, text);
@@ -124,12 +148,25 @@ export async function callUpstreamNonStreaming(cfg: UpstreamConfig, url: string,
   } catch (e) {
     const err = e as Error;
     errorLine(requestId, 'UPSTREAM FETCH ERROR', [`url=${url}`, `afterMs=${Date.now() - start}`, ...formatError(e)]);
+    // A known non-2xx status remains the fallback signal even if its error body
+    // stalls until the provider total deadline. The deadline still aborts the read.
+    if (responseStatus !== null && (responseStatus < 200 || responseStatus >= 300)) {
+      throw upstreamHttpError(responseStatus, '', { status: responseStatus, cause: e });
+    }
     if (err.name === 'AbortError') {
-      throw new GatewayError('timeout_error', 'Upstream request timed out', { status: 504, cause: e });
+      if (abortReason.value === 'connect') {
+        throw new GatewayError('timeout_error', 'Upstream connect timeout', { status: 504, code: 'upstream_connect_timeout', cause: e });
+      }
+      if (abortReason.value === 'slow_response') {
+        throw new GatewayError('timeout_error', 'Combo slow response threshold exceeded', { status: 504, code: 'combo_slow_response_timeout', cause: e });
+      }
+      throw new GatewayError('timeout_error', 'Upstream total timeout', { status: 504, code: 'upstream_total_timeout', cause: e });
     }
     throw new GatewayError('upstream_unavailable', `Upstream connection failed: ${err.message}`, { status: 502, cause: e });
   } finally {
-    clearTimeout(timer);
+    clearTimeout(connectTimer);
+    clearTimeout(totalTimer);
+    if (slowResponseTimer) clearTimeout(slowResponseTimer);
   }
 }
 
@@ -166,22 +203,47 @@ export async function callUpstreamStreaming(
   cfg: UpstreamConfig,
   url: string,
   payload: unknown,
-  onChunk: (event: { data: string; event?: string }, isFirst: boolean) => void,
-  requestId = '-'
-): Promise<{ headers: Record<string, string>; upstreamRequestId: string | null; ttftMs: number }> {
+  onChunk: (event: { data: string; event?: string }, isFirst: boolean) => boolean | void,
+  requestId = '-',
+  requestStartMs = Date.now(),
+  downstreamSignal?: AbortSignal,
+): Promise<{ headers: Record<string, string>; upstreamRequestId: string | null; ttftMs: number | null }> {
   const ctl = new AbortController();
-  const start = Date.now();
+  const start = requestStartMs;
   let ttft: number | null = null;
+  // Which watchdog aborted, so the error names the limit that was actually hit.
+  const abortReason: { value: 'connect' | 'total' | 'idle' | 'first_token' | 'slow_response' | 'downstream' } = { value: 'total' };
+  let aborted = false;
+  const abortWithReason = (reason: 'connect' | 'total' | 'idle' | 'first_token' | 'slow_response' | 'downstream') => {
+    if (aborted) return;
+    aborted = true;
+    abortReason.value = reason;
+    ctl.abort();
+  };
+  const handleDownstreamAbort = () => abortWithReason('downstream');
+  if (downstreamSignal?.aborted) handleDownstreamAbort();
+  else downstreamSignal?.addEventListener('abort', handleDownstreamAbort, { once: true });
   let firstTokenTimer: ReturnType<typeof setTimeout> | null = null;
+  const slowResponseTimer = cfg.slowResponseTimeoutMs === undefined
+    ? null
+    : setTimeout(
+      () => abortWithReason('slow_response'),
+      Math.max(0, start + cfg.slowResponseTimeoutMs - Date.now()),
+    );
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
-  // Which watchdog aborted, so the error names the limit that was actually hit: the total
-  // timer used to surface as "stream idle timeout", which sent operators tuning the wrong knob.
-  let abortedBy: 'total' | 'idle' | 'first_token' = 'total';
-  const totalTimer = setTimeout(() => { abortedBy = 'total'; ctl.abort(); }, cfg.totalTimeoutMs);
+  let headersReceived = false;
+  let responseStatus: number | null = null;
+  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  const totalTimer = setTimeout(() => abortWithReason('total'), Math.max(0, start + cfg.totalTimeoutMs - Date.now()));
+  const connectTimer = setTimeout(() => {
+    if (!headersReceived) {
+      abortWithReason('connect');
+    }
+  }, Math.max(0, start + cfg.connectTimeoutMs - Date.now()));
 
   const resetIdle = () => {
     if (idleTimer) clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => { abortedBy = 'idle'; ctl.abort(); }, cfg.streamIdleTimeoutMs);
+    idleTimer = setTimeout(() => abortWithReason('idle'), cfg.streamIdleTimeoutMs);
   };
 
   try {
@@ -191,17 +253,23 @@ export async function callUpstreamStreaming(
       body: JSON.stringify(payload),
       signal: ctl.signal,
     });
+    responseStatus = res.status;
+    headersReceived = true;
+    clearTimeout(connectTimer);
     if (!res.ok || !res.body) {
+      if (firstTokenTimer) clearTimeout(firstTokenTimer);
+      if (slowResponseTimer) clearTimeout(slowResponseTimer);
       const text = await res.text();
       logUpstreamResponse(requestId, res.status, res.statusText, res.headers, Date.now() - start, text);
       throw new UpstreamHttpError(res.status, text, extractUpstreamRequestId(res.headers));
     }
     logUpstreamResponse(requestId, res.status, res.statusText, res.headers, Date.now() - start, '');
-    // First-token watchdog
-    firstTokenTimer = setTimeout(() => { abortedBy = 'first_token'; ctl.abort(); }, cfg.firstTokenTimeoutMs);
+    // Provider first-token timeout keeps its original post-headers semantics. The combo watchdog
+    // above is separate and measures request start through the first actual content token.
+    firstTokenTimer = setTimeout(() => abortWithReason('first_token'), cfg.firstTokenTimeoutMs);
     resetIdle();
 
-    const reader = res.body.getReader();
+    reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
     let isFirst = true;
@@ -216,12 +284,13 @@ export async function callUpstreamStreaming(
       }
       if (data === '[DONE]') return;
       if (data) {
-        if (ttft === null) {
+        resetIdle();
+        const meaningfulOutput = onChunk({ data, event }, isFirst);
+        if (meaningfulOutput && ttft === null) {
           ttft = Date.now() - start;
           if (firstTokenTimer) clearTimeout(firstTokenTimer);
+          if (slowResponseTimer) clearTimeout(slowResponseTimer);
         }
-        resetIdle();
-        onChunk({ data, event }, isFirst);
         isFirst = false;
       }
     };
@@ -240,12 +309,30 @@ export async function callUpstreamStreaming(
     return {
       headers: Object.fromEntries(res.headers.entries()),
       upstreamRequestId: extractUpstreamRequestId(res.headers),
-      ttftMs: ttft ?? Date.now() - start,
+      ttftMs: ttft,
     };
   } catch (e) {
+    if (reader) {
+      if (!aborted) abortWithReason(e instanceof GatewayError && e.code === 'combo_slow_response_timeout' ? 'slow_response' : 'total');
+      await reader.cancel(e).catch(() => undefined);
+    }
+    if (downstreamSignal?.aborted || abortReason.value === 'downstream') {
+      throw new GatewayError('gateway_error', 'Downstream client disconnected', {
+        status: 499,
+        code: 'client_disconnected',
+        cause: e,
+      });
+    }
     if (e instanceof UpstreamHttpError) {
       throw upstreamHttpError(e.status, e.bodyExcerpt, e);
     }
+    // Preserve a known HTTP error status when the provider stalls while sending
+    // its body. Total timeout still bounds the read, but status-based combo
+    // switches (408/429/5xx) remain authoritative once headers have arrived.
+    if (responseStatus !== null && (responseStatus < 200 || responseStatus >= 300)) {
+      throw upstreamHttpError(responseStatus, '', { status: responseStatus, cause: e });
+    }
+    if (e instanceof GatewayError) throw e;
     const err = e as Error;
     errorLine(requestId, 'UPSTREAM FETCH ERROR', [
       `url=${url}`,
@@ -254,19 +341,32 @@ export async function callUpstreamStreaming(
       ...formatError(e),
     ]);
     if (err.name === 'AbortError') {
-      if (abortedBy === 'total') {
-        throw new GatewayError('timeout_error', 'Upstream total timeout', { status: 504, cause: e });
+      if (abortReason.value === 'connect') {
+        throw new GatewayError('timeout_error', 'Upstream connect timeout', { status: 504, code: 'upstream_connect_timeout', cause: e });
       }
-      if (abortedBy === 'first_token' && ttft === null) {
-        throw new GatewayError('timeout_error', 'Upstream first token timeout', { status: 504, cause: e });
+      if (abortReason.value === 'slow_response') {
+        throw new GatewayError('timeout_error', 'Combo slow response threshold exceeded before first token', { status: 504, code: 'combo_slow_response_timeout', cause: e });
       }
-      throw new GatewayError('timeout_error', 'Upstream stream idle timeout', { status: 504, cause: e });
+      if (abortReason.value === 'total') {
+        throw new GatewayError('timeout_error', 'Upstream total timeout', { status: 504, code: 'upstream_total_timeout', cause: e });
+      }
+      if (abortReason.value === 'first_token' && ttft === null) {
+        throw new GatewayError('timeout_error', 'Upstream first token timeout', { status: 504, code: 'upstream_first_token_timeout', cause: e });
+      }
+      if (abortReason.value === 'idle' && ttft === null) {
+        throw new GatewayError('timeout_error', 'Upstream first token timeout (stream idle)', { status: 504, code: 'upstream_first_token_timeout', cause: e });
+      }
+      throw new GatewayError('timeout_error', 'Upstream stream idle timeout', { status: 504, code: 'upstream_stream_idle_timeout', cause: e });
     }
     throw new GatewayError('upstream_unavailable', `Upstream connection failed: ${err.message}`, { status: 502, cause: e });
   } finally {
+    downstreamSignal?.removeEventListener('abort', handleDownstreamAbort);
     clearTimeout(totalTimer);
+    clearTimeout(connectTimer);
     if (firstTokenTimer) clearTimeout(firstTokenTimer);
+    if (slowResponseTimer) clearTimeout(slowResponseTimer);
     if (idleTimer) clearTimeout(idleTimer);
+    try { reader?.releaseLock(); } catch { /* stream reader already released */ }
   }
 }
 

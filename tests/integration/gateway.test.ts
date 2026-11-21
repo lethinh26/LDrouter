@@ -3,6 +3,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { eq } from 'drizzle-orm';
 
 // Each test uses a unique data dir; we start the server in-process to avoid global state.
 
@@ -590,6 +591,448 @@ describe('gateway smoke', () => {
     expect(seenModel).toBe('test/gpt-5.5');
   });
 
+  it('falls back on slow non-streaming responses and cools down the member after three slow outcomes', async () => {
+    const { reset, pushHandler } = await import('./_mock-control.js');
+    const { getDb, schema } = await import('../../src/server/db/index');
+    const { uuid } = await import('../../src/server/auth/ids');
+    const db = getDb();
+    const provider = db.select().from(schema.providers).all().find((p) => p.slug === 'mock')!;
+    const slowModelId = uuid();
+    const fastModelId = uuid();
+    const comboId = uuid();
+    db.insert(schema.models).values({ id: slowModelId, providerId: provider.id, upstreamModelId: 'slow-model', publicModelId: `mock/slow-${slowModelId}`, displayName: 'Slow model', enabled: true, upstreamAvailable: true, capabilitiesJson: JSON.stringify({ chat: true }) }).run();
+    db.insert(schema.models).values({ id: fastModelId, providerId: provider.id, upstreamModelId: 'fast-model', publicModelId: `mock/fast-${fastModelId}`, displayName: 'Fast model', enabled: true, upstreamAvailable: true, capabilitiesJson: JSON.stringify({ chat: true }) }).run();
+    db.insert(schema.combos).values({
+      id: comboId, name: 'slow-response-non-stream', slug: `slow-response-non-stream-${comboId}`,
+      publicModelId: `combo/slow-response-non-stream-${comboId}`, mode: 'fallback', maxTotalAttempts: 2,
+      slowResponseFallbackEnabled: true, slowResponseThresholdSeconds: 1, slowResponseMaxCount: 3,
+    }).run();
+    db.insert(schema.comboMembers).values([
+      { id: uuid(), comboId, modelId: slowModelId, position: 0, enabled: true },
+      { id: uuid(), comboId, modelId: fastModelId, position: 1, enabled: true },
+    ]).run();
+
+    const invoke = async () => {
+      const seenModels: string[] = [];
+      reset();
+      pushHandler(async (_req, res, body) => {
+        const model = (JSON.parse(body) as { model: string }).model;
+        seenModels.push(model);
+        if (model === 'slow-model') await new Promise((resolve) => setTimeout(resolve, 1300));
+        res.statusCode = 200;
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: model }, finish_reason: 'stop' }], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } }));
+      });
+      const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+        method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey!.secret}` },
+        body: JSON.stringify({ model: `combo/slow-response-non-stream-${comboId}`, messages: [{ role: 'user', content: 'hi' }] }),
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json() as { choices: Array<{ message: { content: string } }> };
+      expect(body.choices[0]?.message.content).toBe('fast-model');
+      return seenModels;
+    };
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await expect(invoke()).resolves.toEqual(['slow-model', 'fast-model']);
+    }
+    const state = db.select().from(schema.comboMemberSlowStates).all().find((row) => row.comboId === comboId && row.modelId === slowModelId);
+    expect(state).toMatchObject({ consecutiveSlowCount: 3, lastOutcome: 'slow' });
+    expect(state?.cooldownUntilMs).toBeGreaterThan(Date.now());
+    await expect(invoke()).resolves.toEqual(['fast-model']);
+  }, 15_000);
+
+  it('uses first content token rather than SSE metadata as streaming TTFT', async () => {
+    const { reset, pushHandler } = await import('./_mock-control.js');
+    const { getDb, schema } = await import('../../src/server/db/index');
+    const { uuid } = await import('../../src/server/auth/ids');
+    const db = getDb();
+    const provider = db.select().from(schema.providers).all().find((p) => p.slug === 'mock')!;
+    const slowModelId = uuid();
+    const fastModelId = uuid();
+    const comboId = uuid();
+    db.insert(schema.models).values({ id: slowModelId, providerId: provider.id, upstreamModelId: 'metadata-slow', publicModelId: `mock/metadata-slow-${slowModelId}`, displayName: 'Metadata slow model', enabled: true, upstreamAvailable: true, capabilitiesJson: JSON.stringify({ chat: true, streaming: true }) }).run();
+    db.insert(schema.models).values({ id: fastModelId, providerId: provider.id, upstreamModelId: 'metadata-fast', publicModelId: `mock/metadata-fast-${fastModelId}`, displayName: 'Metadata fast model', enabled: true, upstreamAvailable: true, capabilitiesJson: JSON.stringify({ chat: true, streaming: true }) }).run();
+    db.insert(schema.combos).values({
+      id: comboId, name: 'slow-response-stream', slug: `slow-response-stream-${comboId}`,
+      publicModelId: `combo/slow-response-stream-${comboId}`, mode: 'fallback', maxTotalAttempts: 2,
+      slowResponseFallbackEnabled: true, slowResponseThresholdSeconds: 1, slowResponseMaxCount: 3,
+    }).run();
+    db.insert(schema.comboMembers).values([
+      { id: uuid(), comboId, modelId: slowModelId, position: 0, enabled: true },
+      { id: uuid(), comboId, modelId: fastModelId, position: 1, enabled: true },
+    ]).run();
+
+    const seenModels: string[] = [];
+    reset();
+    pushHandler(async (_req, res, body) => {
+      const model = (JSON.parse(body) as { model: string }).model;
+      seenModels.push(model);
+      res.statusCode = 200;
+      res.setHeader('content-type', 'text/event-stream');
+      if (model === 'metadata-slow') {
+        res.write('data: {"choices":[{"index":0,"delta":{}}]}\n\n');
+        res.write('data: {"choices":[{"index":0,"delta":{"tool_calls":[]}}]}\n\n');
+        res.write('data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0}]}}]}\n\n');
+        await new Promise((resolve) => setTimeout(resolve, 1300));
+        res.write('data: {"choices":[{"index":0,"delta":{"content":"late"}}]}\n\n');
+      } else {
+        res.write('data: {"choices":[{"index":0,"delta":{"content":"fallback"}}]}\n\n');
+      }
+      res.write('data: [DONE]\n\n');
+      res.end();
+    });
+    const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey!.secret}` },
+      body: JSON.stringify({ model: `combo/slow-response-stream-${comboId}`, stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(seenModels).toEqual(['metadata-slow', 'metadata-fast']);
+    expect(text).toContain('fallback');
+    expect(text).not.toContain('late');
+  }, 10_000);
+
+  it('preserves Anthropic input/cache usage when a metadata-only stream times out before fallback', async () => {
+    const { reset, pushHandler } = await import('./_mock-control.js');
+    const { getDb, schema } = await import('../../src/server/db/index');
+    const { uuid } = await import('../../src/server/auth/ids');
+    const db = getDb();
+    const openAiProvider = db.select().from(schema.providers).all().find((p) => p.slug === 'mock')!;
+    const anthropicProviderId = uuid();
+    const slowModelId = uuid();
+    const backupModelId = uuid();
+    const comboId = uuid();
+    db.insert(schema.providers).values({
+      ...openAiProvider,
+      id: anthropicProviderId,
+      name: 'mock-anthropic',
+      slug: 'mock-anthropic',
+      type: 'anthropic',
+      connectTimeoutMs: 2000,
+      firstTokenTimeoutMs: 300,
+      streamIdleTimeoutMs: 2000,
+      totalTimeoutMs: 5000,
+    }).run();
+    db.insert(schema.models).values({ id: slowModelId, providerId: anthropicProviderId, upstreamModelId: 'slow-anthropic', publicModelId: `mock-anthropic/slow-${slowModelId}`, displayName: 'Slow Anthropic', enabled: true, upstreamAvailable: true, capabilitiesJson: JSON.stringify({ chat: true, streaming: true }) }).run();
+    db.insert(schema.models).values({ id: backupModelId, providerId: openAiProvider.id, upstreamModelId: 'fast-backup', publicModelId: `mock/fast-backup-${backupModelId}`, displayName: 'Fast backup', enabled: true, upstreamAvailable: true, capabilitiesJson: JSON.stringify({ chat: true, streaming: true }) }).run();
+    db.insert(schema.combos).values({
+      id: comboId, name: 'anthropic-metadata-timeout', slug: `anthropic-metadata-timeout-${comboId}`,
+      publicModelId: `combo/anthropic-metadata-timeout-${comboId}`, mode: 'fallback', maxTotalAttempts: 2,
+      slowResponseFallbackEnabled: false, fallbackOnFirstTokenTimeout: true,
+    }).run();
+    db.insert(schema.comboMembers).values([
+      { id: uuid(), comboId, modelId: slowModelId, position: 0, enabled: true },
+      { id: uuid(), comboId, modelId: backupModelId, position: 1, enabled: true },
+    ]).run();
+
+    const seenModels: string[] = [];
+    const attemptsBefore = db.select().from(schema.requestAttempts).all().length;
+    const requestsBefore = db.select().from(schema.requests).all().length;
+    reset();
+    pushHandler(async (_req, res, body) => {
+      const model = (JSON.parse(body) as { model: string }).model;
+      seenModels.push(model);
+      res.statusCode = 200;
+      res.setHeader('content-type', 'text/event-stream');
+      if (model === 'slow-anthropic') {
+        res.write('event: message_start\ndata: {"type":"message_start","message":{"id":"msg-1","type":"message","role":"assistant","content":[],"model":"claude","usage":{"input_tokens":7,"cache_read_input_tokens":2,"cache_creation_input_tokens":1}}}\n\n');
+        return;
+      }
+      res.write('data: {"choices":[{"index":0,"delta":{"content":"backup"}}]}\n\n');
+      res.write('data: [DONE]\n\n');
+      res.end();
+    });
+
+    const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey!.secret}` },
+      body: JSON.stringify({ model: `combo/anthropic-metadata-timeout-${comboId}`, stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain('backup');
+    expect(seenModels).toEqual(['slow-anthropic', 'fast-backup']);
+
+    let attempts = db.select().from(schema.requestAttempts).all();
+    for (let i = 0; i < 40 && attempts.length <= attemptsBefore; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      attempts = db.select().from(schema.requestAttempts).all();
+    }
+    const slowAttempt = attempts.slice(attemptsBefore).find((attempt) => attempt.modelId === slowModelId);
+    expect(slowAttempt).toMatchObject({ inputTokens: 7, cacheReadTokens: 2, cacheWriteTokens: 1, failureReason: 'first_token_timeout' });
+    const request = db.select().from(schema.requests).all().slice(requestsBefore)
+      .find((row) => row.requestedModel === `combo/anthropic-metadata-timeout-${comboId}`);
+    expect(request?.totalTokens).toBe(7);
+  }, 10_000);
+
+  it('treats OpenAI refusal-only streaming chunks as generated content', async () => {
+    const { reset, pushHandler, callCount } = await import('./_mock-control.js');
+    const db = (await import('../../src/server/db/index')).getDb();
+    const { schema } = await import('../../src/server/db/index');
+    const { uuid } = await import('../../src/server/auth/ids');
+    const provider = db.select().from(schema.providers).all().find((p) => p.slug === 'mock')!;
+    const refusalModelId = uuid();
+    const backupModelId = uuid();
+    const comboId = uuid();
+    db.insert(schema.models).values({ id: refusalModelId, providerId: provider.id, upstreamModelId: 'refusal-first', publicModelId: `mock/refusal-first-${refusalModelId}`, displayName: 'Refusal first', enabled: true, upstreamAvailable: true, capabilitiesJson: JSON.stringify({ chat: true, streaming: true }) }).run();
+    db.insert(schema.models).values({ id: backupModelId, providerId: provider.id, upstreamModelId: 'refusal-backup', publicModelId: `mock/refusal-backup-${backupModelId}`, displayName: 'Refusal backup', enabled: true, upstreamAvailable: true, capabilitiesJson: JSON.stringify({ chat: true, streaming: true }) }).run();
+    db.insert(schema.combos).values({ id: comboId, name: 'refusal-is-content', slug: `refusal-is-content-${comboId}`, publicModelId: `combo/refusal-is-content-${comboId}`, mode: 'fallback', maxTotalAttempts: 2 }).run();
+    db.insert(schema.comboMembers).values([
+      { id: uuid(), comboId, modelId: refusalModelId, position: 0, enabled: true },
+      { id: uuid(), comboId, modelId: backupModelId, position: 1, enabled: true },
+    ]).run();
+    const seenModels: string[] = [];
+    reset();
+    pushHandler((_req, res, body) => {
+      const model = (JSON.parse(body) as { model: string }).model;
+      seenModels.push(model);
+      res.statusCode = 200;
+      res.setHeader('content-type', 'text/event-stream');
+      if (model === 'refusal-first') {
+        res.write('data: {"choices":[{"index":0,"delta":{"refusal":"I cannot help with that request."}}]}\n\n');
+      } else {
+        res.write('data: {"choices":[{"index":0,"delta":{"content":"backup"}}]}\n\n');
+      }
+      res.write('data: [DONE]\n\n');
+      res.end();
+    });
+    const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey!.secret}` },
+      body: JSON.stringify({ model: `combo/refusal-is-content-${comboId}`, stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain('"refusal":"I cannot help with that request."');
+    expect(seenModels).toEqual(['refusal-first']);
+    expect(callCount()).toBe(1);
+  });
+
+  it('cancels the upstream stream when the downstream client disconnects', async () => {
+    const { reset, pushHandler, callCount } = await import('./_mock-control.js');
+    const db = (await import('../../src/server/db/index')).getDb();
+    const { schema } = await import('../../src/server/db/index');
+    const { uuid } = await import('../../src/server/auth/ids');
+    const provider = db.select().from(schema.providers).all().find((p) => p.slug === 'mock')!;
+    const firstModelId = uuid();
+    const backupModelId = uuid();
+    const comboId = uuid();
+    db.insert(schema.models).values({ id: firstModelId, providerId: provider.id, upstreamModelId: 'disconnect-first', publicModelId: `mock/disconnect-first-${firstModelId}`, displayName: 'Disconnect first', enabled: true, upstreamAvailable: true, capabilitiesJson: JSON.stringify({ chat: true, streaming: true }) }).run();
+    db.insert(schema.models).values({ id: backupModelId, providerId: provider.id, upstreamModelId: 'disconnect-backup', publicModelId: `mock/disconnect-backup-${backupModelId}`, displayName: 'Disconnect backup', enabled: true, upstreamAvailable: true, capabilitiesJson: JSON.stringify({ chat: true, streaming: true }) }).run();
+    db.insert(schema.combos).values({ id: comboId, name: 'disconnect-cancels-upstream', slug: `disconnect-cancels-upstream-${comboId}`, publicModelId: `combo/disconnect-cancels-upstream-${comboId}`, mode: 'fallback', maxTotalAttempts: 2 }).run();
+    db.insert(schema.comboMembers).values([
+      { id: uuid(), comboId, modelId: firstModelId, position: 0, enabled: true },
+      { id: uuid(), comboId, modelId: backupModelId, position: 1, enabled: true },
+    ]).run();
+    let upstreamClosed = false;
+    const seenModels: string[] = [];
+    reset();
+    pushHandler((_req, res, body) => {
+      seenModels.push((JSON.parse(body) as { model: string }).model);
+      res.statusCode = 200;
+      res.setHeader('content-type', 'text/event-stream');
+      res.flushHeaders();
+      res.write('data: {"choices":[{"index":0,"delta":{"content":"first token"}}]}\n\n');
+      res.on('close', () => { upstreamClosed = true; });
+    });
+
+    const downstream = new AbortController();
+    const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey!.secret}` },
+      body: JSON.stringify({ model: `combo/disconnect-cancels-upstream-${comboId}`, stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+      signal: downstream.signal,
+    });
+    expect(response.status).toBe(200);
+    const reader = response.body!.getReader();
+    const first = await reader.read();
+    expect(first.done).toBe(false);
+    expect(new TextDecoder().decode(first.value)).toContain('first token');
+    downstream.abort();
+    await reader.cancel().catch(() => undefined);
+
+    for (let i = 0; i < 40 && !upstreamClosed; i++) await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(upstreamClosed).toBe(true);
+    expect(seenModels).toEqual(['disconnect-first']);
+    expect(callCount()).toBe(1);
+  });
+
+  it('preserves usage received after stream commit when the provider later idles out', async () => {
+    const { reset, pushHandler, callCount } = await import('./_mock-control.js');
+    const db = (await import('../../src/server/db/index')).getDb();
+    const { schema } = await import('../../src/server/db/index');
+    const { uuid } = await import('../../src/server/auth/ids');
+    const provider = db.select().from(schema.providers).all().find((p) => p.slug === 'mock')!;
+    const originalIdleTimeout = provider.streamIdleTimeoutMs;
+    const originalHealthState = provider.healthState;
+    const aggregateDay = new Date().toISOString().slice(0, 10);
+    const providerStatsBefore = db.select().from(schema.dailyProviderStats).all()
+      .find((row) => row.day === aggregateDay && row.providerId === provider.id);
+    const cacheReadBefore = providerStatsBefore?.cacheReadTokens ?? 0;
+    const reasoningBefore = providerStatsBefore?.reasoningTokens ?? 0;
+    const firstModelId = uuid();
+    const backupModelId = uuid();
+    const comboId = uuid();
+    db.insert(schema.models).values({ id: firstModelId, providerId: provider.id, upstreamModelId: 'idle-first', publicModelId: `mock/idle-first-${firstModelId}`, displayName: 'Idle first', enabled: true, upstreamAvailable: true, capabilitiesJson: JSON.stringify({ chat: true, streaming: true }) }).run();
+    db.insert(schema.models).values({ id: backupModelId, providerId: provider.id, upstreamModelId: 'idle-backup', publicModelId: `mock/idle-backup-${backupModelId}`, displayName: 'Idle backup', enabled: true, upstreamAvailable: true, capabilitiesJson: JSON.stringify({ chat: true, streaming: true }) }).run();
+    db.insert(schema.combos).values({ id: comboId, name: 'post-commit-usage', slug: `post-commit-usage-${comboId}`, publicModelId: `combo/post-commit-usage-${comboId}`, mode: 'fallback', maxTotalAttempts: 2 }).run();
+    db.insert(schema.comboMembers).values([
+      { id: uuid(), comboId, modelId: firstModelId, position: 0, enabled: true },
+      { id: uuid(), comboId, modelId: backupModelId, position: 1, enabled: true },
+    ]).run();
+    const attemptsBefore = db.select().from(schema.requestAttempts).all().length;
+    const requestsBefore = db.select().from(schema.requests).all().length;
+    const seenModels: string[] = [];
+    reset();
+    db.update(schema.providers).set({ streamIdleTimeoutMs: 120, healthState: 'healthy' }).where(eq(schema.providers.id, provider.id)).run();
+    try {
+      pushHandler((_req, res, body) => {
+        seenModels.push((JSON.parse(body) as { model: string }).model);
+        res.statusCode = 200;
+        res.setHeader('content-type', 'text/event-stream');
+        res.write('data: {"choices":[{"index":0,"delta":{"content":"partial"}}]}\n\n');
+        res.write('data: {"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":7,"total_tokens":18,"prompt_tokens_details":{"cached_tokens":4},"completion_tokens_details":{"reasoning_tokens":3}}}\n\n');
+        // Keep the upstream socket open until the stream-idle watchdog aborts it.
+      });
+      const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey!.secret}` },
+        body: JSON.stringify({ model: `combo/post-commit-usage-${comboId}`, stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+      });
+      expect(response.status).toBe(200);
+      expect(await response.text()).toContain('"content":"partial"');
+      expect(seenModels).toEqual(['idle-first']);
+      expect(callCount()).toBe(1);
+
+      let attempts = db.select().from(schema.requestAttempts).all();
+      for (let i = 0; i < 40 && attempts.length <= attemptsBefore; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        attempts = db.select().from(schema.requestAttempts).all();
+      }
+      const attempt = attempts.slice(attemptsBefore).find((row) => row.modelId === firstModelId);
+      expect(attempt).toMatchObject({
+        success: false,
+        partialResponse: true,
+        failureReason: 'stream_idle_timeout',
+        inputTokens: 11,
+        outputTokens: 7,
+        cacheReadTokens: 4,
+        reasoningTokens: 3,
+      });
+      const request = db.select().from(schema.requests).all().slice(requestsBefore)
+        .find((row) => row.requestedModel === `combo/post-commit-usage-${comboId}`);
+      expect(request).toMatchObject({ totalTokens: 18, cacheReadTokens: 4, reasoningTokens: 3 });
+      const providerStats = db.select().from(schema.dailyProviderStats).all()
+        .find((row) => row.day === aggregateDay && row.providerId === provider.id);
+      expect(providerStats?.cacheReadTokens).toBe(cacheReadBefore + 4);
+      expect(providerStats?.reasoningTokens).toBe(reasoningBefore + 3);
+      expect(db.select().from(schema.providers).all().find((row) => row.id === provider.id)?.healthState).toBe('down');
+    } finally {
+      db.update(schema.providers).set({ streamIdleTimeoutMs: originalIdleTimeout, healthState: originalHealthState }).where(eq(schema.providers.id, provider.id)).run();
+    }
+  }, 10_000);
+
+  it('preserves Anthropic cache-write usage when a committed stream later idles out', async () => {
+    const { reset, pushHandler, callCount } = await import('./_mock-control.js');
+    const { getDb, schema } = await import('../../src/server/db/index');
+    const { uuid } = await import('../../src/server/auth/ids');
+    const db = getDb();
+    const openAiProvider = db.select().from(schema.providers).all().find((p) => p.slug === 'mock')!;
+    const anthropicProviderId = uuid();
+    const slowModelId = uuid();
+    const backupModelId = uuid();
+    const comboId = uuid();
+    db.insert(schema.providers).values({
+      ...openAiProvider,
+      id: anthropicProviderId,
+      name: 'mock-anthropic-post-content',
+      slug: 'mock-anthropic-post-content',
+      type: 'anthropic',
+      connectTimeoutMs: 2000,
+      firstTokenTimeoutMs: 300,
+      streamIdleTimeoutMs: 120,
+      totalTimeoutMs: 5000,
+    }).run();
+    db.insert(schema.models).values({ id: slowModelId, providerId: anthropicProviderId, upstreamModelId: 'slow-anthropic-post-content', publicModelId: `mock-anthropic-post-content/slow-${slowModelId}`, displayName: 'Slow Anthropic post-content', enabled: true, upstreamAvailable: true, capabilitiesJson: JSON.stringify({ chat: true, streaming: true }) }).run();
+    db.insert(schema.models).values({ id: backupModelId, providerId: openAiProvider.id, upstreamModelId: 'unused-backup', publicModelId: `mock/unused-backup-${backupModelId}`, displayName: 'Unused backup', enabled: true, upstreamAvailable: true, capabilitiesJson: JSON.stringify({ chat: true, streaming: true }) }).run();
+    db.insert(schema.combos).values({
+      id: comboId,
+      name: 'anthropic-post-content-usage',
+      slug: `anthropic-post-content-usage-${comboId}`,
+      publicModelId: `combo/anthropic-post-content-usage-${comboId}`,
+      mode: 'fallback',
+      maxTotalAttempts: 2,
+      slowResponseFallbackEnabled: false,
+      fallbackOnFirstTokenTimeout: true,
+    }).run();
+    db.insert(schema.comboMembers).values([
+      { id: uuid(), comboId, modelId: slowModelId, position: 0, enabled: true },
+      { id: uuid(), comboId, modelId: backupModelId, position: 1, enabled: true },
+    ]).run();
+
+    const provider = db.select().from(schema.providers).all().find((row) => row.id === anthropicProviderId)!;
+    const originalIdleTimeout = provider.streamIdleTimeoutMs;
+    const originalHealthState = provider.healthState;
+    const aggregateDay = new Date().toISOString().slice(0, 10);
+    const providerStatsBefore = db.select().from(schema.dailyProviderStats).all()
+      .find((row) => row.day === aggregateDay && row.providerId === anthropicProviderId);
+    const cacheReadBefore = providerStatsBefore?.cacheReadTokens ?? 0;
+    const cacheWriteBefore = providerStatsBefore?.cacheWriteTokens ?? 0;
+    const reasoningBefore = providerStatsBefore?.reasoningTokens ?? 0;
+    const attemptsBefore = db.select().from(schema.requestAttempts).all().length;
+    const requestsBefore = db.select().from(schema.requests).all().length;
+    const seenModels: string[] = [];
+    reset();
+    db.update(schema.providers).set({ streamIdleTimeoutMs: 120, healthState: 'healthy' }).where(eq(schema.providers.id, anthropicProviderId)).run();
+    try {
+      pushHandler((_req, res, body) => {
+        seenModels.push((JSON.parse(body) as { model: string }).model);
+        res.statusCode = 200;
+        res.setHeader('content-type', 'text/event-stream');
+        res.write('event: message_start\ndata: {"type":"message_start","message":{"id":"msg-post","type":"message","role":"assistant","content":[],"model":"claude","usage":{"input_tokens":7,"cache_read_input_tokens":2,"cache_creation_input_tokens":1}}}\n\n');
+        res.write('event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}\n\n');
+        res.write('event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}\n\n');
+        // Keep the upstream socket open until the idle watchdog aborts it.
+      });
+
+      const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey!.secret}` },
+        body: JSON.stringify({ model: `combo/anthropic-post-content-usage-${comboId}`, stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+      });
+      expect(response.status).toBe(200);
+      expect(await response.text()).toContain('partial');
+      expect(seenModels).toEqual(['slow-anthropic-post-content']);
+      expect(callCount()).toBe(1);
+
+      let attempts = db.select().from(schema.requestAttempts).all();
+      for (let i = 0; i < 40 && attempts.length <= attemptsBefore; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+        attempts = db.select().from(schema.requestAttempts).all();
+      }
+      const attempt = attempts.slice(attemptsBefore).find((row) => row.modelId === slowModelId);
+      expect(attempt).toMatchObject({
+        success: false,
+        streamStarted: true,
+        partialResponse: true,
+        failureReason: 'stream_idle_timeout',
+        inputTokens: 7,
+        outputTokens: 3,
+        cacheReadTokens: 2,
+        cacheWriteTokens: 1,
+      });
+      const request = db.select().from(schema.requests).all().slice(requestsBefore)
+        .find((row) => row.requestedModel === `combo/anthropic-post-content-usage-${comboId}`);
+      expect(request).toMatchObject({ totalTokens: 10, cacheReadTokens: 2, cacheWriteTokens: 1 });
+      const providerStats = db.select().from(schema.dailyProviderStats).all()
+        .find((row) => row.day === aggregateDay && row.providerId === anthropicProviderId);
+      expect(providerStats?.cacheReadTokens).toBe(cacheReadBefore + 2);
+      expect(providerStats?.cacheWriteTokens).toBe(cacheWriteBefore + 1);
+      expect(providerStats?.reasoningTokens).toBe(reasoningBefore);
+      expect(db.select().from(schema.providers).all().find((row) => row.id === anthropicProviderId)?.healthState).toBe('down');
+    } finally {
+      db.update(schema.providers).set({ streamIdleTimeoutMs: originalIdleTimeout, healthState: originalHealthState }).where(eq(schema.providers.id, anthropicProviderId)).run();
+    }
+  }, 10_000);
+
   it('chat completions: streaming success', async () => {
     const { reset, pushHandler } = (await import('./_mock-control.js'));
     reset();
@@ -675,13 +1118,27 @@ describe('gateway smoke', () => {
     expect([429, 502, 529]).toContain(res.status);
   });
 
-  it('does not fallback after stream content sent', async () => {
+  it('does not fallback after combo stream content has been sent', async () => {
     const { reset, pushHandler, callCount } = (await import('./_mock-control.js'));
     reset();
     const db = (await import('../../src/server/db/index')).getDb();
     const { schema } = await import('../../src/server/db/index');
+    const { uuid } = await import('../../src/server/auth/ids');
+    const provider = db.select().from(schema.providers).all().find((p) => p.slug === 'mock')!;
+    const firstModelId = uuid();
+    const backupModelId = uuid();
+    const comboId = uuid();
+    db.insert(schema.models).values({ id: firstModelId, providerId: provider.id, upstreamModelId: 'partial-first', publicModelId: `mock/partial-first-${firstModelId}`, displayName: 'Partial first', enabled: true, upstreamAvailable: true, capabilitiesJson: JSON.stringify({ chat: true, streaming: true }) }).run();
+    db.insert(schema.models).values({ id: backupModelId, providerId: provider.id, upstreamModelId: 'partial-backup', publicModelId: `mock/partial-backup-${backupModelId}`, displayName: 'Partial backup', enabled: true, upstreamAvailable: true, capabilitiesJson: JSON.stringify({ chat: true, streaming: true }) }).run();
+    db.insert(schema.combos).values({ id: comboId, name: 'no-fallback-after-commit', slug: `no-fallback-after-commit-${comboId}`, publicModelId: `combo/no-fallback-after-commit-${comboId}`, mode: 'fallback', maxTotalAttempts: 2 }).run();
+    db.insert(schema.comboMembers).values([
+      { id: uuid(), comboId, modelId: firstModelId, position: 0, enabled: true },
+      { id: uuid(), comboId, modelId: backupModelId, position: 1, enabled: true },
+    ]).run();
     const before = db.select().from(schema.requestAttempts).all().length;
-    pushHandler((_req, res) => {
+    const seenModels: string[] = [];
+    pushHandler((_req, res, body) => {
+      seenModels.push((JSON.parse(body) as { model: string }).model);
       res.statusCode = 200;
       res.setHeader('content-type', 'text/event-stream');
       res.write(`data: {"choices":[{"index":0,"delta":{"content":"partial"}}]}\n\n`);
@@ -691,11 +1148,12 @@ describe('gateway smoke', () => {
     const res = await fetch(`${baseUrl}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey!.secret}` },
-      body: JSON.stringify({ model: 'mock/gpt-mock', stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+      body: JSON.stringify({ model: `combo/no-fallback-after-commit-${comboId}`, stream: true, messages: [{ role: 'user', content: 'hi' }] }),
     });
     // The committed content reached the client before the failure, and no
     // fallback to a second model occurred (the upstream was called once).
     expect(callCount()).toBe(1);
+    expect(seenModels).toEqual(['partial-first']);
     expect(res.status).toBe(200);
     expect(await res.text()).toContain('"content":"partial"');
     // Streaming responses close the client connection before the gateway

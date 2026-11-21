@@ -94,7 +94,7 @@ describe('quota fallback policy', () => {
   const combo: ComboPlan = {
     comboId: 'quota-policy', mode: 'fallback', maxTotalAttempts: 3,
     members: [{ id: 'm1', modelId: 'a', position: 0, enabled: true }],
-    trigger: { connection: true, connectTimeout: true, firstTokenTimeout: true, on408: true, on429: true, on5xx: true },
+    trigger: { connection: true, connectTimeout: true, firstTokenTimeout: true, totalTimeout: true, on408: true, on429: true, on5xx: true },
   };
 
   it('advances to the next candidate on a quota failure', () => {
@@ -133,6 +133,46 @@ describe('quota fallback policy', () => {
     const err = upstreamHttpError(429, '', { status: 429 });
     expect(isQuotaFailure(err)).toBe(false);
     expect(classifyFailure(err)).toBe('http_status');
+  });
+
+  it('preserves HTTP 408 as an http_status fallback decision', () => {
+    const err = upstreamHttpError(408, 'request timeout', { status: 408 });
+    expect(classifyFailure(err)).toBe('http_status');
+    expect(shouldRetryAttempt({
+      comboId: '408-policy', mode: 'fallback', maxTotalAttempts: 2,
+      members: [{ id: 'm1', modelId: 'a', position: 0, enabled: true }],
+      trigger: { connection: true, connectTimeout: true, firstTokenTimeout: true, totalTimeout: true, on408: true, on429: true, on5xx: true },
+    }, err)).toBe(true);
+    expect(shouldRetryAttempt({
+      comboId: '408-disabled', mode: 'fallback', maxTotalAttempts: 2,
+      members: [{ id: 'm1', modelId: 'a', position: 0, enabled: true }],
+      trigger: { connection: true, connectTimeout: true, firstTokenTimeout: true, totalTimeout: true, on408: false, on429: true, on5xx: true },
+    }, err)).toBe(false);
+  });
+
+  it('routes total timeouts through their own combo trigger and counts them for provider health', () => {
+    const err = new GatewayError('timeout_error', 'Upstream total timeout', { status: 504, code: 'upstream_total_timeout' });
+    expect(classifyFailure(err)).toBe('total_timeout');
+    expect(isUpstreamHealthFailure(err)).toBe(true);
+    const enabled = {
+      comboId: 'total-timeout-enabled', mode: 'fallback' as const, maxTotalAttempts: 2,
+      members: [{ id: 'm1', modelId: 'a', position: 0, enabled: true }],
+      trigger: { connection: true, connectTimeout: true, firstTokenTimeout: true, totalTimeout: true, on408: true, on429: true, on5xx: true },
+    };
+    expect(shouldRetryAttempt(enabled, err)).toBe(true);
+    expect(shouldRetryAttempt({ ...enabled, trigger: { ...enabled.trigger, totalTimeout: false } }, err)).toBe(false);
+
+    const slow = new GatewayError('timeout_error', 'Combo slow response threshold exceeded', { status: 504, code: 'combo_slow_response_timeout' });
+    expect(isUpstreamHealthFailure(slow)).toBe(false);
+  });
+
+  it('counts a post-content stream idle timeout as a provider health failure', () => {
+    const idle = new GatewayError('timeout_error', 'Upstream stream idle timeout', {
+      status: 504,
+      code: 'upstream_stream_idle_timeout',
+    });
+    expect(classifyFailure(idle)).toBe('stream_idle_timeout');
+    expect(isUpstreamHealthFailure(idle)).toBe(true);
   });
 });
 

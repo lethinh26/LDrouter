@@ -215,9 +215,14 @@ function buildInitialSchemaSql(): string {
       fallback_on_connection INTEGER NOT NULL DEFAULT 1,
       fallback_on_connect_timeout INTEGER NOT NULL DEFAULT 1,
       fallback_on_first_token_timeout INTEGER NOT NULL DEFAULT 1,
+      fallback_on_total_timeout INTEGER NOT NULL DEFAULT 1,
       fallback_on_408 INTEGER NOT NULL DEFAULT 1,
       fallback_on_429 INTEGER NOT NULL DEFAULT 1,
       fallback_on_5xx INTEGER NOT NULL DEFAULT 1,
+      slow_response_fallback_enabled INTEGER NOT NULL DEFAULT 1,
+      slow_response_threshold_seconds INTEGER NOT NULL DEFAULT 60,
+      slow_response_max_count INTEGER NOT NULL DEFAULT 3,
+      slow_response_generation INTEGER NOT NULL DEFAULT 1,
       cache_override_enabled INTEGER,
       config_version INTEGER NOT NULL DEFAULT 1,
       created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
@@ -233,6 +238,20 @@ function buildInitialSchemaSql(): string {
     );
     CREATE UNIQUE INDEX IF NOT EXISTS uniq_combo_model ON combo_members(combo_id, model_id);
     CREATE INDEX IF NOT EXISTS idx_combo_pos ON combo_members(combo_id, position);
+
+    CREATE TABLE IF NOT EXISTS combo_member_slow_states (
+      combo_id TEXT NOT NULL,
+      model_id TEXT NOT NULL,
+      consecutive_slow_count INTEGER NOT NULL DEFAULT 0,
+      cooldown_until_ms INTEGER,
+      probe_lease_until_ms INTEGER,
+      last_latency_ms INTEGER,
+      last_outcome TEXT NOT NULL DEFAULT 'unknown' CHECK (last_outcome IN ('slow','fast','error','unknown')),
+      updated_at_ms INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (combo_id, model_id),
+      FOREIGN KEY (combo_id, model_id) REFERENCES combo_members(combo_id, model_id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_combo_slow_cooldown ON combo_member_slow_states(cooldown_until_ms);
 
     CREATE TABLE IF NOT EXISTS model_aliases (
       id TEXT PRIMARY KEY,

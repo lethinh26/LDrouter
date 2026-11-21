@@ -2,10 +2,11 @@
 
 import { getDb, getRawDb, schema } from '../db/index';
 import { eq } from 'drizzle-orm';
-import { GatewayError } from '../errors';
+import { GatewayError, preserveClientDisconnect } from '../errors';
 import { resolveRequestedModel, unwrapAlias } from '../routing/resolver';
 import { bareModelName, deriveRequiredCapabilities, describeRejections, firstMissingCapability, type CanonicalRequest, type RejectedMember, type RejectionReason, type RequiredCapabilities } from '../routing/capabilities';
 import { loadCombo, selectCandidates, orderCandidates, shouldFallback, expandCodexAccountCandidates, expandQoderAccountCandidates, type ComboPlan, type CandidateModel } from '../routing/combo';
+import { claimComboSlowProbe, getComboSlowState, listComboSlowStates, recordComboSlowOutcome, releaseComboSlowProbe } from '../routing/combo-slow-fallback';
 import { listCodexAccountsForProvider, setCodexAccountHealth } from '../db/repositories/codex-accounts';
 import { listQoderAccountsForProvider, setQoderAccountHealth } from '../db/repositories/qoder-accounts';
 import { qoderAttemptFailure, qoderCredentialsFor } from '../providers/qoder/credentials';
@@ -28,6 +29,7 @@ import { upsertDailyAggregates } from '../backup/stats';
 import { metrics } from '../metrics/registry';
 import type { FastifyReply } from 'fastify';
 import { emitRequestLogged, emitRequestStarted } from './events';
+import { watchDownstreamDisconnect } from './downstream';
 import { debugHttp, debugBody, debugUpstream, debugStream, errorLine, formatError, getDebugFlags, truncate } from '../logging/debug';
 
 export interface GatewayContext {
@@ -197,18 +199,37 @@ export class GatewayRunner {
           rejected.push({ publicModelId: c.publicModelId, reason });
           debugHttp(ctx.requestId, 'CAPABILITY REJECT', [`model=${c.publicModelId}`, `reason=${reason}`]);
         });
+        let eligibleFiltered = filtered;
+        if (comboPlan.slowResponseFallbackEnabled) {
+          const now = Date.now();
+          const slowStates = new Map(listComboSlowStates(comboPlan.comboId).map((state) => [state.modelId, state]));
+          eligibleFiltered = filtered.flatMap((candidate) => {
+            const state = slowStates.get(candidate.modelId);
+            if (!state) return [candidate];
+            if (state.probeLeaseUntilMs !== null && state.probeLeaseUntilMs > now) {
+              rejected.push({ publicModelId: candidate.publicModelId, reason: 'slow_response_probe_active' });
+              return [];
+            }
+            if (state.cooldownUntilMs !== null && state.cooldownUntilMs > now) {
+              rejected.push({ publicModelId: candidate.publicModelId, reason: 'slow_response_cooldown' });
+              return [];
+            }
+            if (state.cooldownUntilMs !== null) return [{ ...candidate, slowResponseProbe: true }];
+            return [candidate];
+          });
+        }
         // docs/13 §10: always report why EACH member was filtered out
         debugHttp(ctx.requestId, 'CANDIDATE FILTER', [
           `comboMembers=${comboPlan.members.length}`,
-          `afterFilter=${filtered.length}`,
+          `afterFilter=${eligibleFiltered.length}`,
           `rejectedCount=${rejected.length}`,
           ...rejected.map((r) => `rejected: ${r.publicModelId} reason=${r.reason}`),
         ]);
-        if (filtered.length === 0) {
+        if (eligibleFiltered.length === 0) {
           const s = describeRejections({ kind: 'combo', publicModelId: resolved.publicModelId }, rejected);
           throw new GatewayError(s.type, s.message, { status: s.status, code: s.type });
         }
-        candidates = orderCandidates(comboPlan, filtered).flatMap((candidate) => {
+        candidates = orderCandidates(comboPlan, eligibleFiltered).flatMap((candidate) => {
           const provider = getDb().select().from(schema.providers).where(eq(schema.providers.id, candidate.providerId)).get();
           if (provider?.type === 'codex') return expandCodexAccountCandidates(candidate, listCodexAccountsForProvider(provider.id));
           if (provider?.type === 'qoder') return expandQoderAccountCandidates(candidate, listQoderAccountsForProvider(provider.id));
@@ -279,10 +300,10 @@ export class GatewayRunner {
       let candidateRetries = 0;
       for (let i = 0; i < candidates.length && attemptNumber < maxAttempts;) {
         const candidate = candidates[i]!;
-        attemptNumber++;
         finalModelId = candidate.modelId;
         const provider = getDb().select().from(schema.providers).where(eq(schema.providers.id, candidate.providerId)).get();
         if (!provider || !provider.enabled) {
+          attemptNumber++;
           debugHttp(ctx.requestId, 'ATTEMPT SKIP', [`attempt=${attemptNumber} model=${candidate.publicModelId} reason=skipped_disabled_provider`]);
           attempts.push(this.failedAttempt(attemptNumber, candidate, provider?.name ?? '', 'skipped_disabled_provider', null, null, 0, null, null));
           i++;
@@ -290,6 +311,7 @@ export class GatewayRunner {
         }
         const eff = getEffectiveState(provider.id, provider.cbCooldownSeconds);
         if (eff === 'open' && !halfOpenProbeAllowed(provider.id)) {
+          attemptNumber++;
           debugHttp(ctx.requestId, 'ATTEMPT SKIP', [`attempt=${attemptNumber} model=${candidate.publicModelId} provider=${provider.name} reason=circuit_open`]);
           attempts.push(this.failedAttempt(attemptNumber, candidate, provider.name, 'circuit_open', null, null, 0, null, null));
           if (comboPlan && shouldFallback(comboPlan, { type: 'connection_error' })) {
@@ -301,7 +323,23 @@ export class GatewayRunner {
           break;
         }
 
-        const cfg = providerToUpstreamConfig(provider, candidate.codexAccountId);
+        const baseCfg = providerToUpstreamConfig(provider, candidate.codexAccountId);
+        const cfg = comboPlan?.slowResponseFallbackEnabled && comboPlan.slowResponseThresholdMs
+          ? { ...baseCfg, slowResponseTimeoutMs: comboPlan.slowResponseThresholdMs }
+          : baseCfg;
+        if (candidate.slowResponseProbe && comboPlan && !claimComboSlowProbe(
+          comboPlan.comboId,
+          candidate.modelId,
+          candidate.comboMemberId ?? '',
+          Date.now(),
+          (comboPlan.slowResponseThresholdMs ?? 60_000) + 30_000,
+          comboPlan.slowResponseGeneration,
+        )) {
+          debugHttp(ctx.requestId, 'ATTEMPT SKIP', [`model=${candidate.publicModelId} reason=slow_response_probe_active`]);
+          i++;
+          continue;
+        }
+        attemptNumber++;
         const attemptStart = Date.now();
         // docs/13 §11–§12: provider/account + upstream request summary
         const upstreamModel = candidate.publicModelId.split('/').slice(1).join('/');
@@ -314,6 +352,7 @@ export class GatewayRunner {
           `upstreamType=${cfg.type}`,
           `baseUrl=${cfg.baseUrl}`,
           `stream=${req.canonical.stream}`,
+          `slowResponseTimeoutMs=${cfg.slowResponseTimeoutMs ?? 'disabled'}`,
           `providerKeyFingerprint=${apiKeyFingerprint(cfg.apiKey ?? '')}`,
         ]);
         const attempt: AttemptOutcome = {
@@ -338,23 +377,50 @@ export class GatewayRunner {
           upstreamRequestId: null,
         };
 
+        let slowStateRecordedFast = false;
         try {
           const out = await this.runOneAttempt(req, ctx, candidate, provider.name, cfg, required, (isStreamStarted) => {
             attempt.streamStarted = isStreamStarted;
-            attempt.ttftMs = Date.now() - attemptStart;
           }, (ttftMs) => {
+            attempt.ttftMs = ttftMs;
+            if (comboPlan?.slowResponseFallbackEnabled
+              && comboPlan.slowResponseThresholdMs !== undefined
+              && ttftMs < comboPlan.slowResponseThresholdMs
+              && getComboSlowState(comboPlan.comboId, candidate.modelId)) {
+              recordComboSlowOutcome(
+                comboPlan.comboId,
+                candidate.modelId,
+                candidate.comboMemberId ?? '',
+                'fast',
+                comboPlan.slowResponseMaxCount ?? 3,
+                ttftMs,
+                Date.now(),
+                comboPlan.slowResponseGeneration,
+              );
+              slowStateRecordedFast = true;
+            }
             // Live signal for the monitoring dashboard: the request is now
             // being served by this provider (lit up from TTFT until the
             // completion event fires on persist).
             emitRequestStarted(ctx.requestId, provider.id, candidate.modelId, ctx.requestedModel, ttftMs);
           });
+          const attemptLatencyMs = Date.now() - attemptStart;
+          if (comboPlan?.slowResponseFallbackEnabled && !req.canonical.stream
+            && comboPlan.slowResponseThresholdMs !== undefined
+            && out.ttftMs !== null && out.ttftMs >= comboPlan.slowResponseThresholdMs) {
+            throw new GatewayError('timeout_error', 'Combo slow response threshold exceeded', {
+              status: 504,
+              code: 'combo_slow_response_timeout',
+              cause: { usage: out.usage },
+            });
+          }
           attempt.statusCode = (out as { statusCode?: number | null }).statusCode ?? null;
           attempt.success = true;
           completedSuccessfully = true;
           // A fallback that succeeded answered the client 200: the earlier failed
           // attempt must not keep the request logged (and reported) as a failure.
           lastError = null;
-          attempt.latencyMs = Date.now() - attemptStart;
+          attempt.latencyMs = attemptLatencyMs;
           attempt.ttftMs = out.ttftMs;
           attempt.usage = out.usage;
           attempt.upstreamRequestId = out.upstreamRequestId;
@@ -369,6 +435,12 @@ export class GatewayRunner {
           resultText = out.result.text;
           resultToolCalls = out.result.toolCalls;
           resultFinishReason = out.result.finishReason;
+          if (!req.canonical.stream && comboPlan?.slowResponseFallbackEnabled && getComboSlowState(comboPlan.comboId, candidate.modelId)) {
+            const measuredLatency = out.ttftMs;
+            if (measuredLatency !== null) {
+              recordComboSlowOutcome(comboPlan.comboId, candidate.modelId, candidate.comboMemberId ?? '', 'fast', comboPlan.slowResponseMaxCount ?? 3, measuredLatency, Date.now(), comboPlan.slowResponseGeneration);
+            }
+          }
           recordSuccess(provider.id);
           if (candidate.codexAccountId) setCodexAccountHealth(candidate.codexAccountId, 'healthy');
           if (candidate.qoderAccountId) setQoderAccountHealth(candidate.qoderAccountId, 'healthy');
@@ -383,6 +455,22 @@ export class GatewayRunner {
           break;
         } catch (e) {
           const err = e instanceof GatewayError ? e : new GatewayError('upstream_error', (e as Error).message, { cause: e });
+          if (comboPlan?.slowResponseFallbackEnabled) {
+            if (err.code === 'combo_slow_response_timeout') {
+              recordComboSlowOutcome(
+                comboPlan.comboId,
+                candidate.modelId,
+                candidate.comboMemberId ?? '',
+                'slow',
+                comboPlan.slowResponseMaxCount ?? 3,
+                Date.now() - attemptStart,
+                Date.now(),
+                comboPlan.slowResponseGeneration,
+              );
+            } else if (!slowStateRecordedFast && candidate.slowResponseProbe) {
+              releaseComboSlowProbe(comboPlan.comboId, candidate.modelId, candidate.comboMemberId ?? '', err.code !== 'client_disconnected', Date.now(), comboPlan.slowResponseGeneration);
+            }
+          }
           const quotaFailure = isQuotaFailure(err);
           // Only a final verdict retires the account (below); a transient refresh failure still moves
           // the request to a sibling account but must leave this one enabled.
@@ -409,13 +497,32 @@ export class GatewayRunner {
           // usage on the failed attempt and request instead of discarding it on throw.
           const failedUsage = (err.cause as { usage?: UsageSummary } | undefined)?.usage;
           if (failedUsage) {
-            attempt.usage = failedUsage;
-            usage.input += failedUsage.input;
-            usage.output += failedUsage.output;
-            usage.cacheRead += failedUsage.cacheRead;
-            usage.cacheWrite += failedUsage.cacheWrite;
-            usage.reasoning += failedUsage.reasoning;
-            usage.total += failedUsage.total;
+            const normalizedFailedUsage = {
+              ...failedUsage,
+              total: failedUsage.total || failedUsage.input + failedUsage.output,
+            };
+            attempt.usage = normalizedFailedUsage;
+            usage.input += normalizedFailedUsage.input;
+            usage.output += normalizedFailedUsage.output;
+            usage.cacheRead += normalizedFailedUsage.cacheRead;
+            usage.cacheWrite += normalizedFailedUsage.cacheWrite;
+            usage.reasoning += normalizedFailedUsage.reasoning;
+            usage.total += normalizedFailedUsage.total;
+          }
+          if (isUpstreamHealthFailure(err)) {
+            recordFailure(provider.id, provider.cbFailureThreshold, provider.cbCooldownSeconds);
+            if (candidate.codexAccountId) setCodexAccountHealth(candidate.codexAccountId, 'down', redactString(err.message));
+            if (candidate.qoderAccountId) setQoderAccountHealth(candidate.qoderAccountId, 'down', redactString(err.message));
+            getDb().update(schema.providers).set({ healthState: 'down', updatedAt: new Date().toISOString() }).where(eq(schema.providers.id, provider.id)).run();
+          }
+          // The caller is gone; stop the combo rather than spending attempts on
+          // fallback members that cannot deliver a response to anyone.
+          if (err.code === 'client_disconnected') {
+            attempt.partialResponse = attempt.streamStarted;
+            attempts.push(attempt);
+            lastError = err;
+            sentToClient = attempt.streamStarted;
+            break;
           }
           // If stream already started sending content, do NOT fallback
           if (attempt.streamStarted) {
@@ -435,12 +542,6 @@ export class GatewayRunner {
           // again until it is re-imported, so a retry may only be spent on a sibling account. Without
           // this the retry landed on the same dead account and the request answered 502.
           if (credentialFailure) markCredentialsDead(candidate, err.message);
-          if (isUpstreamHealthFailure(err)) {
-            recordFailure(provider.id, provider.cbFailureThreshold, provider.cbCooldownSeconds);
-            if (candidate.codexAccountId) setCodexAccountHealth(candidate.codexAccountId, 'down', redactString(err.message));
-            if (candidate.qoderAccountId) setQoderAccountHealth(candidate.qoderAccountId, 'down', redactString(err.message));
-            getDb().update(schema.providers).set({ healthState: 'down', updatedAt: new Date().toISOString() }).where(eq(schema.providers.id, provider.id)).run();
-          }
           // Retry an empty 200 on the same model using its provider retry settings.
           // Reserve one attempt for a combo's next member whenever possible.
           const reserveFallback = comboPlan && i + 1 < candidates.length ? 1 : 0;
@@ -719,17 +820,17 @@ export class GatewayRunner {
     let headWritten = false;
     const writeHead = () => {
       if (headWritten) return;
-      headWritten = true;
       pipe.writeHead(200, {
         'content-type': 'text/event-stream',
         'cache-control': 'no-cache',
         connection: 'keep-alive',
         'x-request-id': ctx.requestId,
       });
+      headWritten = true;
     };
 
     let streamStarted = false;
-    const streamStartTs = Date.now();
+    let streamStartTs = Date.now();
     let textBuf = '';
     const toolBuf: Array<{ id: string; name: string; input: unknown }> = [];
     let finishReason: string | null = null;
@@ -747,24 +848,25 @@ export class GatewayRunner {
     let lastChunkTime: number | null = null;
     const loggedFirstChunks: string[] = [];
     let clientDisconnected = false;
-    // Guard: the admin test-stream endpoint passes a minimal `fakeRaw` that has
-    // writeHead/write/end but no `.on` — skip disconnect tracking in that case.
-    if (typeof (pipe as { on?: unknown }).on === 'function') {
-      pipe.on('close', () => {
-        // Distinguish client disconnect from normal end: 'close' fires on the raw
-        // socket when the client (or upstream) side goes away.
-        if (!pipe.writableEnded) {
-          clientDisconnected = true;
-          debugStream(ctx.requestId, 'CLIENT DISCONNECT', [
-            `afterMs=${Date.now() - streamStartTs}`,
-            `streaming=${streamStarted}`,
-            `chunksSoFar=${chunkCount}`,
-          ]);
-        }
+    const downstreamAbort = new AbortController();
+    let detachDownstreamClose: (() => void) | null = null;
+    if (typeof (pipe as { on?: unknown }).on === 'function' && typeof (pipe as { off?: unknown }).off === 'function') {
+      detachDownstreamClose = watchDownstreamDisconnect(pipe, () => {
+        // A closed downstream socket must stop upstream work too. Otherwise the
+        // gateway keeps draining billable tokens after nobody can receive them.
+        clientDisconnected = true;
+        downstreamAbort.abort();
+        debugStream(ctx.requestId, 'CLIENT DISCONNECT', [
+          `afterMs=${Date.now() - streamStartTs}`,
+          `streaming=${streamStarted}`,
+          `chunksSoFar=${chunkCount}`,
+        ]);
       });
     }
+    // Guard: the admin test-stream endpoint passes a minimal `fakeRaw` that has
+    // writeHead/write/end but no `.on` — skip disconnect tracking in that case.
 
-    const chunkHandler = (chunk: { data: string; event?: string }, isFirst: boolean) => {
+    const chunkHandler = (chunk: { data: string; event?: string }, isFirst: boolean): boolean => {
       chunkCount++;
       bytesReceived += chunk.data.length;
       lastChunkTime = Date.now();
@@ -784,15 +886,27 @@ export class GatewayRunner {
             textBuf += choice.delta.content;
             hasOutput = true;
           }
-          if (choice?.delta?.tool_calls) {
+          if (typeof choice?.delta?.refusal === 'string' && choice.delta.refusal.length > 0) {
+            // OpenAI refusal text is generated content too; preserve it in the
+            // canonical result so refusal-only streams commit and are not retried.
+            textBuf += choice.delta.refusal;
+            hasOutput = true;
+          }
+          if (Array.isArray(choice?.delta?.tool_calls)) {
             for (const tc of choice.delta.tool_calls) {
+              const rawArguments = tc.function?.arguments;
+              const hasToolCallContent = (typeof tc.id === 'string' && tc.id.length > 0)
+                || (typeof tc.function?.name === 'string' && tc.function.name.length > 0)
+                || (typeof rawArguments === 'string' && rawArguments.length > 0)
+                || (rawArguments !== null && typeof rawArguments === 'object' && Object.keys(rawArguments).length > 0);
+              if (!hasToolCallContent) continue;
               const id = typeof tc.id === 'string' ? tc.id : `toolu-${Math.random().toString(36).slice(2)}`;
               const name = typeof tc.function?.name === 'string' ? tc.function.name : 'unknown';
               let input = {};
-              if (typeof tc.function?.arguments === 'string') {
-                try { input = JSON.parse(tc.function.arguments); } catch { /* ignore */ }
-              } else if (typeof tc.function?.arguments === 'object') {
-                input = tc.function.arguments;
+              if (typeof rawArguments === 'string') {
+                try { input = JSON.parse(rawArguments); } catch { /* ignore */ }
+              } else if (rawArguments !== null && typeof rawArguments === 'object') {
+                input = rawArguments;
               }
               toolBuf.push({ id, name, input });
               hasOutput = true;
@@ -840,21 +954,30 @@ export class GatewayRunner {
           if (initialBytes > 65536 || initialEvents.length > 128) {
             throw emptyGenerationError(candidate, usage);
           }
-          return;
+          return false;
+        }
+        if (cfg.slowResponseTimeoutMs !== undefined && Date.now() - streamStartTs >= cfg.slowResponseTimeoutMs) {
+          throw new GatewayError('timeout_error', 'Combo slow response threshold exceeded before first token', {
+            status: 504,
+            code: 'combo_slow_response_timeout',
+            cause: { usage },
+          });
         }
         // Only real text/tool output commits the stream. Metadata-only streams
         // can still retry or fall back with an ordinary HTTP error response.
-        streamStarted = true;
-        onStreamStart(true);
         meaningfulTtftMs = Date.now() - streamStartTs;
         onFirstToken(meaningfulTtftMs);
         writeHead();
+        // Commit markers move only after pre-commit bookkeeping and writeHead
+        // succeed. A failure before this point remains safe to fallback.
+        streamStarted = true;
+        onStreamStart(true);
         for (const event of initialEvents) pipe.write(event);
         initialEvents.length = 0;
-        return;
+        return true;
       }
       if (encoded) pipe.write(encoded);
-      return;
+      return hasOutput;
     };
 
     try {
@@ -868,7 +991,7 @@ export class GatewayRunner {
             chunkHandler({ data: codexStreamEventToClient(req.protocol, event, upstreamModel, ctx.requestId) }, firstCodexEvent);
             firstCodexEvent = false;
           }
-        });
+        }, downstreamAbort.signal);
         if (!streamStarted) throw emptyGenerationError(candidate, usage);
         pipe.write('data: [DONE]\n\n');
         pipe.end();
@@ -890,6 +1013,7 @@ export class GatewayRunner {
               if (firstQoderChunk) { qoderTtftMs = Date.now() - streamStartTs; firstQoderChunk = false; }
               chunkHandler({ data: chunk.data }, false);
             },
+            { signal: downstreamAbort.signal },
           );
           if (!streamStarted) throw emptyGenerationError(candidate, usage);
           pipe.write('data: [DONE]\n\n');
@@ -897,14 +1021,16 @@ export class GatewayRunner {
           if (!usage.total) usage.total = usage.input + usage.output;
           return { statusCode: out.status, ttftMs: meaningfulTtftMs ?? qoderTtftMs, upstreamRequestId: out.upstreamRequestId, usage, result: { text: out.text, toolCalls: out.toolCalls, finishReason: out.finishReason } };
         } catch (error) {
-          return qoderAttemptFailure(accountRecordId, error) as never;
+          if (error instanceof GatewayError && error.code === 'client_disconnected') throw error;
+          return preserveClientDisconnect(downstreamAbort.signal, () => qoderAttemptFailure(accountRecordId, error)) as never;
         }
       }
       const url = cfg.type === 'openai' ? upstreamUrl(cfg, '/v1/chat/completions') : upstreamUrl(cfg, '/v1/messages');
       const payload = cfg.type === 'openai' ? canonicalToOpenAIRequest(req.canonical, upstreamModel) : canonicalToAnthropicRequest(req.canonical, upstreamModel);
       logUpstreamRequest(ctx.requestId, cfg, url, payload, true);
       debugStream(ctx.requestId, 'STREAM START', [`upstreamConnected=true`]);
-      const meta = await callUpstreamStreaming(cfg, url, payload, chunkHandler, ctx.requestId);
+      streamStartTs = Date.now();
+      const meta = await callUpstreamStreaming(cfg, url, payload, chunkHandler, ctx.requestId, streamStartTs, downstreamAbort.signal);
       // Upstream completed cleanly: ensure head + terminator are written.
       if (!streamStarted) throw emptyGenerationError(candidate, usage);
       pipe.write('data: [DONE]\n\n');
@@ -932,14 +1058,31 @@ export class GatewayRunner {
         // Ensure the (already-committed) response is closed.
         if (!headWritten) writeHead();
         pipe.end();
-        const err = e instanceof GatewayError ? e : new GatewayError('upstream_error', (e as Error).message);
+        const gatewayError = e instanceof GatewayError ? e : new GatewayError('upstream_error', (e as Error).message, { cause: e });
         errorLine(ctx.requestId, 'STREAM ERROR', [
           `chunksBeforeError=${chunkCount}`,
           `bytesBeforeError=${bytesReceived}`,
           `clientDisconnected=${clientDisconnected}`,
           ...formatErrorPublic(e),
         ]);
-        throw err;
+        const originalCause = gatewayError.cause;
+        const causeRecord = originalCause && typeof originalCause === 'object'
+          ? originalCause as Record<string, unknown>
+          : {};
+        throw new GatewayError(gatewayError.type, gatewayError.message, {
+          status: gatewayError.status,
+          code: gatewayError.code,
+          cause: {
+            ...causeRecord,
+            message: typeof causeRecord.message === 'string'
+              ? causeRecord.message
+              : originalCause instanceof Error ? originalCause.message : undefined,
+            status: typeof causeRecord.status === 'number' ? causeRecord.status : undefined,
+            bodyExcerpt: typeof causeRecord.bodyExcerpt === 'string' ? causeRecord.bodyExcerpt : undefined,
+            originalCause,
+            usage,
+          },
+        });
       }
       errorLine(ctx.requestId, 'STREAM ERROR (before first chunk)', [
         `chunksBeforeError=${chunkCount}`,
@@ -947,7 +1090,30 @@ export class GatewayRunner {
         `clientDisconnected=${clientDisconnected}`,
         ...formatErrorPublic(e),
       ]);
-      throw e;
+      const gatewayError = e instanceof GatewayError ? e : new GatewayError('upstream_error', (e as Error).message, { cause: e });
+      const originalCause = gatewayError.cause;
+      const causeRecord = originalCause && typeof originalCause === 'object'
+        ? originalCause as Record<string, unknown>
+        : {};
+      // Metadata-only Anthropic/OpenAI events can already report billable input/cache usage.
+      // Preserve it for every pre-content failure, including first-token and total timeouts.
+      const cause = {
+        ...causeRecord,
+        message: typeof causeRecord.message === 'string'
+          ? causeRecord.message
+          : originalCause instanceof Error ? originalCause.message : undefined,
+        status: typeof causeRecord.status === 'number' ? causeRecord.status : undefined,
+        bodyExcerpt: typeof causeRecord.bodyExcerpt === 'string' ? causeRecord.bodyExcerpt : undefined,
+        originalCause,
+        usage,
+      };
+      throw new GatewayError(gatewayError.type, gatewayError.message, {
+        status: gatewayError.status,
+        code: gatewayError.code,
+        cause,
+      });
+    } finally {
+      detachDownstreamClose?.();
     }
   }
 
@@ -1193,7 +1359,7 @@ export class GatewayRunner {
 }
 
 export function isUpstreamHealthFailure(err: GatewayError): boolean {
-  return ['connection_error', 'connect_timeout', 'first_token_timeout', 'http_status', 'upstream_rate_limit', 'empty_response'].includes(classifyFailure(err));
+  return ['connection_error', 'connect_timeout', 'first_token_timeout', 'stream_idle_timeout', 'total_timeout', 'http_status', 'upstream_rate_limit', 'empty_response'].includes(classifyFailure(err));
 }
 
 /**
@@ -1300,11 +1466,20 @@ export function shouldRetryAttempt(comboPlan: ComboPlan | null, err: GatewayErro
   if (isCredentialFailure(err)) return true;
   if (isQuotaFailure(err)) return true;
   if (err.code === 'upstream_empty_response') return comboPlan?.trigger.on5xx ?? false;
-  return comboPlan ? shouldFallback(comboPlan, { type: classifyFailure(err), status: err.status }) : false;
+  if (err.code === 'combo_slow_response_timeout') return comboPlan?.slowResponseFallbackEnabled ?? false;
+  const causeStatus = (err.cause as { status?: unknown } | undefined)?.status;
+  const status = typeof causeStatus === 'number' ? causeStatus : err.status;
+  return comboPlan ? shouldFallback(comboPlan, { type: classifyFailure(err), status }) : false;
 }
 
 export function classifyFailure(err: GatewayError): string {
+  if (err.code === 'client_disconnected') return 'client_disconnected';
   if (err.code === 'upstream_empty_response') return 'empty_response';
+  if (err.code === 'combo_slow_response_timeout') return 'slow_response_timeout';
+  if (err.code === 'upstream_connect_timeout') return 'connect_timeout';
+  if (err.code === 'upstream_first_token_timeout') return 'first_token_timeout';
+  if (err.code === 'upstream_stream_idle_timeout') return 'stream_idle_timeout';
+  if (err.code === 'upstream_total_timeout') return 'total_timeout';
   // Checked before the type switch for the same reason as quota: a dead account is not a routing
   // decision the combo's triggers were meant to gate, and `unknown` is not a routing decision at all.
   if (isCredentialFailure(err)) return 'credential';
@@ -1314,14 +1489,18 @@ export function classifyFailure(err: GatewayError): string {
   if (isQuotaFailure(err)) return 'quota';
   switch (err.type) {
     case 'timeout_error':
-      return err.message.includes('first token') ? 'first_token_timeout' : 'connect_timeout';
+      if (err.message.toLowerCase().includes('first token')) return 'first_token_timeout';
+      if (err.message.toLowerCase().includes('connect')) return 'connect_timeout';
+      return 'total_timeout';
     case 'upstream_unavailable':
       return 'connection_error';
     case 'upstream_rate_limit':
       return 'http_status';
     case 'upstream_error': {
       const upstreamStatus = (err.cause as { status?: unknown } | undefined)?.status;
-      return typeof upstreamStatus === 'number' && upstreamStatus >= 500 && upstreamStatus < 600 ? 'http_status' : 'unknown';
+      return typeof upstreamStatus === 'number' && (upstreamStatus === 408 || (upstreamStatus >= 500 && upstreamStatus < 600))
+        ? 'http_status'
+        : 'unknown';
     }
     default:
       return 'unknown';

@@ -83,6 +83,50 @@ describe('Qoder chat client', () => {
     expect(chunks.some((c) => c.includes('keepalive'))).toBe(false);
   });
 
+  it('aborts the upstream Qoder stream when the downstream signal fires', async () => {
+    const downstream = new AbortController();
+    let firstChunkResolve!: () => void;
+    const firstChunk = new Promise<void>((resolve) => { firstChunkResolve = resolve; });
+    let upstreamAborted = false;
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const upstreamSignal = init?.signal as AbortSignal;
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(envelope({ id: 'c1', choices: [{ index: 0, delta: { content: 'partial' } }] })));
+          upstreamSignal.addEventListener('abort', () => {
+            upstreamAborted = true;
+            try { controller.error(new DOMException('aborted', 'AbortError')); } catch { /* already closed */ }
+          }, { once: true });
+        },
+      });
+      return new Response(body, { status: 200 });
+    }) as unknown as typeof fetch;
+
+    const pending = callQoderStreaming(
+      cfg,
+      { ...request, stream: true },
+      () => firstChunkResolve(),
+      { fetchImpl, signal: downstream.signal },
+    );
+    await firstChunk;
+    downstream.abort();
+
+    await expect(pending).rejects.toMatchObject({ code: 'client_disconnected', status: 499 });
+    expect(upstreamAborted).toBe(true);
+  });
+
+  it('cancels a non-2xx response body before surfacing the upstream status', async () => {
+    let bodyCancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      cancel() { bodyCancelled = true; },
+    });
+    const fetchImpl = vi.fn().mockResolvedValue(new Response(body, { status: 429 })) as unknown as typeof fetch;
+
+    await expect(callQoderStreaming(cfg, { ...request, stream: true }, () => {}, { fetchImpl }))
+      .rejects.toMatchObject({ status: 429 });
+    expect(bodyCancelled).toBe(true);
+  });
+
   it('assembles the same result without streaming', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(streamBody(), { status: 200 })));
     const result = await callQoderNonStreaming(cfg, { ...request, stream: false });

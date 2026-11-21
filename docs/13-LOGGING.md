@@ -528,6 +528,14 @@ reason=rate_limit
 
 Từng candidate phải có rejection reason cụ thể.
 
+Slow-response fallback uses the same candidate rejection records. A member skipped during its
+five-minute cooldown is logged with `reason=slow_response_cooldown`; a member whose recovery probe
+is already leased is logged with `reason=slow_response_probe_active`. The upstream attempt record
+includes `slowResponseTimeoutMs`, and a threshold abort is classified as
+`failureReason=slow_response_timeout`.
+Total request timeouts are classified as `total_timeout`; stream-idle timeouts before content are
+classified as `first_token_timeout` so the corresponding combo trigger remains effective.
+
 ---
 
 # 11. LOG ACCOUNT SELECTION

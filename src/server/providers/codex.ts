@@ -1,5 +1,6 @@
 import { withCodexCredentials, refreshCodexAccount } from './codex-refresh';
 import { redactString, redactValue } from '../security/redact';
+import { clientDisconnectedError, preserveClientDisconnect } from '../errors';
 import type { CanonicalRequest } from '../routing/capabilities';
 import type { DiscoveredModel, ProbeResult } from './index';
 
@@ -59,10 +60,10 @@ export function codexHeaders(cfg: CodexProviderConfig, accept = 'application/jso
   };
 }
 
-function timeout(ms: number): { signal: AbortSignal; cancel: () => void } {
+function timeout(ms: number): { signal: AbortSignal; cancel: () => void; abort: () => void } {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), ms);
-  return { signal: controller.signal, cancel: () => clearTimeout(timer) };
+  return { signal: controller.signal, cancel: () => clearTimeout(timer), abort: () => controller.abort() };
 }
 
 export async function probeCodex(cfg: CodexProviderConfig): Promise<ProbeResult> {
@@ -260,23 +261,43 @@ export async function callCodexNonStreaming(cfg: CodexProviderConfig, req: Canon
   return { model: req.model, text, toolCalls, finishReason, usage, status: meta.status, upstreamRequestId: meta.upstreamRequestId };
 }
 
-export async function callCodexStreaming(cfg: CodexProviderConfig, req: CanonicalRequest, onEvent: (event: ReturnType<typeof codexStreamEventToCanonical>) => void): Promise<{ status: number; upstreamRequestId: string | null }> {
+export async function callCodexStreaming(
+  cfg: CodexProviderConfig,
+  req: CanonicalRequest,
+  onEvent: (event: ReturnType<typeof codexStreamEventToCanonical>) => void,
+  downstreamSignal?: AbortSignal,
+): Promise<{ status: number; upstreamRequestId: string | null }> {
   const run = async (tokenCfg: CodexProviderConfig) => {
     const ctl = timeout(tokenCfg.totalTimeoutMs);
+    let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+    const abortForDownstream = () => ctl.abort();
+    if (downstreamSignal?.aborted) abortForDownstream();
+    else downstreamSignal?.addEventListener('abort', abortForDownstream, { once: true });
     try {
     const response = await fetch(codexRequest(tokenCfg, '/responses'), { method: 'POST', headers: codexHeaders(tokenCfg, 'text/event-stream'), body: JSON.stringify(codexRequestPayload(req)), signal: ctl.signal });
     // Only a failed response is read as text here; a 2xx with no body must still report its status.
     if (!response.ok) throw await responseError(response);
     if (!response.body) throw Object.assign(new Error(`Codex upstream HTTP ${response.status}: empty response body`), { status: response.status });
-    const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = '';
+    reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = '';
     const process = (raw: string) => { const data = raw.split(/\r?\n/).find((line) => line.startsWith('data:'))?.slice(5).trim(); if (data && data !== '[DONE]') onEvent(codexStreamEventToCanonical(JSON.parse(data) as Record<string, unknown>)); };
     for (;;) { const part = await reader.read(); buffer += decoder.decode(part.value ?? new Uint8Array(), { stream: part.done }); let index; while ((index = buffer.search(/\r?\n\r?\n/)) >= 0) { process(buffer.slice(0, index)); buffer = buffer.slice(index + (buffer[index] === '\r' ? 4 : 2)); } if (part.done) break; }
     if (buffer.trim()) process(buffer.replace(/\r?\n$/, ''));
     return { status: response.status, upstreamRequestId: response.headers.get('x-request-id') };
-    } finally { ctl.cancel(); }
+    } catch (error) {
+      if (reader) await reader.cancel(error).catch(() => undefined);
+      if (downstreamSignal?.aborted) {
+        throw clientDisconnectedError(error);
+      }
+      throw error;
+    } finally {
+      downstreamSignal?.removeEventListener('abort', abortForDownstream);
+      ctl.cancel();
+    }
   };
-  if (cfg.accountRecordId) return withCodexCredentials(cfg.accountRecordId, (credentials) => run({ ...cfg, accessToken: credentials.accessToken }));
-  return run(cfg);
+  return preserveClientDisconnect(downstreamSignal, async () => {
+    if (cfg.accountRecordId) return withCodexCredentials(cfg.accountRecordId, (credentials) => run({ ...cfg, accessToken: credentials.accessToken }));
+    return run(cfg);
+  });
 }
 
 /* eslint-disable preserve-caught-error -- safe refresh failure intentionally omits credentials */

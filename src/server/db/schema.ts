@@ -2,7 +2,7 @@
 // Source of truth: docs/02-DATA-MODEL.md
 
 import { sql } from 'drizzle-orm';
-import { sqliteTable, text, integer, index, uniqueIndex, primaryKey } from 'drizzle-orm/sqlite-core';
+import { sqliteTable, text, integer, index, uniqueIndex, primaryKey, foreignKey } from 'drizzle-orm/sqlite-core';
 
 // ============================================================================
 // Application settings (singleton)
@@ -262,9 +262,14 @@ export const combos = sqliteTable(
     fallbackOnConnection: integer('fallback_on_connection', { mode: 'boolean' }).notNull().notNull().default(true),
     fallbackOnConnectTimeout: integer('fallback_on_connect_timeout', { mode: 'boolean' }).notNull().notNull().default(true),
     fallbackOnFirstTokenTimeout: integer('fallback_on_first_token_timeout', { mode: 'boolean' }).notNull().notNull().default(true),
+    fallbackOnTotalTimeout: integer('fallback_on_total_timeout', { mode: 'boolean' }).notNull().default(true),
     fallbackOn408: integer('fallback_on_408', { mode: 'boolean' }).notNull().notNull().default(true),
     fallbackOn429: integer('fallback_on_429', { mode: 'boolean' }).notNull().notNull().default(true),
     fallbackOn5xx: integer('fallback_on_5xx', { mode: 'boolean' }).notNull().notNull().default(true),
+    slowResponseFallbackEnabled: integer('slow_response_fallback_enabled', { mode: 'boolean' }).notNull().default(true),
+    slowResponseThresholdSeconds: integer('slow_response_threshold_seconds').notNull().default(60),
+    slowResponseMaxCount: integer('slow_response_max_count').notNull().default(3),
+    slowResponseGeneration: integer('slow_response_generation').notNull().default(1),
     cacheOverrideEnabled: integer('cache_override_enabled', { mode: 'boolean' }),
     configVersion: integer('config_version').notNull().default(1),
     createdAt: text('created_at').notNull().default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ','now'))`),
@@ -292,6 +297,29 @@ export const comboMembers = sqliteTable(
   (t) => ({
     uniqMember: uniqueIndex('uniq_combo_model').on(t.comboId, t.modelId),
     posIdx: index('idx_combo_pos').on(t.comboId, t.position),
+  })
+);
+
+export const comboMemberSlowStates = sqliteTable(
+  'combo_member_slow_states',
+  {
+    comboId: text('combo_id').notNull(),
+    modelId: text('model_id').notNull(),
+    consecutiveSlowCount: integer('consecutive_slow_count').notNull().default(0),
+    cooldownUntilMs: integer('cooldown_until_ms'),
+    probeLeaseUntilMs: integer('probe_lease_until_ms'),
+    lastLatencyMs: integer('last_latency_ms'),
+    lastOutcome: text('last_outcome', { enum: ['slow', 'fast', 'error', 'unknown'] }).notNull().default('unknown'),
+    updatedAtMs: integer('updated_at_ms').notNull().default(0),
+  },
+  (t) => ({
+    pk: primaryKey({ columns: [t.comboId, t.modelId] }),
+    cooldownIdx: index('idx_combo_slow_cooldown').on(t.cooldownUntilMs),
+    memberFk: foreignKey({
+      columns: [t.comboId, t.modelId],
+      foreignColumns: [comboMembers.comboId, comboMembers.modelId],
+      name: 'fk_combo_slow_state_member',
+    }).onDelete('cascade'),
   })
 );
 

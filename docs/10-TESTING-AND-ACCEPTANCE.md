@@ -12,6 +12,12 @@ Cover pure logic:
 - alias resolution
 - combo candidate filtering
 - fallback decision matrix
+- HTTP 408 preserves its upstream status and obeys the combo's `fallback_on_408` toggle
+- non-streaming total timeout obeys `fallback_on_total_timeout`; repeated total timeouts count toward provider circuit health
+- connect timeout aborts streaming and non-streaming requests before response headers
+- metadata-only SSE events do not stop the first-token watchdog
+- combo slow-response state increments, resets on fast responses, and persists across requests
+- one recovery probe is admitted after cooldown; concurrent probes are excluded
 - ordered combo routing
 - retry/backoff calculations
 - circuit breaker transitions
@@ -30,6 +36,7 @@ Run server against temporary SQLite database and mock upstream HTTP servers.
 Cover:
 
 - migrations from empty DB
+- combo slow-response migration defaults and foreign-key integrity
 - first-run admin setup
 - login/session/logout
 - TOTP enable/verify/recovery/disable
@@ -125,6 +132,23 @@ Expected:
 
 With deterministic member positions, confirm the first eligible model is tried first and unavailable
 models are skipped in favor of later members.
+
+### Slow-response fallback
+
+Configure a combo with a one-second threshold, three consecutive slow outcomes, and two members.
+Make the first member exceed the threshold on three requests while the second member responds
+quickly.
+
+Expected:
+
+- each slow attempt is aborted and the current request succeeds through member two
+- the first member's consecutive slow count reaches three and a five-minute cooldown is stored
+- the next request skips member one without waiting for its response timeout
+- after cooldown, only one concurrent request may probe member one
+- a fast probe clears its cooldown and slow count
+- for streaming, metadata-only SSE events do not count as TTFT and no content from the slow member
+  reaches the client before fallback
+- once real text/tool output is sent, later stream errors still never fallback
 
 ## Security acceptance
 

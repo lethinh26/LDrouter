@@ -40,6 +40,11 @@ const openaiText = {
   choices: [{ index: 0, message: { role: 'assistant', content: 'Recovered answer' }, finish_reason: 'stop' }],
   usage: { prompt_tokens: 8, completion_tokens: 3, total_tokens: 11 },
 };
+const openaiRefusal = {
+  id: 'refusal-chat', object: 'chat.completion', model: 'a',
+  choices: [{ index: 0, message: { role: 'assistant', content: null, refusal: 'I cannot help with that request.' }, finish_reason: 'content_filter' }],
+  usage: { prompt_tokens: 9, completion_tokens: 6, total_tokens: 15 },
+};
 const openaiTool = {
   id: 'tool-chat', object: 'chat.completion', model: 'a',
   choices: [{ index: 0, message: { role: 'assistant', content: null, tool_calls: [
@@ -289,6 +294,19 @@ describe('upstream 200 without semantic output', () => {
     const body = await response.json() as { choices: Array<{ message: { content: string | null; tool_calls: Array<{ function: { name: string } }> } }> };
     expect(body.choices[0]!.message.tool_calls[0]!.function.name).toBe('lookup');
     expect(callCount()).toBe(1);
+  });
+
+  it('treats a non-streaming OpenAI refusal-only response as generated content, not an empty response', async () => {
+    const before = requestCount();
+    pushHandler((_req, res, body) => json(res, JSON.parse(body).model === 'model-first' ? openaiRefusal : openaiText));
+    const response = await request('openai', comboIds.openai);
+    expect(response.status).toBe(200);
+    const body = await response.json() as { choices: Array<{ message: { content: string | null } }> };
+    expect(body.choices[0]!.message.content).toBe('I cannot help with that request.');
+    expect(callCount()).toBe(1);
+    const logged = await recordedRequestSince(before);
+    expect(logged).toMatchObject({ success: true, httpStatus: 200, finalModelId: models.openai.first.id });
+    expect(attemptRows(logged.id)).toMatchObject([{ success: true, modelId: models.openai.first.id }]);
   });
 
   it('accepts nonempty OpenAI text even when usage reports zero output tokens', async () => {

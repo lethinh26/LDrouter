@@ -15,11 +15,16 @@ export interface ComboPlan {
   comboId: string;
   mode: 'fallback';
   maxTotalAttempts: number;
+  slowResponseFallbackEnabled?: boolean;
+  slowResponseThresholdMs?: number;
+  slowResponseMaxCount?: number;
+  slowResponseGeneration?: number;
   members: ComboMember[];
   trigger: {
     connection: boolean;
     connectTimeout: boolean;
     firstTokenTimeout: boolean;
+    totalTimeout: boolean;
     on408: boolean;
     on429: boolean;
     on5xx: boolean;
@@ -35,11 +40,16 @@ export function loadCombo(comboId: string): ComboPlan | null {
     comboId: c.id,
     mode: 'fallback',
     maxTotalAttempts: c.maxTotalAttempts,
+    slowResponseFallbackEnabled: c.slowResponseFallbackEnabled,
+    slowResponseThresholdMs: c.slowResponseThresholdSeconds * 1000,
+    slowResponseMaxCount: c.slowResponseMaxCount,
+    slowResponseGeneration: c.slowResponseGeneration,
     members: members.map((m) => ({ id: m.id, modelId: m.modelId, position: m.position, enabled: m.enabled })),
     trigger: {
       connection: c.fallbackOnConnection,
       connectTimeout: c.fallbackOnConnectTimeout,
       firstTokenTimeout: c.fallbackOnFirstTokenTimeout,
+      totalTimeout: c.fallbackOnTotalTimeout,
       on408: c.fallbackOn408,
       on429: c.fallbackOn429,
       on5xx: c.fallbackOn5xx,
@@ -49,6 +59,8 @@ export function loadCombo(comboId: string): ComboPlan | null {
 
 export interface CandidateModel {
   modelId: string;
+  /** The combo_members row captured when this request loaded its routing plan. */
+  comboMemberId?: string;
   publicModelId: string;
   upstreamModelId: string;
   providerId: string;
@@ -65,6 +77,8 @@ export interface CandidateModel {
   qoderUserId?: string;
   providerType?: string;
   selectionReason?: string;
+  /** Set after a member's slow-response cooldown expires; runner must claim its probe lease. */
+  slowResponseProbe?: boolean;
 }
 
 export interface CodexAccountCandidate {
@@ -129,7 +143,7 @@ export function selectCandidates(
     if (c.circuitOpen) { onReject?.(c, 'circuit_open'); continue; }
     const missing = firstMissingCapability(c.capabilities, req);
     if (missing) { onReject?.(c, missing); continue; }
-    candidates.push(c);
+    candidates.push({ ...c, comboMemberId: m.id });
   }
   return candidates;
 }
@@ -151,6 +165,8 @@ export function shouldFallback(combo: ComboPlan, reason: { type: string; status?
       return combo.trigger.connectTimeout;
     case 'first_token_timeout':
       return combo.trigger.firstTokenTimeout;
+    case 'total_timeout':
+      return combo.trigger.totalTimeout;
     case 'quota':
       // An exhausted account is the clearest case for trying the next candidate: retrying the same
       // one cannot succeed until its window resets. Unconditional because a dead account is not a

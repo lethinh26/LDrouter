@@ -100,6 +100,8 @@ export type RejectionReason =
   | 'circuit_open'
   | 'combo_disabled'
   | 'member_disabled'
+  | 'slow_response_cooldown'
+  | 'slow_response_probe_active'
   | 'codex_account_unavailable'
   | 'qoder_account_unavailable'
   | 'streaming'
@@ -138,6 +140,8 @@ const NON_CAPABILITY_TEXT: Partial<Record<RejectionReason, string>> = {
   circuit_open: 'provider circuit is open',
   combo_disabled: 'combo disabled',
   member_disabled: 'disabled in this combo',
+  slow_response_cooldown: 'slow-response cooldown',
+  slow_response_probe_active: 'slow-response recovery probe is already running',
   codex_account_unavailable: 'no available Codex account',
   qoder_account_unavailable: 'no enabled Qoder account is available — check the account group',
 };

@@ -32,6 +32,30 @@ export class GatewayError extends Error {
   }
 }
 
+export function clientDisconnectedError(cause?: unknown): GatewayError {
+  return new GatewayError('gateway_error', 'Downstream client disconnected', {
+    status: 499,
+    code: 'client_disconnected',
+    ...(cause === undefined ? {} : { cause }),
+  });
+}
+
+/** Preserve caller cancellation across async credential preflight and failure classification. */
+export async function preserveClientDisconnect<T>(
+  signal: AbortSignal | undefined,
+  operation: () => Promise<T>,
+): Promise<T> {
+  if (signal?.aborted) throw clientDisconnectedError();
+  try {
+    return await operation();
+  } catch (error) {
+    if (signal?.aborted && !(error instanceof GatewayError && error.code === 'client_disconnected')) {
+      throw clientDisconnectedError(error);
+    }
+    throw error;
+  }
+}
+
 export function defaultStatusFor(t: GatewayErrorType): number {
   switch (t) {
     case 'authentication_error':

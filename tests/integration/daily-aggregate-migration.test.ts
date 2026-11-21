@@ -12,7 +12,7 @@ describe('daily aggregate migration', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'latedev-stats-'));
     const migrations = path.join(dir, 'migrations');
     fs.mkdirSync(migrations);
-    for (const file of fs.readdirSync(path.resolve(process.cwd(), 'migrations')).filter((f) => /^\d{4}_.+\.sql$/.test(f) && !f.startsWith('0011_'))) fs.copyFileSync(path.resolve(process.cwd(), 'migrations', file), path.join(migrations, file));
+    for (const file of fs.readdirSync(path.resolve(process.cwd(), 'migrations')).filter((f) => /^\d{4}_.+\.sql$/.test(f) && !f.startsWith('0011_') && !f.startsWith('0012_'))) fs.copyFileSync(path.resolve(process.cwd(), 'migrations', file), path.join(migrations, file));
     const db = new Database(path.join(dir, 'test.db'));
     try {
       runMigrations(db, logger, migrations);
@@ -26,6 +26,9 @@ describe('daily aggregate migration', () => {
       fs.copyFileSync(path.resolve(process.cwd(), 'migrations/0011_daily_aggregate_stats.sql'), path.join(migrations, '0011_daily_aggregate_stats.sql'));
       runMigrations(db, logger, migrations);
       expect((db.prepare('SELECT MAX(version) AS v FROM schema_migrations').get() as { v: number }).v).toBe(11);
+      fs.copyFileSync(path.resolve(process.cwd(), 'migrations/0012_combo_slow_response_fallback.sql'), path.join(migrations, '0012_combo_slow_response_fallback.sql'));
+      runMigrations(db, logger, migrations);
+      expect((db.prepare('SELECT MAX(version) AS v FROM schema_migrations').get() as { v: number }).v).toBe(12);
       expect(db.prepare('SELECT * FROM daily_model_stats').all()).toMatchObject([{ day: '2026-01-02', model_id: 'm', requests: 1, successful_requests: 1, failed_requests: 0, input_tokens: 3, output_tokens: 4, fallback_requests: 1, latency_success_sum_ms: 100, latency_success_count: 1, ttft_sum_ms: 20, ttft_count: 1 }]);
       expect(db.prepare('SELECT * FROM daily_provider_stats ORDER BY provider_id').all()).toMatchObject([{ day: '2026-01-02', provider_id: 'p1', attempts: 1, failed_attempts: 1 }, { day: '2026-01-02', provider_id: 'p2', attempts: 1, successful_attempts: 1 }]);
       expect(db.prepare('SELECT * FROM daily_api_key_stats').all()).toHaveLength(1);

@@ -2,7 +2,7 @@
 
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { eq, sql } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import { getDb, schema } from '../../db/index';
 import { requireAdminAuth } from '../../auth/middleware';
 import { recordAudit } from '../../db/repositories/audit';
@@ -11,6 +11,7 @@ import { GatewayError } from '../../errors';
 import type { GatewayContext, GatewayRequest } from '../../gateway/runner';
 import type { CanonicalRequest } from '../../routing/capabilities';
 import { circuitBlocks } from '../../routing/circuit';
+import { listComboSlowStates } from '../../routing/combo-slow-fallback';
 
 const MemberSpec = z.object({ modelId: z.string(), position: z.number().int().min(0), enabled: z.boolean().default(true) });
 
@@ -28,9 +29,13 @@ const ComboCreate = z.object({
   fallbackOnConnection: z.boolean().optional(),
   fallbackOnConnectTimeout: z.boolean().optional(),
   fallbackOnFirstTokenTimeout: z.boolean().optional(),
+  fallbackOnTotalTimeout: z.boolean().optional(),
   fallbackOn408: z.boolean().optional(),
   fallbackOn429: z.boolean().optional(),
   fallbackOn5xx: z.boolean().optional(),
+  slowResponseFallbackEnabled: z.boolean().optional(),
+  slowResponseThresholdSeconds: z.number().int().min(1).max(600).optional(),
+  slowResponseMaxCount: z.number().int().min(1).max(20).optional(),
   members: z.array(MemberSpec).min(1).max(16),
 });
 
@@ -144,14 +149,18 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
     const allMembers = db.select().from(schema.comboMembers).all();
     const models = db.select().from(schema.models).all();
     const modelMap = new Map(models.map((m) => [m.id, m]));
-      const providerMap = new Map(db.select().from(schema.providers).all().map((p) => [p.id, p]));
+    const providerMap = new Map(db.select().from(schema.providers).all().map((p) => [p.id, p]));
     return {
       combos: combos.map((c) => {
         const members = allMembers.filter((m) => m.comboId === c.id);
-          const statuses = members.map((m) => memberStatus(modelMap.get(m.modelId), providerMap.get(modelMap.get(m.modelId)?.providerId ?? ''), m.enabled));
-          const readyCount = statuses.filter((status) => status.state === 'ready').length;
-          const reasons = [...new Set(statuses.filter((status) => status.state === 'unavailable').map((status) => status.reason))];
-          const comboModels = members.map((m) => modelMap.get(m.modelId)).filter((m): m is typeof models[number] => Boolean(m));
+        const statuses = members.map((m) => memberStatus(modelMap.get(m.modelId), providerMap.get(modelMap.get(m.modelId)?.providerId ?? ''), m.enabled));
+        const readyCount = statuses.filter((status) => status.state === 'ready').length;
+        const reasons = [...new Set(statuses.filter((status) => status.state === 'unavailable').map((status) => status.reason))];
+        const comboModels = members.map((m) => modelMap.get(m.modelId)).filter((m): m is typeof models[number] => Boolean(m));
+        const slowStates = listComboSlowStates(c.id);
+        const now = Date.now();
+        const slowCooldownCount = slowStates.filter((state) => state.cooldownUntilMs !== null && state.cooldownUntilMs > now).length;
+        const slowProbeCount = slowStates.filter((state) => state.probeLeaseUntilMs !== null && state.probeLeaseUntilMs > now).length;
         return {
           id: c.id,
           name: c.name,
@@ -161,6 +170,8 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
           enabled: c.enabled,
           memberCount: members.length,
           healthyMemberCount: readyCount,
+          slowCooldownCount,
+          slowProbeCount,
           status: !c.enabled ? 'disabled' : readyCount > 0 ? 'ready' : 'unavailable',
           unavailableReasons: reasons,
           capabilityWarnings: capabilityWarnings(comboModels),
@@ -182,6 +193,7 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
     const modelMap = new Map(models.map((m) => [m.id, m]));
     const providers = db.select().from(schema.providers).all();
     const providerMap = new Map(providers.map((p) => [p.id, p]));
+    const slowStateMap = new Map(listComboSlowStates(id).map((state) => [state.modelId, state]));
      const comboModels = members.map((m) => modelMap.get(m.modelId));
      return {
       combo: {
@@ -201,6 +213,7 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
            circuitOpen: circuitBlocks(modelMap.get(m.modelId)?.providerId ?? '', providerMap.get(modelMap.get(m.modelId)?.providerId ?? '')?.cbCooldownSeconds ?? 0),
            capabilities: modelMap.get(m.modelId) ? modelCapabilities(modelMap.get(m.modelId)!) : {},
            status: memberStatus(modelMap.get(m.modelId), providerMap.get(modelMap.get(m.modelId)?.providerId ?? ''), m.enabled),
+          slowState: slowStateMap.get(m.modelId) ?? null,
         })),
          capabilityWarnings: capabilityWarnings(comboModels.filter((m): m is typeof models[number] => Boolean(m))),
       },
@@ -295,9 +308,13 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
         fallbackOnConnection: body.fallbackOnConnection ?? true,
         fallbackOnConnectTimeout: body.fallbackOnConnectTimeout ?? true,
         fallbackOnFirstTokenTimeout: body.fallbackOnFirstTokenTimeout ?? true,
+        fallbackOnTotalTimeout: body.fallbackOnTotalTimeout ?? true,
         fallbackOn408: body.fallbackOn408 ?? true,
         fallbackOn429: body.fallbackOn429 ?? true,
         fallbackOn5xx: body.fallbackOn5xx ?? true,
+        slowResponseFallbackEnabled: body.slowResponseFallbackEnabled ?? true,
+        slowResponseThresholdSeconds: body.slowResponseThresholdSeconds ?? 60,
+        slowResponseMaxCount: body.slowResponseMaxCount ?? 3,
         configVersion: 1,
       }).run();
       for (const m of body.members) {
@@ -333,19 +350,64 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
     if (body.fallbackOnConnection !== undefined) update.fallbackOnConnection = body.fallbackOnConnection;
     if (body.fallbackOnConnectTimeout !== undefined) update.fallbackOnConnectTimeout = body.fallbackOnConnectTimeout;
     if (body.fallbackOnFirstTokenTimeout !== undefined) update.fallbackOnFirstTokenTimeout = body.fallbackOnFirstTokenTimeout;
+    if (body.fallbackOnTotalTimeout !== undefined) update.fallbackOnTotalTimeout = body.fallbackOnTotalTimeout;
     if (body.fallbackOn408 !== undefined) update.fallbackOn408 = body.fallbackOn408;
     if (body.fallbackOn429 !== undefined) update.fallbackOn429 = body.fallbackOn429;
     if (body.fallbackOn5xx !== undefined) update.fallbackOn5xx = body.fallbackOn5xx;
+    if (body.slowResponseFallbackEnabled !== undefined) update.slowResponseFallbackEnabled = body.slowResponseFallbackEnabled;
+    if (body.slowResponseThresholdSeconds !== undefined) update.slowResponseThresholdSeconds = body.slowResponseThresholdSeconds;
+    if (body.slowResponseMaxCount !== undefined) update.slowResponseMaxCount = body.slowResponseMaxCount;
+    const slowSettingsChanged = (body.slowResponseFallbackEnabled !== undefined && body.slowResponseFallbackEnabled !== c.slowResponseFallbackEnabled)
+      || (body.slowResponseThresholdSeconds !== undefined && body.slowResponseThresholdSeconds !== c.slowResponseThresholdSeconds)
+      || (body.slowResponseMaxCount !== undefined && body.slowResponseMaxCount !== c.slowResponseMaxCount);
+    let membersChanged = false;
+    let currentMembers: Array<typeof schema.comboMembers.$inferSelect> = [];
     if (body.members) {
       assertMembersUsable(db, body.members);
-      // Replace members inside one transaction: the delete-then-insert used to
-      // leave the combo memberless (and so unroutable) if any insert failed.
+      currentMembers = db.select().from(schema.comboMembers).where(eq(schema.comboMembers.comboId, body.id)).all()
+        .sort((a, b) => a.position - b.position);
+      const requestedMembers = [...body.members].sort((a, b) => a.position - b.position);
+      membersChanged = currentMembers.length !== requestedMembers.length
+        || currentMembers.some((member, index) => {
+          const requested = requestedMembers[index];
+          return !requested || member.modelId !== requested.modelId || member.position !== requested.position || member.enabled !== requested.enabled;
+        });
+    }
+    // Slow-state generation changes only when the slow-response policy changes.
+    // Member removals cascade their own state; retained members keep an in-flight probe lease.
+    if (slowSettingsChanged) update.slowResponseGeneration = c.slowResponseGeneration + 1;
+
+    if (membersChanged && body.members) {
+      // Diff members transactionally. Retained member rows keep their slow history;
+      // deleting a member cascades only that member's persisted state.
       db.transaction((tx) => {
         tx.update(schema.combos).set(update).where(eq(schema.combos.id, body.id)).run();
-        tx.delete(schema.comboMembers).where(eq(schema.comboMembers.comboId, body.id)).run();
-        for (const m of body.members!) {
-          tx.insert(schema.comboMembers).values({ id: uuid(), comboId: body.id, modelId: m.modelId, position: m.position, enabled: m.enabled ?? true }).run();
+        const requestedById = new Map(body.members!.map((member) => [member.modelId, member]));
+        for (const current of currentMembers) {
+          if (!requestedById.has(current.modelId)) {
+            tx.delete(schema.comboMembers).where(and(
+              eq(schema.comboMembers.comboId, body.id),
+              eq(schema.comboMembers.modelId, current.modelId),
+            )).run();
+          }
         }
+        for (const m of body.members!) {
+          const current = currentMembers.find((member) => member.modelId === m.modelId);
+          if (current) {
+            tx.update(schema.comboMembers).set({ position: m.position, enabled: m.enabled ?? true })
+              .where(eq(schema.comboMembers.id, current.id)).run();
+          } else {
+            tx.insert(schema.comboMembers).values({ id: uuid(), comboId: body.id, modelId: m.modelId, position: m.position, enabled: m.enabled ?? true }).run();
+          }
+        }
+        if (slowSettingsChanged) {
+          tx.delete(schema.comboMemberSlowStates).where(eq(schema.comboMemberSlowStates.comboId, body.id)).run();
+        }
+      });
+    } else if (slowSettingsChanged) {
+      db.transaction((tx) => {
+        tx.update(schema.combos).set(update).where(eq(schema.combos.id, body.id)).run();
+        tx.delete(schema.comboMemberSlowStates).where(eq(schema.comboMemberSlowStates.comboId, body.id)).run();
       });
     } else {
       db.update(schema.combos).set(update).where(eq(schema.combos.id, body.id)).run();
