@@ -34,6 +34,7 @@ interface ComboTestResult {
 type ComboSettings = { maxTotalAttempts: number; fallbackOnConnection: boolean; fallbackOnConnectTimeout: boolean; fallbackOnFirstTokenTimeout: boolean; fallbackOnTotalTimeout: boolean; fallbackOn408: boolean; fallbackOn429: boolean; fallbackOn5xx: boolean; slowResponseFallbackEnabled: boolean; slowResponseThresholdSeconds: number; slowResponseMaxCount: number };
 const defaultComboSettings: ComboSettings = { maxTotalAttempts: 3, fallbackOnConnection: true, fallbackOnConnectTimeout: true, fallbackOnFirstTokenTimeout: true, fallbackOnTotalTimeout: true, fallbackOn408: true, fallbackOn429: true, fallbackOn5xx: true, slowResponseFallbackEnabled: true, slowResponseThresholdSeconds: 60, slowResponseMaxCount: 3 };
 const reasonLabels: Record<string, string> = { member_disabled: 'member disabled', model_missing: 'model missing', provider_disabled: 'provider disabled', provider_down: 'provider down', model_disabled: 'model disabled', upstream_unavailable: 'upstream unavailable', circuit_open: 'circuit open', chat_capability_unavailable: 'chat capability unavailable', slow_response_cooldown: 'slow-response cooldown', slow_response_probe_active: 'recovery probe already running', slow_response_timeout: 'slow response' };
+const compareAlphabetically = (a: string, b: string) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
 
 // Priority is the array order: index 0 is tried first.
 const reindex = (members: MemberForm[]) => members.map((m, i) => ({ ...m, position: i }));
@@ -49,6 +50,7 @@ export function Combos() {
   const [testingId, setTestingId] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<ComboTestResult | null>(null);
   const [editSlowStates, setEditSlowStates] = useState<SlowStateView[]>([]);
+  const [comboSearch, setComboSearch] = useState('');
   const [form, setForm] = useState({ name: '', slug: '', enabled: true, ...defaultComboSettings, members: [] as MemberForm[] });
   const [editForm, setEditForm] = useState({ name: '', slug: '', enabled: true, ...defaultComboSettings, members: [] as typeof form.members });
   const [deleting, setDeleting] = useState<Combo | null>(null);
@@ -62,6 +64,14 @@ export function Combos() {
     setModels(m.models);
   };
   useEffect(() => { void reload(); }, []);
+
+  const visibleCombos = combos
+    .filter((combo) => {
+      const query = comboSearch.trim().toLowerCase();
+      return !query || [combo.name, combo.slug, combo.publicModelId].some((value) => value.toLowerCase().includes(query));
+    })
+    .sort((a, b) => compareAlphabetically(a.name || a.publicModelId, b.name || b.publicModelId)
+      || compareAlphabetically(a.publicModelId, b.publicModelId));
 
   const testCombo = async (combo: Combo) => {
     setTestingId(combo.id);
@@ -181,17 +191,22 @@ export function Combos() {
         </Dialog>
       } />
       <Card>
-        <CardHeader><CardTitle className="text-base">All combos</CardTitle><CardDescription>{combos.length} total</CardDescription></CardHeader>
+        <CardHeader><CardTitle className="text-base">All combos</CardTitle><CardDescription>{visibleCombos.length} of {combos.length} combos · sorted alphabetically</CardDescription></CardHeader>
         <CardContent>
+          <div className="mb-4 relative">
+            <Search className="absolute left-3 top-2.5 h-4 w-4 text-muted-foreground" />
+            <Input className="pl-9 pr-9" placeholder="Search by combo name or model ID…" value={comboSearch} onChange={(e) => setComboSearch(e.target.value)} />
+            {comboSearch && <Button type="button" size="icon" variant="ghost" className="absolute right-1 top-0.5 h-8 w-8" onClick={() => setComboSearch('')} aria-label="Clear combo search"><X className="h-4 w-4" /></Button>}
+          </div>
           <Table>
             <TableHeader>
-               <TableRow><TableHead>Public ID</TableHead><TableHead>Members</TableHead><TableHead>Status</TableHead><TableHead>Enabled</TableHead><TableHead /></TableRow>
+               <TableRow><TableHead>Combo</TableHead><TableHead>Members</TableHead><TableHead>Status</TableHead><TableHead>Enabled</TableHead><TableHead /></TableRow>
             </TableHeader>
             <TableBody>
-              {combos.length === 0 && <TableRow><TableCell colSpan={5} className="text-center text-muted-foreground">No combos yet.</TableCell></TableRow>}
-              {combos.map((c) => (
+              {visibleCombos.length === 0 && <TableRow><TableCell colSpan={5} className="py-8 text-center text-muted-foreground">{combos.length === 0 ? 'No combos yet. Create a combo to combine physical models.' : 'No combos match your search.'}</TableCell></TableRow>}
+              {visibleCombos.map((c) => (
                 <TableRow key={c.id}>
-                  <TableCell className="font-mono text-xs">{c.publicModelId}</TableCell>
+                  <TableCell><div className="font-medium">{c.name}</div><div className="mt-0.5 font-mono text-xs text-muted-foreground">{c.publicModelId}</div></TableCell>
                   <TableCell>{c.memberCount}</TableCell>
                   <TableCell><Badge variant={c.status === 'ready' ? 'success' : c.status === 'disabled' ? 'secondary' : 'destructive'}>{c.healthyMemberCount}/{c.memberCount} healthy</Badge>{c.slowCooldownCount > 0 && <div className="text-xs text-amber-600">{c.slowCooldownCount} in slow cooldown</div>}{c.slowProbeCount > 0 && <div className="text-xs text-muted-foreground">{c.slowProbeCount} recovery probe running</div>}{c.capabilityWarnings.length > 0 && <div className="text-xs text-amber-600">Capability metadata differs</div>}{c.status === 'unavailable' && c.unavailableReasons.length > 0 && <div className="text-xs text-muted-foreground">{c.unavailableReasons.map((reason) => reasonLabels[reason] ?? reason).join(', ')}</div>}</TableCell>
                   <TableCell>{c.enabled ? 'Yes' : 'No'}</TableCell>

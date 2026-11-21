@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.21.0] - 2026-11-21
+
+### Added
+
+- Group physical models by provider with expandable sections, alphabetic sorting, and provider-aware search.
+- Add alphabetic combo sorting and search by name, slug, or public model ID.
+- Redesign alias management with searchable filters, destination editing, enable/disable controls, copy actions, and confirmed deletion.
+
+### Fixed
+
+- Validate alias updates against existing aliases and model/combo IDs, and reject missing destinations before saving.
+
 ## [1.20.6] - 2026-11-21
 
 ### Fixed

@@ -11,7 +11,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '.
 import { Checkbox } from '../../components/ui/checkbox';
 import { api, fetchWithCsrf } from '../../lib/api';
 import { toast } from 'sonner';
-import { Download, Trash2, FlaskConical, Loader2, Search, X, SlidersHorizontal } from 'lucide-react';
+import { ChevronDown, Download, Trash2, FlaskConical, Loader2, Search, X, SlidersHorizontal } from 'lucide-react';
 
 // A capability the admin can declare. Anything left off stays "unknown",
 // which the router treats as allowed rather than unsupported.
@@ -58,10 +58,13 @@ type TestState =
   | { phase: 'error'; model: string; error: string }
   | { phase: 'done'; model: string; result: TestResult; text: string };
 
+const compareAlphabetically = (a: string, b: string) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
+
 export function Models() {
   const [rows, setRows] = useState<ModelRow[]>([]);
   const [providers, setProviders] = useState<Provider[]>([]);
   const [providerFilter, setProviderFilter] = useState<string>('all');
+  const [expandedProviders, setExpandedProviders] = useState<Set<string>>(new Set());
   const [fetchOpen, setFetchOpen] = useState(false);
   const [fetchProviderId, setFetchProviderId] = useState<string>('');
   const [discovered, setDiscovered] = useState<Discovered[]>([]);
@@ -111,9 +114,46 @@ export function Models() {
 
   const filtered = rows.filter((m) => {
     if (providerFilter !== 'all' && m.providerId !== providerFilter) return false;
-    if (search && !m.publicModelId.toLowerCase().includes(search.toLowerCase())) return false;
+    if (search) {
+      const query = search.toLowerCase();
+      const provider = providers.find((p) => p.id === m.providerId);
+      if (![m.publicModelId, m.upstreamModelId, m.displayName, provider?.name, m.providerSlug]
+        .some((value) => value?.toLowerCase().includes(query))) return false;
+    }
     return true;
   });
+
+  const sortedProviders = [...providers].sort((a, b) => compareAlphabetically(a.name || a.slug, b.name || b.slug));
+  const providerById = new Map(providers.map((provider) => [provider.id, provider]));
+  const providerGroups = Array.from(filtered.reduce((groups, model) => {
+    const provider = providerById.get(model.providerId);
+    const id = model.providerId || model.providerSlug;
+    const group = groups.get(id) ?? {
+      id,
+      name: provider?.name || model.providerSlug || 'Unknown provider',
+      slug: provider?.slug || model.providerSlug,
+      type: provider?.type || model.providerType,
+      models: [],
+    };
+    group.models.push(model);
+    groups.set(id, group);
+    return groups;
+  }, new Map<string, { id: string; name: string; slug: string; type: string; models: ModelRow[] }>()).values())
+    .map((group) => ({
+      ...group,
+      models: group.models.sort((a, b) => compareAlphabetically(a.displayName || a.upstreamModelId, b.displayName || b.upstreamModelId)
+        || compareAlphabetically(a.upstreamModelId, b.upstreamModelId)),
+    }))
+    .sort((a, b) => compareAlphabetically(a.name, b.name));
+
+  const toggleProvider = (providerId: string) => {
+    setExpandedProviders((current) => {
+      const next = new Set(current);
+      if (next.has(providerId)) next.delete(providerId);
+      else next.add(providerId);
+      return next;
+    });
+  };
 
   // Discovered models filtered by search
   const filteredDiscovered = discovered.filter((d) => {
@@ -322,57 +362,93 @@ export function Models() {
       <Card>
         <CardHeader>
           <CardTitle className="text-base">All models</CardTitle>
-          <CardDescription>{rows.length} total</CardDescription>
+          <CardDescription>{filtered.length} of {rows.length} models across {providerGroups.length} providers · alphabetically sorted</CardDescription>
         </CardHeader>
         <CardContent>
-          <div className="mb-3 flex items-center gap-2">
+          <div className="mb-4 flex flex-wrap items-center gap-2">
             <Select value={providerFilter} onValueChange={setProviderFilter}>
               <SelectTrigger className="w-56"><SelectValue /></SelectTrigger>
               <SelectContent>
                 <SelectItem value="all">All providers</SelectItem>
-                {providers.map((p) => <SelectItem key={p.id} value={p.id}>{p.name}</SelectItem>)}
+                {sortedProviders.map((p) => <SelectItem key={p.id} value={p.id}>{p.name}</SelectItem>)}
               </SelectContent>
             </Select>
-            <Input className="max-w-xs" placeholder="Search public ID" value={search} onChange={(e) => setSearch(e.target.value)} />
+            <div className="relative min-w-56 flex-1">
+              <Search className="absolute left-3 top-2.5 h-4 w-4 text-muted-foreground" />
+              <Input className="pl-9 pr-9" placeholder="Search model name or ID…" value={search} onChange={(e) => setSearch(e.target.value)} />
+              {search && <Button type="button" size="icon" variant="ghost" className="absolute right-1 top-0.5 h-8 w-8" onClick={() => setSearch('')} aria-label="Clear model search"><X className="h-4 w-4" /></Button>}
+            </div>
+            {!search && providerGroups.length > 0 && <div className="ml-auto flex items-center gap-1">
+              <Button size="sm" variant="ghost" onClick={() => setExpandedProviders(new Set(providerGroups.map((group) => group.id)))}>Expand all</Button>
+              <Button size="sm" variant="ghost" onClick={() => setExpandedProviders(new Set())}>Collapse all</Button>
+            </div>}
           </div>
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Public ID</TableHead><TableHead>Provider</TableHead><TableHead>Upstream ID</TableHead>
-                <TableHead>Capabilities</TableHead><TableHead>Available</TableHead><TableHead>Enabled</TableHead><TableHead />
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {filtered.length === 0 && <TableRow><TableCell colSpan={7} className="text-center text-muted-foreground">No models</TableCell></TableRow>}
-              {filtered.map((m) => (
-                <TableRow key={m.id}>
-                  <TableCell className="font-mono text-xs">{m.publicModelId}</TableCell>
-                  <TableCell>{m.providerSlug}</TableCell>
-                  <TableCell className="text-xs text-muted-foreground">{m.upstreamModelId}</TableCell>
-                  <TableCell className="space-x-1">
-                    {Object.entries(m.capabilities).filter(([, v]) => v === true).slice(0, 4).map(([k]) => (
-                      <Badge key={k} variant="outline" className="mr-1">{k}</Badge>
-                    ))}
-                  </TableCell>
-                  <TableCell>{m.upstreamAvailable ? <Badge variant="success">up</Badge> : <Badge variant="destructive">down</Badge>}</TableCell>
-                  <TableCell>{m.enabled ? 'Yes' : 'No'}</TableCell>
-                  <TableCell className="text-right">
-                    <div className="flex items-center justify-end gap-1">
-                      <Button size="sm" variant="outline" onClick={() => openCaps(m)} disabled={testingId !== null}>
-                        <SlidersHorizontal className="h-3.5 w-3.5" /> Capabilities
-                      </Button>
-                      <Button size="sm" variant="outline" onClick={() => void testModel(m.id)} disabled={testingId !== null}>
-                        {testingId === m.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <FlaskConical className="h-3.5 w-3.5" />} Test
-                      </Button>
-                      <Button size="sm" variant="destructive" onClick={() => setDeleteTarget(m)} disabled={testingId !== null}>
-                        <Trash2 className="h-3.5 w-3.5" /> Xoá
-                      </Button>
-                    </div>
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
+          <div className="space-y-3">
+            {providerGroups.length === 0 && <div className="rounded-lg border border-dashed px-4 py-10 text-center">
+              <p className="font-medium">No models found</p>
+              <p className="mt-1 text-sm text-muted-foreground">Try another search or provider filter, or fetch models from a provider.</p>
+            </div>}
+            {providerGroups.map((group) => {
+              const expanded = search.trim().length > 0 || expandedProviders.has(group.id);
+              const availableCount = group.models.filter((model) => model.upstreamAvailable).length;
+              const enabledCount = group.models.filter((model) => model.enabled).length;
+              const contentId = `provider-models-${group.id}`;
+              return <Card key={group.id} className="overflow-hidden shadow-none">
+                <CardHeader className="p-0">
+                  <Button type="button" variant="ghost" aria-expanded={expanded} aria-controls={contentId} onClick={() => toggleProvider(group.id)} className="h-auto w-full justify-between rounded-none px-4 py-3 text-left hover:bg-muted/50">
+                    <span className="flex min-w-0 items-center gap-3">
+                      <ChevronDown className={`h-4 w-4 shrink-0 text-muted-foreground transition-transform ${expanded ? 'rotate-180' : ''}`} />
+                      <span className="min-w-0">
+                        <span className="flex flex-wrap items-center gap-2">
+                          <span className="truncate font-semibold text-foreground">{group.name}</span>
+                          <Badge variant="outline">{group.type}</Badge>
+                        </span>
+                        <span className="mt-1 block truncate text-xs font-normal text-muted-foreground">{group.slug}</span>
+                      </span>
+                    </span>
+                    <span className="flex shrink-0 items-center gap-2">
+                      <Badge variant="secondary">{group.models.length} models</Badge>
+                      <Badge variant={availableCount > 0 ? 'success' : 'destructive'}>{availableCount} available</Badge>
+                      <span className="hidden text-xs text-muted-foreground sm:inline">{enabledCount} enabled</span>
+                    </span>
+                  </Button>
+                </CardHeader>
+                {expanded && <CardContent id={contentId} className="border-t p-0">
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead>Model</TableHead><TableHead>Public ID</TableHead><TableHead>Capabilities</TableHead>
+                        <TableHead>Available</TableHead><TableHead>Enabled</TableHead><TableHead className="text-right">Actions</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {group.models.map((m) => (
+                        <TableRow key={m.id}>
+                          <TableCell className="font-medium">{m.displayName || m.upstreamModelId}<div className="mt-0.5 text-xs font-normal text-muted-foreground">{m.upstreamModelId}</div></TableCell>
+                          <TableCell className="font-mono text-xs">{m.publicModelId}</TableCell>
+                          <TableCell>
+                            <div className="flex flex-wrap gap-1">
+                              {Object.entries(m.capabilities).filter(([, value]) => value === true).slice(0, 4).map(([key]) => <Badge key={key} variant="outline">{key}</Badge>)}
+                              {Object.values(m.capabilities).every((value) => value !== true) && <span className="text-xs text-muted-foreground">—</span>}
+                            </div>
+                          </TableCell>
+                          <TableCell>{m.upstreamAvailable ? <Badge variant="success">Available</Badge> : <Badge variant="destructive">Unavailable</Badge>}</TableCell>
+                          <TableCell>{m.enabled ? <Badge variant="success">Enabled</Badge> : <Badge variant="secondary">Disabled</Badge>}</TableCell>
+                          <TableCell className="text-right">
+                            <div className="flex items-center justify-end gap-1">
+                              <Button size="sm" variant="outline" onClick={() => openCaps(m)} disabled={testingId !== null}><SlidersHorizontal className="h-3.5 w-3.5" /> Capabilities</Button>
+                              <Button size="sm" variant="outline" onClick={() => void testModel(m.id)} disabled={testingId !== null}>{testingId === m.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <FlaskConical className="h-3.5 w-3.5" />} Test</Button>
+                              <Button size="sm" variant="destructive" onClick={() => setDeleteTarget(m)} disabled={testingId !== null}><Trash2 className="h-3.5 w-3.5" /> Delete</Button>
+                            </div>
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </CardContent>}
+              </Card>;
+            })}
+          </div>
         </CardContent>
       </Card>
 

@@ -18,6 +18,30 @@ const AliasCreate = z.object({
 
 const AliasUpdate = AliasCreate.partial().extend({ id: z.string() });
 
+type AliasTargetKind = z.infer<typeof AliasCreate>['targetKind'];
+
+function assertAliasAvailable(db: ReturnType<typeof getDb>, alias: string, excludeId?: string): void {
+  const existingAlias = db.select().from(schema.modelAliases).where(eq(schema.modelAliases.alias, alias)).get();
+  if (existingAlias && existingAlias.id !== excludeId) {
+    throw new GatewayError('invalid_request_error', 'Alias already in use', { status: 400 });
+  }
+
+  const existingModel = db.select().from(schema.models).where(eq(schema.models.publicModelId, alias)).get();
+  const existingCombo = db.select().from(schema.combos).where(eq(schema.combos.publicModelId, alias)).get();
+  if (existingModel || existingCombo) {
+    throw new GatewayError('invalid_request_error', 'Alias shadows an existing model or combo ID', { status: 400 });
+  }
+}
+
+function assertAliasTargetExists(db: ReturnType<typeof getDb>, targetKind: AliasTargetKind, targetId: string): void {
+  const target = targetKind === 'model'
+    ? db.select().from(schema.models).where(eq(schema.models.id, targetId)).get()
+    : db.select().from(schema.combos).where(eq(schema.combos.id, targetId)).get();
+  if (!target) {
+    throw new GatewayError('invalid_request_error', targetKind === 'model' ? 'Target model not found' : 'Target combo not found', { status: 400 });
+  }
+}
+
 export async function registerAliasRoutes(app: FastifyInstance): Promise<void> {
   app.addHook('preHandler', requireAdminAuth);
 
@@ -44,23 +68,8 @@ export async function registerAliasRoutes(app: FastifyInstance): Promise<void> {
     const body = AliasCreate.parse(req.body);
     const db = getDb();
     const alias = slugify(body.alias);
-    // Verify target exists and is enabled
-    if (body.targetKind === 'model') {
-      const m = db.select().from(schema.models).where(eq(schema.models.id, body.targetId)).get();
-      if (!m) throw new GatewayError('invalid_request_error', 'Target model not found', { status: 400 });
-      if (db.select().from(schema.modelAliases).where(eq(schema.modelAliases.alias, alias)).get()) {
-        throw new GatewayError('invalid_request_error', 'Alias already in use', { status: 400 });
-      }
-      if (db.select().from(schema.models).where(eq(schema.models.publicModelId, alias)).get()) {
-        throw new GatewayError('invalid_request_error', 'Alias shadows a physical model ID', { status: 400 });
-      }
-    } else {
-      const c = db.select().from(schema.combos).where(eq(schema.combos.id, body.targetId)).get();
-      if (!c) throw new GatewayError('invalid_request_error', 'Target combo not found', { status: 400 });
-      if (db.select().from(schema.modelAliases).where(eq(schema.modelAliases.alias, alias)).get()) {
-        throw new GatewayError('invalid_request_error', 'Alias already in use', { status: 400 });
-      }
-    }
+    assertAliasTargetExists(db, body.targetKind, body.targetId);
+    assertAliasAvailable(db, alias);
     const id = uuid();
     db.insert(schema.modelAliases).values({ id, alias, targetKind: body.targetKind, targetId: body.targetId, enabled: body.enabled ?? true }).run();
     recordAudit({ action: 'alias.create', success: true, targetType: 'alias', targetId: id, targetName: alias, ip: req.ip });
@@ -73,14 +82,21 @@ export async function registerAliasRoutes(app: FastifyInstance): Promise<void> {
     const a = db.select().from(schema.modelAliases).where(eq(schema.modelAliases.id, body.id)).get();
     if (!a) throw new GatewayError('invalid_request_error', 'Alias not found', { status: 404 });
     const update: Partial<typeof schema.modelAliases.$inferInsert> = { updatedAt: new Date().toISOString(), configVersion: a.configVersion + 1 };
-    if (body.alias) update.alias = slugify(body.alias);
-    if (body.targetKind) update.targetKind = body.targetKind;
-    if (body.targetId) update.targetId = body.targetId;
+    if (body.alias !== undefined || body.targetKind !== undefined || body.targetId !== undefined) {
+      const alias = body.alias !== undefined ? slugify(body.alias) : a.alias;
+      const targetKind = body.targetKind ?? a.targetKind;
+      const targetId = body.targetId ?? a.targetId;
+      assertAliasTargetExists(db, targetKind, targetId);
+      assertAliasAvailable(db, alias, a.id);
+      update.alias = alias;
+      update.targetKind = targetKind;
+      update.targetId = targetId;
+    }
     if (body.enabled !== undefined) update.enabled = body.enabled;
     db.update(schema.modelAliases).set(update).where(eq(schema.modelAliases.id, body.id)).run();
     const { invalidateCacheFor } = await import('../../caching/store');
     invalidateCacheFor('alias', body.id);
-    recordAudit({ action: 'alias.update', success: true, targetType: 'alias', targetId: body.id, targetName: a.alias, ip: req.ip });
+    recordAudit({ action: 'alias.update', success: true, targetType: 'alias', targetId: body.id, targetName: update.alias ?? a.alias, ip: req.ip });
     return { ok: true };
   });
 
