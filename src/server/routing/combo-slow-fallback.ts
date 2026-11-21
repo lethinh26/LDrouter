@@ -1,5 +1,5 @@
 import { and, eq } from 'drizzle-orm';
-import { getDb, getRawDb, schema } from '../db';
+import { getDb, getRawDb, schema } from '../db/index';
 
 export const COMBO_SLOW_FALLBACK_COOLDOWN_MS = 5 * 60 * 1000;
 export const COMBO_SLOW_FALLBACK_PROBE_LEASE_MS = 90 * 1000;

@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.20.6] - 2026-11-21
+
+### Fixed
+
+- Resolve the combo slow-response state module through the explicit `db/index` entry so compiled Node.js ESM runtimes can start correctly.
+- Retain Docker smoke-test containers until their logs are collected, preserving actionable startup diagnostics when the health check fails.
+
 ## [1.20.5] - 2026-11-21
 
 ### Added
