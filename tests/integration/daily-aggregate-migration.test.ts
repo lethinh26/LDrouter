@@ -12,7 +12,7 @@ describe('daily aggregate migration', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'latedev-stats-'));
     const migrations = path.join(dir, 'migrations');
     fs.mkdirSync(migrations);
-    for (const file of fs.readdirSync(path.resolve(process.cwd(), 'migrations')).filter((f) => /^\d{4}_.+\.sql$/.test(f) && !f.startsWith('0011_') && !f.startsWith('0012_'))) fs.copyFileSync(path.resolve(process.cwd(), 'migrations', file), path.join(migrations, file));
+    for (const file of fs.readdirSync(path.resolve(process.cwd(), 'migrations')).filter((f) => /^\d{4}_.+\.sql$/.test(f) && !f.startsWith('0011_') && !f.startsWith('0012_') && !f.startsWith('0013_'))) fs.copyFileSync(path.resolve(process.cwd(), 'migrations', file), path.join(migrations, file));
     const db = new Database(path.join(dir, 'test.db'));
     try {
       runMigrations(db, logger, migrations);
