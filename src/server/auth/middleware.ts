@@ -22,7 +22,10 @@ export async function requireAdminCsrf(req: FastifyRequest): Promise<void> {
   if (typeof token !== 'string' || !req.adminSessionId) throw new GatewayError('authentication_error', 'CSRF token required', { status: 403 });
   const row = getDb().select().from(schema.csrfTokens).where(sql`session_id = ${req.adminSessionId}`).get();
   const expected = row?.token;
-  if (!expected || new Date(row.expiresAt).getTime() < Date.now()) throw new GatewayError('authentication_error', 'Invalid CSRF token', { status: 403 });
+  const expiresAt = row ? new Date(row.expiresAt).getTime() : Number.NaN;
+  if (!expected || !Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+    throw new GatewayError('authentication_error', 'Invalid CSRF token', { status: 403 });
+  }
   const actualBytes = Buffer.from(token);
   const expectedBytes = Buffer.from(expected);
   if (actualBytes.length !== expectedBytes.length || !timingSafeEqual(actualBytes, expectedBytes)) throw new GatewayError('authentication_error', 'Invalid CSRF token', { status: 403 });
@@ -31,7 +34,8 @@ export async function requireAdminCsrf(req: FastifyRequest): Promise<void> {
 export function csrfTokenForSession(sessionId: string): string {
   const db = getDb();
   const row = db.select().from(schema.csrfTokens).where(sql`session_id = ${sessionId}`).get();
-  if (row && new Date(row.expiresAt).getTime() >= Date.now()) return row.token;
+  const existingExpiry = row ? new Date(row.expiresAt).getTime() : Number.NaN;
+  if (row && Number.isFinite(existingExpiry) && existingExpiry > Date.now()) return row.token;
 
   const token = crypto.randomBytes(32).toString('base64url');
   const expiresAt = csrfExpiry();
@@ -66,7 +70,8 @@ export async function requireAdminAuth(req: FastifyRequest, _reply: FastifyReply
     .where(sql`token_digest = ${digest}`)
     .get();
   if (!session) throw new GatewayError('authentication_error', 'Invalid session', { status: 401 });
-  if (new Date(session.expiresAt).getTime() < Date.now()) {
+  const expiresAt = new Date(session.expiresAt).getTime();
+  if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
     db.delete(schema.adminSessions).where(sql`id = ${session.id}`).run();
     throw new GatewayError('authentication_error', 'Session expired', { status: 401 });
   }

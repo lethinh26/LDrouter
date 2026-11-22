@@ -15,7 +15,8 @@ import { api, fetchWithCsrf } from '../../lib/api';
 import { uploadBackup, type UploadProgress } from '../../lib/backup-upload';
 import { toast } from 'sonner';
 import { CheckCircle2, Download, Loader2, Bell, Volume2 } from 'lucide-react';
-import { useNotificationPrefs, saveNotificationPrefs, loadNotificationPrefs } from '../../lib/notification-settings';
+import { useNotificationPrefs, useNotificationPrefsLoaded, saveNotificationPrefs, loadNotificationPrefs } from '../../lib/notification-settings';
+import { previewRequestSound, unlockRequestAudio, cancelPendingAudioDisposal, type RequestSoundKind } from '../../lib/sound-feedback';
 import { Textarea } from '../../components/ui/textarea';
 
 interface Settings {
@@ -279,12 +280,12 @@ export function Settings() {
                 </Select>
               </div>
               <div className="space-y-1">
-                <Label>Retention (days)</Label>
-                <Input type="number" min={1} max={3650} value={s.retentionDays} onChange={(e) => update({ retentionDays: Number(e.target.value) })} />
+                <Label htmlFor="settings-retention-days">Retention (days)</Label>
+                <Input id="settings-retention-days" type="number" min={1} max={3650} value={s.retentionDays} onChange={(e) => update({ retentionDays: Number(e.target.value) })} />
               </div>
               <div className="space-y-1">
-                <Label>Database size limit (MB)</Label>
-                <Input type="number" min={64} value={s.dbSizeLimitMb} onChange={(e) => update({ dbSizeLimitMb: Number(e.target.value) })} />
+                <Label htmlFor="settings-db-size-limit-mb">Database size limit (MB)</Label>
+                <Input id="settings-db-size-limit-mb" type="number" min={64} value={s.dbSizeLimitMb} onChange={(e) => update({ dbSizeLimitMb: Number(e.target.value) })} />
               </div>
               <div className="flex flex-wrap items-center gap-2 pt-2">
                 {cleanupPreview && (
@@ -369,8 +370,8 @@ export function Settings() {
             <CardHeader><CardTitle className="text-base">Security</CardTitle><CardDescription>Change password, 2FA, and trusted proxy configuration</CardDescription></CardHeader>
             <CardContent className="space-y-4">
               <div className="space-y-2">
-                <Label>Trusted proxy hops</Label>
-                <Input type="number" min={0} max={8} value={s.trustProxyHops} onChange={(e) => update({ trustProxyHops: Number(e.target.value) })} />
+                <Label htmlFor="settings-trust-proxy-hops">Trusted proxy hops</Label>
+                <Input id="settings-trust-proxy-hops" type="number" min={0} max={8} value={s.trustProxyHops} onChange={(e) => update({ trustProxyHops: Number(e.target.value) })} />
                 <p className="text-xs text-muted-foreground">0 = never trust X-Forwarded-For (direct exposure). 1+ only when behind a single trusted reverse proxy.</p>
               </div>
 
@@ -553,12 +554,12 @@ export function Settings() {
               <div><span className="text-muted-foreground">Encryption:</span> {sys?.masterKeyConfigured ? 'Configured' : 'Not configured'} (v{sys?.masterKeyVersion})</div>
               <div><span className="text-muted-foreground">Environment:</span> {sys?.environment}</div>
               <div className="flex items-center gap-2 pt-2">
-                <Switch checked={s.gatewayCacheEnabled} onCheckedChange={(v) => update({ gatewayCacheEnabled: v })} />
-                <Label>Gateway response cache (disabled by default)</Label>
+                <Switch id="settings-gateway-cache-enabled" aria-label="Gateway response cache" checked={s.gatewayCacheEnabled} onCheckedChange={(v) => update({ gatewayCacheEnabled: v })} />
+                <Label htmlFor="settings-gateway-cache-enabled">Gateway response cache (disabled by default)</Label>
               </div>
               <div className="grid grid-cols-2 gap-2">
-                <div><Label>Cache TTL (s)</Label><Input type="number" min={1} value={s.gatewayCacheDefaultTtlSeconds} onChange={(e) => update({ gatewayCacheDefaultTtlSeconds: Number(e.target.value) })} /></div>
-                <div><Label>Cache max size (MB)</Label><Input type="number" min={1} value={s.gatewayCacheMaxSizeMb} onChange={(e) => update({ gatewayCacheMaxSizeMb: Number(e.target.value) })} /></div>
+                <div><Label htmlFor="settings-cache-ttl-seconds">Cache TTL (s)</Label><Input id="settings-cache-ttl-seconds" type="number" min={1} value={s.gatewayCacheDefaultTtlSeconds} onChange={(e) => update({ gatewayCacheDefaultTtlSeconds: Number(e.target.value) })} /></div>
+                <div><Label htmlFor="settings-cache-max-size-mb">Cache max size (MB)</Label><Input id="settings-cache-max-size-mb" type="number" min={1} value={s.gatewayCacheMaxSizeMb} onChange={(e) => update({ gatewayCacheMaxSizeMb: Number(e.target.value) })} /></div>
               </div>
               <Button variant="outline" onClick={async () => { const r = await api.post<{ deleted: number }>('/api/admin/settings/cache/clear'); toast.success(`Cleared ${r.deleted} entries`); }}>Clear gateway cache</Button>
             </CardContent>
@@ -638,19 +639,58 @@ export function Settings() {
 // Notification toggles card — lives in System tab. Shared prefs with useRequestNotifications.
 function NotificationsCard() {
   const prefs = useNotificationPrefs();
+  const prefsLoaded = useNotificationPrefsLoaded();
+  const [saving, setSaving] = useState<'enabled' | 'sound' | null>(null);
+
+  const updatePreference = async (key: 'enabled' | 'sound', value: boolean) => {
+    // Start AudioContext.resume() directly in the enabling gesture; a later
+    // asynchronous unlock would lose the browser's transient user activation.
+    const unlockOnEnable = key === 'sound' && value;
+    if (unlockOnEnable) cancelPendingAudioDisposal();
+    const unlockPromise = unlockOnEnable ? unlockRequestAudio() : null;
+    setSaving(key);
+    try {
+      // Start the optimistic store update/PATCH immediately too, so request
+      // events arriving while AudioContext.resume() or the network is pending
+      // observe the user's new preference instead of silently consuming sound.
+      const savePromise = saveNotificationPrefs({ [key]: value });
+      const [audioUnlocked] = await Promise.all([unlockPromise ?? Promise.resolve(true), savePromise]);
+      if (unlockOnEnable && !audioUnlocked) {
+        toast.warning('Preference saved, but browser audio is still blocked. Interact with the page or try a preview to enable it.');
+      } else {
+        toast.success('Notification preference saved');
+      }
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Could not save notification preference');
+    } finally {
+      setSaving(null);
+    }
+  };
+
+  const preview = async (kind: RequestSoundKind) => {
+    if (!await previewRequestSound(kind, { disposeAfter: !prefsLoaded || !prefs.sound })) {
+      toast.error('This browser could not enable audio. Try interacting with the page again.');
+    }
+  };
+
   return (
     <Card className="mt-4">
       <CardHeader><CardTitle className="text-base flex items-center gap-2"><Bell className="h-4 w-4" /> Notifications</CardTitle></CardHeader>
       <CardContent className="space-y-3 text-sm">
         <div className="flex items-center justify-between">
           <span>Show request notifications</span>
-          <Switch checked={prefs.enabled} onCheckedChange={(v) => void saveNotificationPrefs({ enabled: v })} />
+          <Switch aria-label="Show request notifications" disabled={saving !== null || !prefsLoaded} checked={prefs.enabled} onCheckedChange={(v) => void updatePreference('enabled', v)} />
         </div>
         <div className="flex items-center justify-between">
           <span className="flex items-center gap-1"><Volume2 className="h-3 w-3" /> Play notification sound</span>
-          <Switch checked={prefs.sound} onCheckedChange={(v) => void saveNotificationPrefs({ sound: v })} />
+          <Switch aria-label="Play notification sound" disabled={saving !== null || !prefsLoaded} checked={prefs.sound} onCheckedChange={(v) => void updatePreference('sound', v)} />
         </div>
-        <p className="text-xs text-muted-foreground mt-2">Notifications are disabled while muted. Changes apply immediately.</p>
+        <div className="flex flex-wrap gap-2 pt-1">
+          <Button size="sm" variant="outline" disabled={!prefsLoaded || saving !== null} onClick={() => void preview('success')}>Test success</Button>
+          <Button size="sm" variant="outline" disabled={!prefsLoaded || saving !== null} onClick={() => void preview('http-error')}>Test failure</Button>
+        </div>
+        {!prefsLoaded && <p role="status" className="text-xs text-muted-foreground">Loading saved notification preferences. Controls are disabled until they are available.</p>}
+        <p className="mt-2 text-xs text-muted-foreground">Cards and sound work independently. Browser audio is enabled after your first interaction. Canceled requests remain silent.</p>
       </CardContent>
     </Card>
   );

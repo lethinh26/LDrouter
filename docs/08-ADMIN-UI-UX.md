@@ -43,6 +43,10 @@ Desktop:
 
 Mobile: sidebar becomes shadcn Sheet/drawer.
 
+The mobile drawer reuses the desktop navigation destinations and closes after
+navigation. The top bar shows the current page title and exposes a searchable
+command palette through the search action or `Ctrl+K` / `Cmd+K`.
+
 ## Dashboard
 
 Show operational summary, not duplicated analytics overload:
@@ -53,12 +57,16 @@ Show operational summary, not duplicated analytics overload:
 - active providers / unhealthy providers
 - recent failures
 - provider health compact list
+- loading skeletons, recoverable error/retry, and first-run/empty states
+- direct links from recent failures to the matching request
 
 Quick actions:
 
 - Add Provider
+- Browse Models
 - Create Combo
 - Create API Key
+- Browse Requests
 
 ## Providers page
 
@@ -207,6 +215,53 @@ Failed request must have an obvious expandable **Error** section.
 Attempts use an accordion/timeline so fallback is understandable visually.
 
 Do not display raw secret-bearing headers.
+
+The explorer supports search by model substring, exact request ID, or exact
+client IP; status presets (success, failed, HTTP 4xx, HTTP 5xx); protocol and
+streaming filters; and URL-backed filters/pagination for shareable deep links.
+The current API sorts server pages newest-first. Alternate sorting is a
+client-side view of the loaded page only and does not change server pagination.
+Loading, transport error/retry, no-history, and no-match states must be distinct.
+
+### Request notifications and sound
+
+- Request notification cards and sound are independent persisted preferences.
+- Cards are live SSE notifications for final persisted request outcomes; they
+  are dismissible and auto-dismiss after five seconds.
+- Generate short success, HTTP failure, upstream-unavailable/network, and
+  timeout tones locally with Web Audio. Do not load external audio assets.
+- Unlock audio only after a user gesture; keep visual notifications usable if
+  the browser blocks audio. Settings provides success/failure preview actions.
+- If a final request arrives while that explicit unlock is pending, retain at
+  most four live outcomes and flush them after a successful resume. The queue
+  keeps the newest outcomes, respects the 450 ms live-sound interval, and is
+  cleared after a failed unlock or context disposal. Events before any user
+  gesture are not queued.
+- Disabling sound is optimistic in the UI, but an existing AudioContext is
+  disposed only after the preference PATCH succeeds. A failed PATCH restores
+  the enabled preference without losing the previously unlocked context.
+- A manual preview waits for any queued live tones to finish, then plays
+  independently of the live notification throttle.
+- HTTP 499/client disconnects are neutral and silent. Intermediate upstream
+  attempts, request-start events, polling, and prefetch must not trigger sound.
+- Deduplicate by request ID, bound in-memory IDs, throttle closely spaced tones,
+  and release AudioContext/listeners/timers when no longer needed.
+- Persisted completion events use a strictly increasing `createdAt` timestamp
+  (also copied to `completedAt`) so live delivery has a durable completion order
+  even when multiple requests finish within one clock millisecond. This is an
+  ordering guarantee, not a database schema or response-shape change.
+- SSE reconnects carry both `createdAt` and request ID. Replay is keyset-paginated
+  and capped per connection; when more history remains, the server closes before
+  flushing newer live completions so the next connection resumes without skipping
+  older rows. The numeric `since` form remains accepted for initial clients.
+- `request_started` is a transient, best-effort route pulse, not a persisted
+  completion. Its bounded queue may discard the oldest pulse during prolonged
+  replay/backpressure; the final persisted `request` event remains replayable.
+
+- If the bounded live-completion queue overflows during replay, close that stream
+  rather than sending an incomplete backlog. The reconnect cursor recovers every
+  persisted completion; a deterministic integration gate verifies overflow
+  after the first replay page and checks for duplicates or omissions.
 
 ## Statistics page
 

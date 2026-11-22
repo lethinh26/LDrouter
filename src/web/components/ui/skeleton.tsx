@@ -1,5 +1,10 @@
-// Page header used on every admin page.
+// Shared skeleton placeholder and page header used across the admin UI.
+import * as React from 'react';
 import { cn } from '../../lib/utils';
+
+export function Skeleton({ className, ...props }: React.HTMLAttributes<HTMLDivElement>) {
+  return <div aria-hidden="true" className={cn('animate-pulse rounded-md bg-muted motion-reduce:animate-none', className)} {...props} />;
+}
 
 export function PageHeader({ title, description, actions, className }: { title: string; description?: string; actions?: React.ReactNode; className?: string }) {
   return (

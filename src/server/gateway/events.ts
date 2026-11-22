@@ -40,3 +40,11 @@ export function offRequestLogged(cb: (requestId: string) => void): void {
 export function offRequestStarted(cb: (data: { requestId: string; providerId: string | null; modelId: string; requestedModel: string; ttftMs: number }) => void): void {
   bus.off(REQUEST_STARTED, cb);
 }
+
+/** Listener diagnostics used by integration tests for long-lived SSE cleanup. */
+export function getRequestEventListenerCounts(): { requestLogged: number; requestStarted: number } {
+  return {
+    requestLogged: bus.listenerCount(REQUEST_LOGGED),
+    requestStarted: bus.listenerCount(REQUEST_STARTED),
+  };
+}
