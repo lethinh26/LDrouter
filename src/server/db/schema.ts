@@ -113,7 +113,7 @@ export const providers = sqliteTable(
     customHeadersEncrypted: text('custom_headers_encrypted'),
     customHeadersNonce: text('custom_headers_nonce'),
     enabled: integer('enabled', { mode: 'boolean' }).notNull().notNull().default(true),
-    connectTimeoutMs: integer('connect_timeout_ms').notNull().default(15000),
+    connectTimeoutMs: integer('connect_timeout_ms').notNull().default(60000),
     firstTokenTimeoutMs: integer('first_token_timeout_ms').notNull().default(60000),
     streamIdleTimeoutMs: integer('stream_idle_timeout_ms').notNull().default(300000),
     totalTimeoutMs: integer('total_timeout_ms').notNull().default(600000),

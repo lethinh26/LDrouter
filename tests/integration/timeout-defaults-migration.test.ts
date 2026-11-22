@@ -1,4 +1,4 @@
-// Migration 0009: the raised timeout defaults reach existing rows, without clobbering
+// Migration 0009/0013: the raised timeout defaults reach existing rows, without clobbering
 // an admin-tuned value. The client-side watchdog behaviour is covered in upstream-timeouts.test.ts.
 import fs from 'node:fs';
 import os from 'node:os';
@@ -27,11 +27,11 @@ describe('timeout default migration', () => {
       db.prepare(insert).run('old', 'Old', 'old', 'openai', 'https://x.test', 10000, 30000, 60000, 180000);
       db.prepare(insert).run('tuned', 'Tuned', 'tuned', 'openai', 'https://x.test', 5000, 45000, 900000, 1500000);
 
-      // Re-apply 0009 the way an upgrade from a pre-0009 instance would.
-      db.prepare('DELETE FROM schema_migrations WHERE version = 9').run();
+      // Re-apply 0009 and 0013 the way an upgrade from a pre-0009 instance would.
+      db.prepare('DELETE FROM schema_migrations WHERE version IN (9, 13)').run();
       runMigrations(db, logger, migrationsDir);
 
-      expect(timeouts(db, 'old')).toEqual({ c: 15000, f: 60000, i: 300000, t: 600000 });
+      expect(timeouts(db, 'old')).toEqual({ c: 60000, f: 60000, i: 300000, t: 600000 });
       expect(timeouts(db, 'tuned')).toEqual({ c: 5000, f: 45000, i: 900000, t: 1500000 });
     } finally {
       db.close();

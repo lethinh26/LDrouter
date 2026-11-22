@@ -4,7 +4,7 @@
 -- `timeout_error` rows all ending at exactly 180s with a first token already delivered, i.e.
 -- the total timer firing while the stream was still alive.
 --
--- New defaults: connect 15s, first token 60s, stream idle 300s, total 600s.
+-- New defaults: connect 60s, first token 60s, stream idle 300s, total 600s.
 -- Only rows still on the previous defaults are touched, so an admin-tuned value survives.
 -- The column DEFAULT in `providers` stays at the old values (SQLite cannot ALTER a default
 -- without a full table rebuild) — the application always writes the timeout columns

@@ -104,7 +104,7 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
       customHeadersEncrypted: headersEnc?.ciphertext ?? null,
       customHeadersNonce: headersEnc?.nonce ?? null,
       enabled: body.enabled ?? true,
-      connectTimeoutMs: body.connectTimeoutMs ?? 15000,
+      connectTimeoutMs: body.connectTimeoutMs ?? 60000,
       firstTokenTimeoutMs: body.firstTokenTimeoutMs ?? 60000,
       streamIdleTimeoutMs: body.streamIdleTimeoutMs ?? 300000,
       totalTimeoutMs: body.totalTimeoutMs ?? 600000,
