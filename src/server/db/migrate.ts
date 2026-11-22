@@ -169,7 +169,7 @@ function buildInitialSchemaSql(): string {
       custom_headers_encrypted TEXT,
       custom_headers_nonce TEXT,
       enabled INTEGER NOT NULL DEFAULT 1,
-      connect_timeout_ms INTEGER NOT NULL DEFAULT 15000,
+      connect_timeout_ms INTEGER NOT NULL DEFAULT 60000,
       first_token_timeout_ms INTEGER NOT NULL DEFAULT 60000,
       stream_idle_timeout_ms INTEGER NOT NULL DEFAULT 300000,
       total_timeout_ms INTEGER NOT NULL DEFAULT 600000,
