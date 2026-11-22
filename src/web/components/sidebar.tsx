@@ -1,31 +1,43 @@
 // Sidebar with primary navigation.
 import { useEffect, useState } from 'react';
 import { NavLink } from 'react-router-dom';
-import { Activity, Boxes, Code2, Cog, FileText, Gauge, KeyRound, Layers, Network, ScrollText, ShieldCheck } from 'lucide-react';
+import { ShieldCheck } from 'lucide-react';
 import { cn } from '../lib/utils';
+import { adminNavigationItems } from '../lib/admin-navigation';
+import { api } from '../lib/api';
 
-const items = [
-  { to: '/', label: 'Dashboard', icon: Gauge, end: true },
-  { to: '/providers', label: 'Providers', icon: Network },
-  { to: '/models', label: 'Models', icon: Boxes },
-  { to: '/combos', label: 'Combos', icon: Layers },
-  { to: '/aliases', label: 'Aliases', icon: Code2 },
-  { to: '/api-keys', label: 'API Keys', icon: KeyRound },
-  { to: '/requests', label: 'Requests', icon: Activity },
-  { to: '/statistics', label: 'Statistics', icon: FileText },
-  { to: '/audit', label: 'Audit Logs', icon: ScrollText },
-  { to: '/settings', label: 'Settings', icon: Cog },
-];
+export function SidebarLinks({ onNavigate }: { onNavigate?: () => void }) {
+  return (
+    <>
+      {adminNavigationItems.map((it) => (
+        <NavLink
+          key={it.to}
+          to={it.to}
+          end={it.end}
+          onClick={onNavigate}
+          className={({ isActive }) =>
+            cn(
+              'flex items-center gap-2 rounded-md px-3 py-2 text-sm transition-colors',
+              isActive ? 'bg-primary/10 text-primary font-medium' : 'text-muted-foreground hover:bg-accent hover:text-accent-foreground'
+            )
+          }
+        >
+          <it.icon className="h-4 w-4" />
+          {it.label}
+        </NavLink>
+      ))}
+    </>
+  );
+}
 
 export function Sidebar() {
   const [version, setVersion] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    fetch('/api/admin/settings/system', { credentials: 'include' })
-      .then((r) => (r.ok ? r.json() : null))
-      .then((d: { appVersion?: string } | null) => {
-        if (!cancelled && d?.appVersion) setVersion(d.appVersion);
+    api.get<{ appVersion?: string }>('/api/admin/settings/system')
+      .then((data) => {
+        if (!cancelled && data.appVersion) setVersion(data.appVersion);
       })
       .catch(() => { /* keep placeholder */ });
     return () => { cancelled = true; };
@@ -37,23 +49,8 @@ export function Sidebar() {
         <img src="/logo.png" alt="LateDev Router" className="h-7 w-7 object-contain" />
         <div className="font-semibold tracking-tight">LateDev Router</div>
       </div>
-      <nav className="flex-1 space-y-0.5 p-2">
-        {items.map((it) => (
-          <NavLink
-            key={it.to}
-            to={it.to}
-            end={it.end}
-            className={({ isActive }) =>
-              cn(
-                'flex items-center gap-2 rounded-md px-3 py-2 text-sm transition-colors',
-                isActive ? 'bg-primary/10 text-primary font-medium' : 'text-muted-foreground hover:bg-accent hover:text-accent-foreground'
-              )
-            }
-          >
-            <it.icon className="h-4 w-4" />
-            {it.label}
-          </NavLink>
-        ))}
+      <nav aria-label="Primary navigation" className="flex-1 space-y-0.5 p-2">
+        <SidebarLinks />
       </nav>
       <div className="border-t p-3 text-xs text-muted-foreground flex items-center gap-2">
         <ShieldCheck className="h-3.5 w-3.5 text-primary" /> {version ? `v${version}` : 'v…'}

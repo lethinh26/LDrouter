@@ -1,14 +1,17 @@
-// Live request notifications: subscribes to the SSE stream and play a sound per event.
+// Live request notifications: subscribes to final persisted request events over SSE.
 // Each notification auto-dismisses after 5s and can be closed manually.
-// Both the cards and the sound are gated by Settings prefs (see notification-settings.ts).
+// Card visibility and sound are independently gated by Settings prefs.
 import { useEffect, useRef, useState } from 'react';
-import { useNotificationPrefs, loadNotificationPrefs } from './notification-settings';
+import { useNotificationPrefs, getNotificationPrefsSnapshot, loadNotificationPrefs } from './notification-settings';
+import { classifyRequestSound, cancelPendingAudioDisposal, disposeRequestAudio, installAudioUnlockListeners, playRequestSound } from './sound-feedback';
+import { subscribeToRequestStream } from './request-stream';
 
 export interface RequestNotificationItem {
   id: string;
   requestedModel: string;
   success: boolean;
   errorType: string | null;
+  httpStatus: number;
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens: number;
@@ -20,43 +23,70 @@ export interface RequestNotificationItem {
 
 const DISMISS_MS = 5000; // auto-dismiss after 5 seconds
 const MAX_ITEMS = 8; // cap visible cards at once
-const RECONNECT_MS = 3000;
-
-// Single shared Audio object; lazy-created so the first notification also primes the autoplay gesture.
-let sound: HTMLAudioElement | null = null;
-function playSound(): void {
-  try {
-    if (!sound) sound = new Audio('/notification.mp3');
-    sound.currentTime = 0;
-    void sound.play().catch(() => { /* autoplay blocked until first user interaction — ignore */ });
-  } catch { /* never let audio break notifications */ }
-}
+const MAX_SEEN_IDS = 2000;
+const PREF_RETRY_MS = 5000;
 
 export function useRequestNotifications(): { items: RequestNotificationItem[]; dismiss: (id: string) => void } {
   const [items, setItems] = useState<RequestNotificationItem[]>([]);
-  const esRef = useRef<EventSource | null>(null);
+  const [prefsReady, setPrefsReady] = useState(false);
   const timersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
-  const lastSeenRef = useRef<number>(Date.now()); // epoch ms, sent as `since` on (re)connect
-  // IDs already surfaced as a notification. The SSE stream replays the last 20
+  // Keep the initial replay boundary stable for this notification session;
+  // subscribeToRequestStream advances its own cursor after each handled event.
+  const sessionStartedAtRef = useRef<number | null>(null);
+  // IDs already surfaced as a notification. The SSE stream replays recent
   // rows after `since` on every (re)connect, so without this set a reconnect
   // would re-show replayed rows as "new" — the ghost notification (card +
   // sound) with no actual new request behind it.
   const seenIdsRef = useRef<Set<string>>(new Set());
   const prefs = useNotificationPrefs();
-  const soundRef = useRef(prefs.sound); // tracks each render so the SSE effect stays stable
-  soundRef.current = prefs.sound;
 
-  // Fetch prefs from the server once (defaults apply before it resolves).
-  useEffect(() => { void loadNotificationPrefs(); }, []);
+  // Do not open the SSE stream or unlock audio until the persisted preferences
+  // have loaded; otherwise a stored opt-out could briefly play a sound on boot.
+  useEffect(() => {
+    let active = true;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    const load = async (): Promise<void> => {
+      const ready = await loadNotificationPrefs();
+      if (!active) return;
+      if (ready) setPrefsReady(true);
+      else retryTimer = setTimeout(() => { retryTimer = null; void load(); }, PREF_RETRY_MS);
+    };
+    void load();
+    return () => {
+      active = false;
+      if (retryTimer !== null) clearTimeout(retryTimer);
+    };
+  }, []);
 
-  const enabled = prefs.enabled;
+  const shouldListen = prefsReady && (prefs.enabled || prefs.sound);
+
+  useEffect(() => () => disposeRequestAudio(), []);
+
+  // Enabling sound cancels preview-only disposal. Disabling is finalized by
+  // saveNotificationPrefs only after its PATCH succeeds, so rollback preserves
+  // the currently unlocked context.
+  useEffect(() => {
+    if (prefsReady && prefs.sound) cancelPendingAudioDisposal();
+  }, [prefsReady, prefs.sound]);
 
   useEffect(() => {
-    if (!enabled) {
-      // Preferences off: tear down any stream and clear cards.
-      esRef.current?.close();
-      esRef.current = null;
-      const timers = timersRef.current;
+    if (!prefsReady || !prefs.sound) return;
+    return installAudioUnlockListeners();
+  }, [prefsReady, prefs.sound]);
+
+  useEffect(() => {
+    const timers = timersRef.current;
+    if (!prefs.enabled) {
+      for (const t of timers.values()) clearTimeout(t);
+      timers.clear();
+      setItems([]);
+    }
+
+    if (!shouldListen) {
+      // Both notification channels are off: tear down the stream and clear cards.
+      // A later opt-in starts a new notification session; do not replay events
+      // that completed while the user had explicitly disabled both channels.
+      sessionStartedAtRef.current = null;
       for (const t of timers.values()) clearTimeout(t);
       timers.clear();
       setItems([]);
@@ -64,52 +94,52 @@ export function useRequestNotifications(): { items: RequestNotificationItem[]; d
     }
 
     let cancelled = false;
-    const timers = timersRef.current; // stable across the effect lifetime
+    // Start the replay window only after persisted preferences allow this
+    // channel to listen, so boot-time requests are not surfaced retroactively.
+    sessionStartedAtRef.current ??= Date.now();
+    const unsubscribe = subscribeToRequestStream<RequestNotificationItem>(sessionStartedAtRef.current, (data) => {
+      if (cancelled || !data || typeof data.id !== 'string' || !data.id) return;
+      if (seenIdsRef.current.has(data.id)) return; // replay duplicate — already alerted
+      seenIdsRef.current.add(data.id);
+      if (seenIdsRef.current.size > MAX_SEEN_IDS) {
+        const oldestId = seenIdsRef.current.values().next().value;
+        if (oldestId) seenIdsRef.current.delete(oldestId);
+      }
 
-    const connect = (): void => {
-      if (cancelled) return;
-      const es = new EventSource(`/api/admin/requests/stream?since=${lastSeenRef.current}`);
-      esRef.current = es;
+      const currentPrefs = getNotificationPrefsSnapshot();
+      if (currentPrefs.enabled) {
+        setItems((prev) => {
+          if (prev.some((i) => i.id === data.id)) return prev;
+          return [data, ...prev].slice(0, MAX_ITEMS);
+        });
+        if (timers.size >= MAX_ITEMS) {
+          const oldestId = timers.keys().next().value;
+          if (oldestId) {
+            const oldestTimer = timers.get(oldestId);
+            if (oldestTimer) clearTimeout(oldestTimer);
+            timers.delete(oldestId);
+          }
+        }
+        const t = setTimeout(() => {
+          setItems((prev) => prev.filter((i) => i.id !== data.id));
+          timers.delete(data.id);
+        }, DISMISS_MS);
+        timers.set(data.id, t);
+      }
 
-      es.addEventListener('request', (ev) => {
-        if (cancelled) return;
-        try {
-          const data = JSON.parse((ev as MessageEvent).data as string) as RequestNotificationItem;
-          const seenMs = new Date(data.createdAt).getTime();
-          if (Number.isFinite(seenMs)) lastSeenRef.current = Math.max(lastSeenRef.current, seenMs);
-          if (seenIdsRef.current.has(data.id)) return; // replay duplicate — already alerted
-          seenIdsRef.current.add(data.id);
-          setItems((prev) => {
-            if (prev.some((i) => i.id === data.id)) return prev;
-            return [data, ...prev].slice(0, MAX_ITEMS);
-          });
-          const t = setTimeout(() => {
-            setItems((prev) => prev.filter((i) => i.id !== data.id));
-            timers.delete(data.id);
-          }, DISMISS_MS);
-          timers.set(data.id, t);
-          if (soundRef.current) playSound();
-        } catch { /* malformed event — ignore */ }
-      });
-
-      es.onerror = () => {
-        es.close();
-        esRef.current = null;
-        // Reconnect after a short delay with the last seen timestamp so nothing is lost.
-        if (!cancelled) setTimeout(connect, RECONNECT_MS);
-      };
-    };
-
-    connect();
+      if (currentPrefs.sound) {
+        const soundKind = classifyRequestSound(data);
+        if (soundKind) playRequestSound(soundKind);
+      }
+    });
 
     return () => {
       cancelled = true;
-      esRef.current?.close();
-      esRef.current = null;
+      unsubscribe();
       for (const t of timers.values()) clearTimeout(t);
       timers.clear();
     };
-  }, [enabled]);
+  }, [prefs.enabled, shouldListen]);
 
   const dismiss = (id: string): void => {
     const t = timersRef.current.get(id);

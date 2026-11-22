@@ -1,14 +1,73 @@
 // Admin API: request logs + attempts (server-side paginated).
 
 import type { FastifyInstance } from 'fastify';
-import { and, desc, eq, gte, like, lte, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, gt, gte, like, lte, or, sql } from 'drizzle-orm';
 import { getDb, schema } from '../../db/index';
 import { requireAdminAuth } from '../../auth/middleware';
+import { isAdminIpAllowed } from '../../security/admin-ip-gate';
 import { redactJsonString } from '../../security/redact';
 import { onRequestLogged, offRequestLogged, onRequestStarted, offRequestStarted } from '../../gateway/events';
 import type { RequestLogSummary, AttemptLog } from '../../../shared/types';
 
 type RequestRow = typeof schema.requests.$inferSelect;
+const REQUEST_STREAM_REPLAY_PAGE_SIZE = 100;
+const REQUEST_STREAM_MAX_REPLAY_ROWS = 10_000;
+const REQUEST_STREAM_LIVE_REPLAY_DEDUPE_LIMIT = 1000;
+// Keep the production queue at 10k; a smaller test threshold exercises the
+// same overflow/replay path without inserting tens of thousands of rows.
+const REQUEST_STREAM_PENDING_LIVE_LIMIT = process.env.NODE_ENV === 'test' ? 100 : 10_000;
+const REQUEST_STREAM_AUTH_RECHECK_MS = 5_000;
+
+let requestStreamReplayTestGate: (() => Promise<void>) | null = null;
+
+/** @internal Deterministic replay coordination for the SSE overflow regression test. */
+export function setRequestStreamReplayTestGateForTests(gate: (() => Promise<void>) | null): void {
+  if (process.env.NODE_ENV === 'test') requestStreamReplayTestGate = gate;
+}
+
+interface RequestStreamCursor {
+  createdAt: string;
+  id: string;
+}
+
+function parseRequestStreamCursor(query: Record<string, unknown>): RequestStreamCursor {
+  const fallback = new Date(Date.now() - 5_000).toISOString();
+  const rawSince = query.since;
+  let createdAt = fallback;
+  let validSince = false;
+
+  if (typeof rawSince === 'string' && /^\d{1,16}$/.test(rawSince)) {
+    const timestamp = Number(rawSince);
+    const date = new Date(timestamp);
+    if (Number.isSafeInteger(timestamp) && timestamp >= 0 && Number.isFinite(date.getTime())) {
+      createdAt = date.toISOString();
+      validSince = true;
+    }
+  } else if (
+    typeof rawSince === 'string'
+    && rawSince.length <= 64
+    && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/.test(rawSince)
+    && Number.isFinite(Date.parse(rawSince))
+  ) {
+    // Preserve the exact database timestamp text; Date.parse would truncate
+    // sub-millisecond precision if a future schema ever introduces it.
+    createdAt = rawSince;
+    validSince = true;
+  }
+
+  const rawId = query.afterId;
+  const id = validSince && typeof rawId === 'string' && rawId.length > 0 && rawId.length <= 512
+    ? rawId
+    : '';
+  return { createdAt, id };
+}
+
+function afterRequestCursor(cursor: RequestStreamCursor) {
+  return or(
+    gt(schema.requests.createdAt, cursor.createdAt),
+    and(eq(schema.requests.createdAt, cursor.createdAt), gt(schema.requests.id, cursor.id)),
+  );
+}
 
 interface SummaryMaps {
   keyMap: Map<string, { name: string }>;
@@ -127,10 +186,9 @@ export async function registerRequestRoutes(app: FastifyInstance): Promise<void>
 
   // SSE stream of request completions (client reconnects with `since` of its last seen event).
   app.get('/api/admin/requests/stream', async (req, reply) => {
+    const sessionId = req.adminSessionId;
     reply.hijack();
-    const q = req.query as Record<string, string | undefined>;
-    const parsedSince = Number(q.since);
-    const since = Number.isFinite(parsedSince) && parsedSince > 0 ? parsedSince : Date.now() - 5_000;
+    const cursor = parseRequestStreamCursor(req.query as Record<string, unknown>);
     const response = reply.raw;
 
     // Standard SSE headers
@@ -142,73 +200,247 @@ export async function registerRequestRoutes(app: FastifyInstance): Promise<void>
     response.flushHeaders(); // ensure the client sees the stream immediately, even with an empty replay
 
     let closed = false;
-    const send = (data: string): void => {
+    const closeStream = (destroy = false): void => {
       if (closed) return;
+      closed = true;
       try {
-        response.write(data);
+        if (destroy) response.destroy();
+        else if (!response.destroyed && !response.writableEnded) response.end();
       } catch {
-        closed = true;
+        response.destroy();
+      }
+    };
+    const send = (data: string): boolean => {
+      if (closed) return false;
+      try {
+        return response.write(data);
+      } catch {
+        closeStream(true);
+        return false;
       }
     };
 
     const db = getDb();
     const maps = loadSummaryMaps();
+    let replaying = true;
+    const pendingLiveRequestIds = new Set<string>();
+    const pendingStartedEvents = new Map<string, { requestId: string; providerId: string; modelId: string; requestedModel: string; ttftMs: number }>();
+    let flushingLive = false;
 
-    // History replay: up to 20 most recent rows after `since` (oldest first so the client renders in order).
-    const historyRows = db
-      .select()
-      .from(schema.requests)
-      .where(gte(schema.requests.createdAt, new Date(since).toISOString()))
-      .orderBy(desc(schema.requests.createdAt))
-      .limit(20)
-      .all()
-      .reverse();
-    const replayIds = new Set<string>();
-    for (const r of historyRows) {
-      replayIds.add(r.id);
-      send(`event: request\ndata: ${JSON.stringify(toSummary(r, maps))}\n\n`);
-    }
+    const waitForDrain = async (): Promise<void> => {
+      if (closed || !response.writableNeedDrain) return;
+      await new Promise<void>((resolve) => {
+        const finish = (): void => {
+          response.off('drain', finish);
+          response.off('close', finish);
+          response.off('finish', finish);
+          response.off('error', finish);
+          resolve();
+        };
+        response.once('drain', finish);
+        response.once('close', finish);
+        response.once('finish', finish);
+        response.once('error', finish);
+      });
+    };
+
+    const startedFrame = (data: { requestId: string; providerId: string; modelId: string; requestedModel: string; ttftMs: number }): string => {
+      const provider = maps.providerMap.get(data.providerId);
+      return `event: request_started\ndata: ${JSON.stringify({ ...data, providerName: provider?.name ?? null, createdAt: new Date().toISOString() })}\n\n`;
+    };
+
+    const flushPendingLive = async (): Promise<void> => {
+      if (flushingLive || replaying || closed) return;
+      flushingLive = true;
+      try {
+        while (!closed && (pendingStartedEvents.size > 0 || pendingLiveRequestIds.size > 0)) {
+          await waitForDrain();
+          if (closed) break;
+
+          const started = [...pendingStartedEvents.values()];
+          pendingStartedEvents.clear();
+          for (let index = 0; index < started.length; index += 1) {
+            if (closed) break;
+            if (!send(startedFrame(started[index]!)) && response.writableNeedDrain) {
+              for (const pending of started.slice(index + 1)) pendingStartedEvents.set(pending.requestId, pending);
+              break;
+            }
+          }
+          if (closed) break;
+          if (response.writableNeedDrain) continue;
+
+          const requestIds = [...pendingLiveRequestIds];
+          pendingLiveRequestIds.clear();
+          for (let index = 0; index < requestIds.length; index += 1) {
+            if (closed) break;
+            const requestId = requestIds[index]!;
+            const row = db.select().from(schema.requests).where(eq(schema.requests.id, requestId)).get();
+            if (!row) continue;
+            if (!send(`event: request\ndata: ${JSON.stringify(toSummary(row, maps))}\n\n`) && response.writableNeedDrain) {
+              for (const pendingId of requestIds.slice(index + 1)) pendingLiveRequestIds.add(pendingId);
+              break;
+            }
+          }
+        }
+      } finally {
+        flushingLive = false;
+        if (!replaying && !closed && (pendingStartedEvents.size > 0 || pendingLiveRequestIds.size > 0)) {
+          void flushPendingLive();
+        }
+      }
+    };
+
+    // History replay is emitted after the live listeners are registered.
 
     // Live: subscribe to the event bus.
     const handleRequestLogged = (requestId: string): void => {
-      if (closed || replayIds.has(requestId)) return;
+      if (closed) return;
+      if (replaying || flushingLive || response.writableNeedDrain) {
+        pendingLiveRequestIds.add(requestId);
+        if (pendingLiveRequestIds.size > REQUEST_STREAM_PENDING_LIVE_LIMIT) {
+          // Final completions are durable. Close without advancing the client
+          // cursor; reconnect replay recovers every row not yet delivered.
+          closeStream();
+          return;
+        }
+        if (!replaying) void flushPendingLive();
+        return;
+      }
       const row = db.select().from(schema.requests).where(eq(schema.requests.id, requestId)).get();
-      if (!row) return;
-      send(`event: request\ndata: ${JSON.stringify(toSummary(row, maps))}\n\n`);
+      if (row) send(`event: request\ndata: ${JSON.stringify(toSummary(row, maps))}\n\n`);
     };
     onRequestLogged(handleRequestLogged);
 
-    // A request is being served (first token reached): live-only — not part of
-    // history replay. The monitoring dashboard uses this to light the route
-    // from TTFT until the completion (`request`) event arrives.
+    // A request is being served (first token reached): intentionally best-effort
+    // and live-only — it is not persisted or replayed. The monitoring dashboard
+    // uses it to light the route until the durable completion event arrives.
     const handleRequestStarted = (data: { requestId: string; providerId: string | null; modelId: string; requestedModel: string; ttftMs: number }): void => {
       if (closed || !data.providerId) return;
-      const provider = maps.providerMap.get(data.providerId);
-      send(`event: request_started\ndata: ${JSON.stringify({ requestId: data.requestId, providerId: data.providerId, providerName: provider?.name ?? null, modelId: data.modelId, requestedModel: data.requestedModel, ttftMs: data.ttftMs, createdAt: new Date().toISOString() })}\n\n`);
+      const started = { ...data, providerId: data.providerId };
+      if (replaying || flushingLive || response.writableNeedDrain) {
+        pendingStartedEvents.set(data.requestId, started);
+        if (pendingStartedEvents.size > REQUEST_STREAM_LIVE_REPLAY_DEDUPE_LIMIT) {
+          // Drop the oldest transient route pulse rather than growing memory;
+          // the final persisted completion remains durable and replayable.
+          const oldestId = pendingStartedEvents.keys().next().value;
+          if (oldestId) pendingStartedEvents.delete(oldestId);
+        }
+        if (!replaying) void flushPendingLive();
+        return;
+      }
+      send(startedFrame(started));
     };
     onRequestStarted(handleRequestStarted);
 
     // Keepalive ping every 25s.
-    const keepAlive = setInterval(() => send(': ping\n\n'), 25_000);
+    const keepAlive = setInterval(() => {
+      if (!response.writableNeedDrain) send(': ping\n\n');
+    }, 25_000);
     // Auto-close after 5 min; the client reconnects with its last seen timestamp.
     const autoClose = setTimeout(() => {
-      response.end();
-      response.destroy();
+      closeStream();
     }, 5 * 60_000);
+    const authRecheck = setInterval(() => {
+      if (closed) return;
+      try {
+        const session = sessionId
+          ? db.select({ expiresAt: schema.adminSessions.expiresAt }).from(schema.adminSessions).where(eq(schema.adminSessions.id, sessionId)).get()
+          : undefined;
+        const sessionValid = Boolean(session && new Date(session.expiresAt).getTime() >= Date.now());
+        if (sessionValid && isAdminIpAllowed(req)) return;
+      } catch {
+        // Fail closed if session or current access policy cannot be verified.
+      }
+      closeStream();
+    }, REQUEST_STREAM_AUTH_RECHECK_MS);
 
+    let cleaned = false;
     const cleanup = (): void => {
+      if (cleaned) return;
+      cleaned = true;
       closed = true;
       clearInterval(keepAlive);
+      clearInterval(authRecheck);
       clearTimeout(autoClose);
       offRequestLogged(handleRequestLogged);
       offRequestStarted(handleRequestStarted);
+      response.off('close', cleanup);
+      response.off('finish', cleanup);
+      response.off('error', cleanup);
+      pendingLiveRequestIds.clear();
+      pendingStartedEvents.clear();
     };
     // Listen on the *response*: req.raw (IncomingMessage) emits 'close' as soon as the
     // request message is consumed (immediately for a GET), which would tear down the
     // stream before any live event. reply.raw (ServerResponse) 'close' fires when the
     // response completes or the connection terminates — the canonical SSE signal.
     reply.raw.on('close', cleanup);
+    reply.raw.on('finish', cleanup);
     reply.raw.on('error', cleanup);
+
+    // Replay persisted completions in bounded keyset pages. The ID component
+    // continues through historical timestamp ties; newly persisted completion
+    // timestamps are strictly increasing, so live events cannot arrive behind
+    // an already-delivered completion cursor.
+    let firstPage = cursor.id.length === 0;
+    let lastCreatedAt = cursor.createdAt;
+    let lastId = cursor.id;
+    let replayedRows = 0;
+    while (!closed && replayedRows < REQUEST_STREAM_MAX_REPLAY_ROWS) {
+      const cursorCondition = firstPage
+        ? gte(schema.requests.createdAt, cursor.createdAt)
+        : afterRequestCursor({ createdAt: lastCreatedAt, id: lastId });
+      const page = db
+        .select()
+        .from(schema.requests)
+        .where(cursorCondition)
+        .orderBy(asc(schema.requests.createdAt), asc(schema.requests.id))
+        .limit(Math.min(REQUEST_STREAM_REPLAY_PAGE_SIZE, REQUEST_STREAM_MAX_REPLAY_ROWS - replayedRows))
+        .all();
+      if (page.length === 0) break;
+
+      firstPage = false;
+      for (const row of page) {
+        lastCreatedAt = row.createdAt;
+        lastId = row.id;
+        if (closed) break;
+        replayedRows += 1;
+        pendingLiveRequestIds.delete(row.id);
+        pendingStartedEvents.delete(row.id);
+        send('event: request\ndata: ' + JSON.stringify(toSummary(row, maps)) + '\n\n');
+      }
+
+      // Hold the stream after its first replay page only when the integration
+      // test explicitly installs a gate. This proves live completions overflow
+      // the bounded queue while historical replay is still in progress.
+      if (process.env.NODE_ENV === 'test' && replayedRows === REQUEST_STREAM_REPLAY_PAGE_SIZE) {
+        const gate = requestStreamReplayTestGate;
+        requestStreamReplayTestGate = null;
+        await gate?.();
+      }
+
+      await waitForDrain();
+      if (page.length < REQUEST_STREAM_REPLAY_PAGE_SIZE) break;
+      if (!closed) await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+
+    // If the bounded replay window has more rows, close before flushing queued
+    // live completions. A live row beyond the replay boundary must never move
+    // the reconnect cursor past older, not-yet-replayed history.
+    const hasMoreReplay = !closed && replayedRows >= REQUEST_STREAM_MAX_REPLAY_ROWS
+      ? Boolean(db.select({ id: schema.requests.id })
+        .from(schema.requests)
+        .where(afterRequestCursor({ createdAt: lastCreatedAt, id: lastId }))
+        .limit(1)
+        .get())
+      : false;
+    if (hasMoreReplay) {
+      closeStream();
+      return;
+    }
+
+    replaying = false;
+    await flushPendingLive();
   });
 
   app.get('/api/admin/requests/:id', async (req, reply) => {

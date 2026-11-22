@@ -39,9 +39,15 @@ export async function registerDashboardRoutes(app: FastifyInstance): Promise<voi
     const models = db.select().from(schema.models).all();
     const providers = db.select().from(schema.providers).all();
     const providerMap = new Map(providers.map((p) => [p.id, p]));
+    const attemptsByModel = new Map<string, typeof recentAttempts>();
+    for (const attempt of recentAttempts) {
+      const attempts = attemptsByModel.get(attempt.modelId) ?? [];
+      attempts.push(attempt);
+      attemptsByModel.set(attempt.modelId, attempts);
+    }
     const modelHealth = models.map((m) => {
       const provider = providerMap.get(m.providerId);
-      const attempts = recentAttempts.filter((a) => a.modelId === m.id);
+      const attempts = attemptsByModel.get(m.id) ?? [];
       const lastFailure = attempts.find((a) => !a.success);
       const circuitOpen = circuitBlocks(m.providerId, provider?.cbCooldownSeconds ?? 0);
       const state = !provider?.enabled ? 'disabled' : provider.healthState === 'down' ? 'provider_down' : provider.healthState === 'circuit_open' || circuitOpen ? 'circuit_open' : !m.enabled ? 'disabled' : !m.upstreamAvailable ? 'unavailable' : 'ready';

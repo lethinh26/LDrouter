@@ -4,6 +4,24 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.22.0] - 2026-11-22
+
+### Added
+
+- Add responsive mobile navigation and a searchable command palette with `Ctrl+K` / `Cmd+K` shortcuts.
+- Improve the dashboard with loading skeletons, retryable error and first-run states, operational quick links, and direct links to failed requests.
+- Upgrade Request Explorer with URL-backed model/request-ID/IP search, status/protocol/streaming filters, current-page sorting, live updates, and explicit loading/empty/error/detail states.
+- Add centralized Web Audio request feedback with distinct success, HTTP, upstream-unavailable, and timeout tones; independent notification/sound preferences and Settings previews.
+
+### Fixed
+
+- Keep notification preference loading retryable after a failed fetch and avoid opening the request SSE/audio channels before persisted preferences are loaded.
+- Defer audio-context disposal until a sound-disable preference PATCH succeeds; preserve the unlocked context on rollback and dispose a failed opt-in context.
+- Make request completion replay resumable across timestamp ties and the 10,000-row connection cap; assign strictly increasing completion timestamps without changing the database schema, and never flush newer live events past unreplayed history.
+- Fail closed for malformed persisted admin-session and CSRF expiries; restore focus after closing mobile navigation/command overlays and announce skeleton loading/no-result states to assistive technology.
+- Queue up to four request outcomes while an explicit Web Audio unlock is pending, clear stale queued sounds on failure/disposal, and keep previews separate from the live throttle.
+- Unlock Web Audio in the explicit sound-enable gesture, respect reduced-motion settings for the request refresh indicator, and preserve the notification status copy used before this feature.
+
 ## [1.21.2] - 2026-11-22
 
 ### Fixed

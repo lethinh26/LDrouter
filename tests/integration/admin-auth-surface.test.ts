@@ -8,6 +8,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { eq } from 'drizzle-orm';
 
 const nativeFetch = (globalThis as unknown as { __nativeFetch: typeof fetch }).__nativeFetch;
 
@@ -96,5 +97,57 @@ describe('admin auth surface after setup', () => {
     // The create route streams a binary .ldb body. Drain it so the connection goes
     // idle; an unconsumed stream keeps app.close() waiting for the socket.
     await res.arrayBuffer();
+  });
+
+  it('rejects a CSRF token issued to a different admin session', async () => {
+    const secondLogin = await nativeFetch(`${baseUrl}/api/admin/login`, {
+      method: 'POST', headers: json(),
+      body: JSON.stringify({ username: 'admin', password: 'super-secret-password-1234' }),
+    });
+    expect(secondLogin.status).toBe(200);
+    const secondCookie = secondLogin.headers.get('set-cookie')?.split(';')[0] ?? '';
+    const csrfRes = await nativeFetch(`${baseUrl}/api/admin/csrf`, { headers: { cookie: secondCookie } });
+    const { csrfToken } = await csrfRes.json() as { csrfToken: string };
+
+    const res = await nativeFetch(`${baseUrl}/api/admin/settings`, {
+      method: 'PATCH', headers: { ...json(), cookie, 'x-csrf-token': csrfToken },
+      body: JSON.stringify({ notificationsEnabled: true }),
+    });
+    expect(res.status).toBe(403);
+  });
+
+  it('rejects malformed persisted CSRF and session expiries', async () => {
+    const { getDb, schema } = await import('../../src/server/db/index');
+    const { sha256Hex } = await import('../../src/server/auth/ids');
+    const secondLogin = await nativeFetch(`${baseUrl}/api/admin/login`, {
+      method: 'POST', headers: json(),
+      body: JSON.stringify({ username: 'admin', password: 'super-secret-password-1234' }),
+    });
+    const secondCookie = secondLogin.headers.get('set-cookie')?.split(';')[0] ?? '';
+    const csrfRes = await nativeFetch(`${baseUrl}/api/admin/csrf`, { headers: { cookie: secondCookie } });
+    const { csrfToken } = await csrfRes.json() as { csrfToken: string };
+    const secondToken = secondCookie.slice('ld_session='.length);
+    const secondSession = getDb().select().from(schema.adminSessions).all()
+      .find((session) => session.tokenDigest === sha256Hex(secondToken));
+    expect(secondSession).toBeTruthy();
+
+    getDb().update(schema.csrfTokens).set({ expiresAt: 'not-a-date' })
+      .where(eq(schema.csrfTokens.sessionId, secondSession!.id)).run();
+    const invalidCsrf = await nativeFetch(`${baseUrl}/api/admin/settings`, {
+      method: 'PATCH', headers: { ...json(), cookie: secondCookie, 'x-csrf-token': csrfToken },
+      body: JSON.stringify({ notificationsEnabled: true }),
+    });
+    expect(invalidCsrf.status).toBe(403);
+
+    const firstToken = cookie.slice('ld_session='.length);
+    const firstSession = getDb().select().from(schema.adminSessions).all()
+      .find((session) => session.tokenDigest === sha256Hex(firstToken));
+    expect(firstSession).toBeTruthy();
+    getDb().update(schema.adminSessions).set({ expiresAt: 'not-a-date' })
+      .where(eq(schema.adminSessions.id, firstSession!.id)).run();
+
+    const invalidSession = await nativeFetch(`${baseUrl}/api/admin/providers`, { headers: { cookie } });
+    expect(invalidSession.status).toBe(401);
+    expect(getDb().select().from(schema.adminSessions).all().some((session) => session.id === firstSession!.id)).toBe(false);
   });
 });

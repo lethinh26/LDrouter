@@ -1,7 +1,7 @@
 // Gateway execution pipeline: auth -> resolve -> ACL -> limits -> route -> attempt -> persist.
 
 import { getDb, getRawDb, schema } from '../db/index';
-import { eq } from 'drizzle-orm';
+import { desc, eq } from 'drizzle-orm';
 import { GatewayError, preserveClientDisconnect } from '../errors';
 import { resolveRequestedModel, unwrapAlias } from '../routing/resolver';
 import { bareModelName, deriveRequiredCapabilities, describeRejections, firstMissingCapability, type CanonicalRequest, type RejectedMember, type RejectionReason, type RequiredCapabilities } from '../routing/capabilities';
@@ -29,6 +29,7 @@ import { upsertDailyAggregates } from '../backup/stats';
 import { metrics } from '../metrics/registry';
 import type { FastifyReply } from 'fastify';
 import { emitRequestLogged, emitRequestStarted } from './events';
+import { nextRequestCompletionTimestamp } from './request-timestamps';
 import { watchDownstreamDisconnect } from './downstream';
 import { debugHttp, debugBody, debugUpstream, debugStream, errorLine, formatError, getDebugFlags, truncate } from '../logging/debug';
 
@@ -1308,10 +1309,19 @@ export class GatewayRunner {
       upstreamRequestId: a.upstreamRequestId,
     }));
     const tx = getRawDb().transaction(() => {
+    // Assign a strictly increasing completion timestamp inside the same
+    // transaction as the row insert. IDs are generated at request arrival and
+    // may be supplied by clients, so they are not a safe live-event tie-breaker.
+    const latestRequest = db.select({ createdAt: schema.requests.createdAt })
+      .from(schema.requests)
+      .orderBy(desc(schema.requests.createdAt))
+      .limit(1)
+      .get();
+    const completedAt = nextRequestCompletionTimestamp(new Date(), latestRequest?.createdAt);
     db.insert(schema.requests).values({
       id: requestId,
-      createdAt: now,
-      completedAt: now,
+      createdAt: completedAt,
+      completedAt,
       apiKeyId: ctx.key?.id ?? null,
       keyPrefixSnapshot: ctx.key?.keyPrefix ?? null,
       clientIp: ctx.clientIp,

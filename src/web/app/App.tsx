@@ -15,10 +15,12 @@ import { Requests } from './pages/requests';
 import { Statistics } from './pages/statistics';
 import { AuditLogs } from './pages/audit';
 import { Settings } from './pages/settings';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api } from '../lib/api';
 import { RequestNotifications } from '../components/request-notifications';
 import { useRequestNotifications } from '../lib/request-events';
+import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '../components/ui/sheet';
+import { SidebarLinks } from '../components/sidebar';
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
   const { user, loading } = useAuth();
@@ -30,12 +32,20 @@ function RequireAuth({ children }: { children: React.ReactNode }) {
 
 function Shell() {
   const { items, dismiss } = useRequestNotifications();
+  const [mobileNavigationOpen, setMobileNavigationOpen] = useState(false);
+  const mobileNavigationReturnFocusRef = useRef<HTMLElement | null>(null);
+  const mainContentRef = useRef<HTMLElement | null>(null);
+  const openMobileNavigation = () => {
+    const active = document.activeElement;
+    mobileNavigationReturnFocusRef.current = active instanceof HTMLElement ? active : null;
+    setMobileNavigationOpen(true);
+  };
   return (
     <div className="flex h-screen bg-background text-foreground">
       <Sidebar />
       <div className="flex flex-1 flex-col overflow-hidden">
-        <TopBar />
-        <main className="flex-1 overflow-auto p-6">
+        <TopBar onOpenNavigation={openMobileNavigation} commandFallbackFocusRef={mainContentRef} />
+        <main ref={mainContentRef} tabIndex={-1} className="flex-1 overflow-auto p-3 sm:p-4 lg:p-6">
           <Routes>
             <Route index element={<Dashboard />} />
             <Route path="/providers" element={<Providers />} />
@@ -50,6 +60,30 @@ function Shell() {
           </Routes>
         </main>
       </div>
+      <Sheet open={mobileNavigationOpen} onOpenChange={setMobileNavigationOpen}>
+        <SheetContent
+          side="left"
+          className="w-[min(18rem,85vw)] gap-0 p-0"
+          onCloseAutoFocus={(event) => {
+            const target = mobileNavigationReturnFocusRef.current;
+            if (target?.isConnected) {
+              event.preventDefault();
+              target.focus();
+            }
+          }}
+        >
+          <SheetHeader className="flex h-14 flex-row items-center border-b px-4 py-0 pr-12">
+            <SheetTitle className="flex items-center gap-2 text-base">
+              <img src="/logo.png" alt="" className="h-7 w-7 object-contain" />
+              LateDev Router
+            </SheetTitle>
+          </SheetHeader>
+          <SheetDescription className="sr-only">Navigate between LateDev Router administration pages.</SheetDescription>
+          <nav aria-label="Mobile primary navigation" className="min-h-0 flex-1 space-y-0.5 overflow-y-auto p-2">
+            <SidebarLinks onNavigate={() => setMobileNavigationOpen(false)} />
+          </nav>
+        </SheetContent>
+      </Sheet>
       <RequestNotifications items={items} onDismiss={dismiss} />
     </div>
   );
