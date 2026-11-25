@@ -36,7 +36,7 @@
   "scripts": {
     "dev": "node --import tsx/esm scripts/dev.ts",
     "build": "pnpm run build:web && pnpm run build:server",
-    "build:server": "tsc -p tsconfig.build.json && node --import tsx/esm scripts/fix-imports.mts",
+    "build:server": "node --import tsx/esm scripts/clean-server.mts && tsc -p tsconfig.build.json && node --import tsx/esm scripts/fix-imports.mts",
     "build:web": "vite build",
     "start": "node dist/cli.js",
     "lint": "eslint . --max-warnings=0",

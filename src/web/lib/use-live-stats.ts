@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { api } from './api';
 import { subscribeToRequestStream } from './request-stream';
+import type { HistoricalProviderStats } from '../../shared/types';
 
 export type Preset = 'today' | '7d' | '30d';
 
@@ -28,6 +29,7 @@ export interface LiveRequestShape {
   success: boolean; httpStatus: number; inputTokens: number; outputTokens: number;
   cacheReadTokens: number; totalLatencyMs: number; attemptsCount: number;
   gatewayCacheHit: boolean; providerType: string | null;
+  providerDeleted?: boolean;
 }
 
 export interface Pulse { id: string; providerId: string; success: boolean }
@@ -44,6 +46,7 @@ export interface StatsSnapshot {
   topApiKeys: Array<{ name: string; requests: number; totalTokens: number }>;
   recent: LiveRequestShape[];
   providers: RoutingProviderShape[];
+  historicalProviders?: HistoricalProviderStats[];
 }
 
 const PULSE_MS = 1600; // animation duration
@@ -73,6 +76,8 @@ export interface LiveTally {
   cacheReadTokens: number;
   /** The prompt of each provider, already expressed on ITS OWN denominator (see promptTokensFor). */
   promptTokens: number;
+  /** A snapshot or event lacked the semantics needed to calculate the denominator. */
+  cacheSemanticsUnknown?: boolean;
   gatewayCacheHits: number;
   fallbacks: number;
 }
@@ -93,8 +98,19 @@ export function promptTokensFor(inputTokens: number, cacheReadTokens: number, pr
 }
 
 /** Cached share of the prompt that a provider actually served from its prompt cache. */
-export function cacheHitRateOf(t: LiveTally): number {
+export function cacheHitRateOf(t: LiveTally): number | null {
+  if (t.cacheSemanticsUnknown) return null;
   return t.promptTokens > 0 ? t.cacheReadTokens / t.promptTokens : 0;
+}
+
+export function advanceLiveTally(t: LiveTally, r: LiveRequestShape): LiveTally {
+  return {
+    cacheReadTokens: t.cacheReadTokens + r.cacheReadTokens,
+    promptTokens: t.promptTokens + promptTokensFor(r.inputTokens, r.cacheReadTokens, r.providerType),
+    cacheSemanticsUnknown: Boolean(t.cacheSemanticsUnknown || (r.cacheReadTokens > 0 && r.providerType !== 'openai' && r.providerType !== 'anthropic')),
+    gatewayCacheHits: t.gatewayCacheHits + (r.gatewayCacheHit ? 1 : 0),
+    fallbacks: t.fallbacks + (r.attemptsCount > 1 ? 1 : 0),
+  };
 }
 
 /** Share of requests that needed more than the first attempt. */
@@ -111,15 +127,9 @@ export function gatewayCacheHitRateOf(t: { gatewayCacheHits: number }, totalRequ
 function applyLiveSummary(s: StatsSummaryShape, t: LiveTally, r: LiveRequestShape): StatsSummaryShape {
   const totalRequests = s.totalRequests + 1;
   const successfulRequests = s.successfulRequests + (r.success ? 1 : 0);
-  const next: LiveTally = {
-    cacheReadTokens: t.cacheReadTokens + r.cacheReadTokens,
-    promptTokens: t.promptTokens + promptTokensFor(r.inputTokens, r.cacheReadTokens, r.providerType),
-    gatewayCacheHits: t.gatewayCacheHits + (r.gatewayCacheHit ? 1 : 0),
-    fallbacks: t.fallbacks + (r.attemptsCount > 1 ? 1 : 0),
-  };
   return {
     ...s,
-    ...next,
+    cacheReadTokens: t.cacheReadTokens,
     totalRequests,
     successfulRequests,
     failedRequests: s.failedRequests + (r.success ? 0 : 1),
@@ -129,9 +139,9 @@ function applyLiveSummary(s: StatsSummaryShape, t: LiveTally, r: LiveRequestShap
     totalTokens: s.totalTokens + r.inputTokens + r.outputTokens,
     // Unlike tokens/latency, a rate is a ratio — summing it (as this did) is
     // meaningless. Re-derive each from its running totals instead.
-    cacheHitRate: cacheHitRateOf(next),
-    gatewayCacheHitRate: gatewayCacheHitRateOf(next, totalRequests),
-    fallbackRate: fallbackRateOf(next, totalRequests),
+    cacheHitRate: cacheHitRateOf(t),
+    gatewayCacheHitRate: gatewayCacheHitRateOf(t, totalRequests),
+    fallbackRate: fallbackRateOf(t, totalRequests),
     averageLatencyMs: (s.averageLatencyMs * s.totalRequests + r.totalLatencyMs) / totalRequests,
   };
 }
@@ -177,6 +187,7 @@ export function useLiveStats(preset: Preset): UseLiveStatsResult {
         // to the same tallies, so seed them with what that snapshot summed.
         tallyRef.current = {
           cacheReadTokens: r.summary.cacheReadTokens,
+          cacheSemanticsUnknown: r.summary.cacheHitRate === null,
           // The server's rate already encodes each provider's own denominator, so invert it
           // to recover the mixed-provider prompt total (a raw inputTokens sum cannot express
           // it). Rounded: a token count is an integer, so this drops float noise only. With
@@ -229,19 +240,17 @@ export function useLiveStats(preset: Preset): UseLiveStatsResult {
 
         // Live summary increments. Each row is normalised on its own provider's token
         // semantics, so a mixed window stays correct without knowing the whole mix.
-        const nextTally: LiveTally = {
-          cacheReadTokens: tallyRef.current.cacheReadTokens + row.cacheReadTokens,
-          promptTokens: tallyRef.current.promptTokens + promptTokensFor(row.inputTokens, row.cacheReadTokens, row.providerType),
-          gatewayCacheHits: tallyRef.current.gatewayCacheHits + (row.gatewayCacheHit ? 1 : 0),
-          fallbacks: tallyRef.current.fallbacks + (row.attemptsCount > 1 ? 1 : 0),
-        };
+        const nextTally = advanceLiveTally(tallyRef.current, row);
         tallyRef.current = nextTally;
-        if (liveRef.current) setLive(applyLiveSummary(liveRef.current, nextTally, row));
+        if (liveRef.current) {
+          liveRef.current = applyLiveSummary(liveRef.current, nextTally, row);
+          setLive(liveRef.current);
+        }
         setRecent((prev) => {
           if (prev.some((r) => r.id === row.id)) return prev;
           return [row, ...prev].slice(0, MAX_RECENT);
         });
-        if (row.providerId) {
+        if (row.providerId && !row.providerDeleted && providersRef.current.some((p) => p.id === row.providerId)) {
           providersRef.current = providersRef.current.map((p) =>
             p.id === row.providerId
               ? { ...p, requests: p.requests + 1, errorRate: p.requests + 1 ? (p.errorRate * p.requests + (row.success ? 0 : 1)) / (p.requests + 1) : 0 }
@@ -265,7 +274,7 @@ export function useLiveStats(preset: Preset): UseLiveStatsResult {
         }
       },
       (row) => {
-        if (cancelled || !row.providerId) return;
+        if (cancelled || !row.providerId || !providersRef.current.some((p) => p.id === row.providerId)) return;
         activeRoutesRef.current = [
           ...activeRoutesRef.current.filter((a) => a.id !== row.requestId).slice(-(MAX_ACTIVE_ROUTES - 1)),
           { id: row.requestId, providerId: row.providerId, startedAt: Date.now(), ttftMs: row.ttftMs ?? 0 },
@@ -300,7 +309,7 @@ export function useLiveStats(preset: Preset): UseLiveStatsResult {
         .then((r) => {
           if (cancelled) return;
           const healthMap = new Map(r.providers.map((p) => [p.id, p]));
-          providersRef.current = providersRef.current.map((p) => {
+          providersRef.current = providersRef.current.filter((p) => healthMap.has(p.id)).map((p) => {
             const h = healthMap.get(p.id);
             return h ? { ...p, health: h.health as RoutingProviderShape['health'], enabled: h.enabled } : p;
           });

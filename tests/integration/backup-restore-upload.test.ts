@@ -12,6 +12,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import zlib from 'node:zlib';
+import { createLegacyDatabase, LEGACY_DAY, LEGACY_COMPACT_DAY, LEGACY_KEY, MIXED_KEY, ALL_KEY } from '../fixtures/legacy-db';
 
 const dataDir = path.join(os.tmpdir(), `latedev-restore-upload-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
 process.env.LATEDEV_DATA_DIR = dataDir;
@@ -349,5 +350,154 @@ describe('streamed multipart restore', () => {
     } finally {
       fs.rmSync(file, { force: true });
     }
+  });
+
+  it('invalidates restored probe owners and old attempt fences while preserving fresh latency samples', async () => {
+    const {getRawDb} = await import('../../src/server/db/index');
+    const {loadCombo} = await import('../../src/server/routing/combo');
+    const {beginAdaptiveAttempt,listAdaptiveStates,recordAdaptiveOutcome,claimAdaptiveProbe} = await import('../../src/server/routing/combo-adaptive-state');
+    const db = getRawDb();
+    const modelId = await ensureModel('a','p/a');
+    const now = Date.now();
+    const workload = 'stream:plain:short';
+    db.prepare("INSERT INTO combos(id,name,slug,public_model_id,mode) VALUES ('restore-adaptive','Adaptive restore','restore-adaptive','combo/restore-adaptive','fallback')").run();
+    db.prepare("INSERT INTO combo_members(id,combo_id,model_id,position) VALUES ('restore-member','restore-adaptive',?,0)").run(modelId);
+    const generation = loadCombo('restore-adaptive')!.slowResponseGeneration!;
+    const samples = [{latencyMs:70_000,atMs:now-1000}];
+    db.prepare(`INSERT INTO combo_adaptive_states(
+      combo_id,member_id,model_id,workload,generation,samples_json,consecutive_slow_count,degraded,
+      probe_due_ms,probe_lease_until_ms,probe_token,recovery_successes,last_observation_ms,last_start_ms,last_start_sequence,updated_at_ms
+    ) VALUES ('restore-adaptive','restore-member',?,?,?,?,3,'absolute',?,?,'old-backup-owner',1,?,?,42,?)`)
+      .run(modelId,workload,generation,JSON.stringify(samples),now-100,now+120_000,now-1000,now-2000,now-1000);
+    db.prepare(`INSERT INTO combo_adaptive_states(combo_id,member_id,model_id,workload,generation,updated_at_ms)
+      VALUES ('restore-adaptive','restore-member',?,'complete:plain:short:short',?,?)`)
+      .run(modelId,generation,now-16*60_000);
+    const oldFence=beginAdaptiveAttempt();
+    const file=await exportToFile('full');
+    try {
+      db.prepare("UPDATE combo_adaptive_states SET probe_token='newer-live-owner' WHERE combo_id='restore-adaptive' AND workload=?").run(workload);
+      const result=await uploadFile(file);
+      expect(result.status,JSON.stringify(result.json)).toBe(200);
+      const restoredPlan=loadCombo('restore-adaptive')!;
+      expect(restoredPlan.slowResponseGeneration).toBe(generation+1);
+      const restored=listAdaptiveStates('restore-adaptive');
+      expect(restored).toHaveLength(1);
+      expect(restored[0]).toMatchObject({samples,degraded:'absolute',probeToken:null,probeLeaseUntilMs:null,recoverySuccesses:0,lastStartSequence:0});
+      const candidate={modelId,comboMemberId:'restore-member',publicModelId:'p/a',upstreamModelId:'a',providerId,enabled:true,upstreamAvailable:true,circuitOpen:false,providerEnabled:true,capabilities:{streaming:true}};
+      recordAdaptiveOutcome({plan:restoredPlan,candidate,workload,startedAtMs:now,now:Date.now(),kind:'success',
+        latencyMs:8000,role:'normal',comparableCandidates:[candidate],learn:true,attemptFence:oldFence});
+      expect(listAdaptiveStates('restore-adaptive',workload)[0]?.samples).toEqual(samples);
+      const token=claimAdaptiveProbe(restoredPlan,candidate,workload,Date.now(),120_000);
+      expect(token).toBeTruthy();
+      expect(token).not.toBe('old-backup-owner');
+      expect(token).not.toBe('newer-live-owner');
+      expect(await waitForEmptyTmp()).toEqual([]);
+    } finally {fs.rmSync(file,{force:true});}
+  });
+
+  it.each(['v1','v2'] as const)('rejects a falsely stamped schema-14 %s backup before swapping the live database', async (format) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'latedev-forged-restore-'));
+    try {
+      const old = createLegacyDatabase(dir);
+      try {
+        old.exec("INSERT INTO schema_migrations(version,name) VALUES (14,'remove_legacy_providers'); UPDATE app_settings SET schema_version=14");
+        expect(old.prepare('PRAGMA integrity_check').get()).toEqual({integrity_check:'ok'});
+        expect(old.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+      } finally { old.close(); }
+      const bytes = fs.readFileSync(path.join(dir,'legacy.sqlite'));
+      const payload = zlib.gzipSync(bytes);
+      const { getRawDb } = await import('../../src/server/db/index');
+      const before = getRawDb();
+      const masterKey = process.env.LATEDEV_MASTER_KEY;
+      const models = await modelIds();
+      let result;
+      if (format === 'v1') {
+        const response = await fetch(`${baseUrl}/api/admin/backup/restore`, {
+          method: 'POST', headers: { 'content-type': 'application/json', cookie: cookies, 'x-csrf-token': await freshCsrf() },
+          body: JSON.stringify({ backup: {
+            format: 'latedev-backup', version: 1, schemaVersion: 14,
+            payload: payload.toString('base64'), checksum: crypto.createHash('sha256').update(payload).digest('hex'),
+          }, passphrase: PASSPHRASE }),
+        });
+        result = { status: response.status, json: await response.json() };
+      } else {
+        result = await uploadBuffer(await buildContainer(payload, {
+          profile:'full', excludedTables:[], schemaVersion:14, uncompressedBytes:bytes.length,
+        }));
+      }
+      expect(result.status,JSON.stringify(result.json)).toBe(400);
+      expect(getRawDb()).toBe(before);
+      expect(await modelIds()).toEqual(models);
+      expect(process.env.LATEDEV_MASTER_KEY).toBe(masterKey);
+      expect(await waitForEmptyTmp()).toEqual([]);
+    } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+  });
+
+  it.each(['v1', 'v2-full', 'v2-compact'] as const)('upgrades a genuine pre-0014 %s backup before replacing the live DB', async (format) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'latedev-legacy-restore-'));
+    try {
+      const old = createLegacyDatabase(dir);
+      try {
+        if (format === 'v2-compact') {
+          for (const table of EXCLUDED_TABLES) old.exec('DELETE FROM ' + table);
+        }
+      } finally { old.close(); }
+      const payload = zlib.gzipSync(fs.readFileSync(path.join(dir, 'legacy.sqlite')));
+      const { encryptBackupMasterKey } = await import('../../src/server/auth/backup-crypto');
+      const { parseMasterKey } = await import('../../src/server/auth/crypto');
+      const { loadConfig } = await import('../../src/server/config/index');
+      const keyEnvelope = encryptBackupMasterKey(parseMasterKey(loadConfig().masterKey!), PASSPHRASE);
+      const { getRawDb } = await import('../../src/server/db/index');
+      const before = getRawDb();
+      let result;
+      if (format === 'v1') {
+        const response = await fetch(`${baseUrl}/api/admin/backup/restore`, {
+          method: 'POST', headers: { 'content-type': 'application/json', cookie: cookies, 'x-csrf-token': await freshCsrf() },
+          body: JSON.stringify({ backup: {
+            format: 'latedev-backup', version: 1, schemaVersion: 0,
+            payload: payload.toString('base64'), checksum: crypto.createHash('sha256').update(payload).digest('hex'), keyEnvelope,
+          }, passphrase: PASSPHRASE }),
+        });
+        result = { status: response.status, json: await response.json() };
+      } else {
+        const profile = format === 'v2-full' ? 'full' : 'compact';
+        const container = await buildContainer(payload, {
+          schemaVersion: 0, profile, keyEnvelope,
+          excludedTables: profile === 'compact' ? EXCLUDED_TABLES : [],
+          uncompressedBytes: fs.statSync(path.join(dir, 'legacy.sqlite')).size,
+        });
+        result = await uploadBuffer(container);
+      }
+      expect(result.status, JSON.stringify(result.json)).toBe(200);
+      const db = getRawDb();
+      expect(db).not.toBe(before);
+      expect(db.prepare('SELECT schema_version FROM app_settings').get()).toEqual({schema_version:15});
+      expect(db.prepare("SELECT name FROM sqlite_schema WHERE name='combo_member_slow_states'").get()).toBeUndefined();
+      expect(db.prepare('SELECT * FROM combo_adaptive_states').all()).toEqual([]);
+      expect(db.prepare('SELECT type FROM providers ORDER BY type').all()).toEqual([{type:'anthropic'},{type:'openai'}]);
+      expect(db.prepare("SELECT id FROM models ORDER BY id").all()).toEqual([{id:'m-anthropic'},{id:'m-openai'}]);
+      expect(db.prepare("SELECT name FROM sqlite_master WHERE name IN ('codex_accounts','qoder_accounts')").all()).toEqual([]);
+      expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+      expect(db.prepare("SELECT enabled FROM combos WHERE id='empty'").get()).toEqual({enabled:0});
+      expect(db.prepare("SELECT id FROM combo_members WHERE combo_id='mixed' ORDER BY position").all()).toEqual([{id:'member-openai'},{id:'member-anthropic'}]);
+      expect(db.prepare('SELECT COUNT(*) n FROM requests').get()).toEqual({n:format === 'v2-compact' ? 0 : 3});
+      expect(db.prepare('SELECT COUNT(*) n FROM request_attempts').get()).toEqual({n:format === 'v2-compact' ? 0 : 4});
+      expect(db.prepare('SELECT SUM(requests) n FROM daily_model_stats').get()).toEqual({n:8});
+      expect(db.prepare('SELECT SUM(attempts) n FROM daily_provider_stats').get()).toEqual({n:9});
+      expect(db.prepare('SELECT SUM(requests) n FROM daily_api_key_stats').get()).toEqual({n:8});
+      const { authenticateGatewayKey, keyAllowedFor } = await import('../../src/server/auth/api-key');
+      const key = (secret: string) => authenticateGatewayKey({ headers: { authorization: 'Bearer ' + secret } })!;
+      expect(keyAllowedFor(key(LEGACY_KEY),'model','m-openai')).toBe(false);
+      expect(keyAllowedFor(key(LEGACY_KEY),'model','m-anthropic')).toBe(false);
+      expect(keyAllowedFor(key(MIXED_KEY),'model','m-openai')).toBe(true);
+      expect(keyAllowedFor(key(MIXED_KEY),'model','m-anthropic')).toBe(false);
+      expect(keyAllowedFor(key(ALL_KEY),'model','m-anthropic')).toBe(true);
+      const stats = await fetch(`${baseUrl}/api/admin/stats?from=${LEGACY_COMPACT_DAY}T00:00:00.000Z&to=${LEGACY_DAY}T23:59:59.999Z`, {headers:{cookie:cookies}});
+      expect(stats.status).toBe(200);
+      const body = await stats.json() as {summary:{totalRequests:number;inputTokens:number;outputTokens:number};topModels:Array<{publicId:string;requests:number}>};
+      expect(body.summary).toMatchObject({totalRequests:8,inputTokens:112,outputTokens:28});
+      expect(body.topModels).toContainEqual(expect.objectContaining({publicId:'Deleted model (m-retired-a)',requests:6}));
+      expect(await waitForEmptyTmp()).toEqual([]);
+    } finally { fs.rmSync(dir,{recursive:true,force:true}); }
   });
 });

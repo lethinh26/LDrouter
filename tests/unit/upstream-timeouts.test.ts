@@ -230,4 +230,47 @@ describe('callUpstreamStreaming watchdogs', () => {
     await expect(callUpstreamNonStreaming(cfg({ connectTimeoutMs: 300 }), url, { model: 'm', stream: false }))
       .rejects.toMatchObject({ code: 'upstream_connect_timeout', message: 'Upstream connect timeout' });
   });
+
+  it('aborts a non-streaming upstream body when the request-wide client signal fires', async () => {
+    let closed = false;
+    let started!: () => void;
+    const receiving = new Promise<void>((resolve) => { started = resolve; });
+    server = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.flushHeaders();
+      res.on('close', () => { closed = true; });
+      started();
+    });
+    await new Promise<void>((resolve) => server!.listen(0, '127.0.0.1', resolve));
+    const url = `http://127.0.0.1:${(server.address() as { port: number }).port}/v1/chat/completions`;
+    const controller = new AbortController();
+    const pending = callUpstreamNonStreaming(cfg({ requestSignal: controller.signal }), url, { model: 'm' });
+    const rejected = expect(pending).rejects.toMatchObject({ status: 499, code: 'client_disconnected' });
+    await receiving;
+    controller.abort();
+    await rejected;
+    for (let i = 0; i < 20 && !closed; i++) await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(closed).toBe(true);
+  });
+
+  it('keeps an overall deadline distinct from the provider watchdogs for either transport', async () => {
+    const url = await silentServer(true);
+    for (const stream of [false, true]) {
+      const controller = new AbortController();
+      const config = cfg({ requestSignal: controller.signal, totalTimeoutMs: 5000, slowResponseTimeoutMs: 1000 });
+      const pending = stream
+        ? callUpstreamStreaming(config, url, { model: 'm', stream }, () => false)
+        : callUpstreamNonStreaming(config, url, { model: 'm', stream });
+      const rejected = expect(pending).rejects.toMatchObject({ code: 'combo_overall_timeout', status: 504 });
+      const timer = setTimeout(() => controller.abort(new GatewayError('timeout_error', 'overall deadline', { status: 504, code: 'combo_overall_timeout' })), 50);
+      try { await rejected; } finally { clearTimeout(timer); }
+    }
+  });
+
+  it('gives the hard total deadline precedence over an equal soft threshold', async () => {
+    const url = await silentServer(true);
+    const config = cfg({ totalTimeoutMs: 150, slowResponseTimeoutMs: 150 });
+    await expect(callUpstreamNonStreaming(config, url, { model: 'm' })).rejects.toMatchObject({ code: 'upstream_total_timeout' });
+    await expect(callUpstreamStreaming(config, url, { model: 'm', stream: true }, () => false)).rejects.toMatchObject({ code: 'upstream_total_timeout' });
+  });
 });

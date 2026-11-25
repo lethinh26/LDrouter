@@ -73,7 +73,7 @@ const patch = (body: Record<string, unknown>) =>
 const detail = async (id: string) => {
   const r = await fetch(`${baseUrl}/api/admin/combos/${id}`, { headers: { cookie: cookies } });
   expect(r.status).toBe(200);
-  return (await r.json()).combo as { slug: string; publicModelId: string; maxTotalAttempts: number; fallbackOn429: boolean; fallbackOnTotalTimeout: boolean; slowResponseFallbackEnabled: boolean; slowResponseThresholdSeconds: number; slowResponseMaxCount: number; members: Array<{ modelId: string; providerEnabled: boolean; status: { state: string }; slowState: unknown }> };
+  return (await r.json()).combo as { slug: string; publicModelId: string; maxTotalAttempts: number; maxRequestDurationSeconds: number | null; fallbackOn429: boolean; fallbackOnTotalTimeout: boolean; slowResponseFallbackEnabled: boolean; slowResponseThresholdSeconds: number; slowResponseMaxCount: number; members: Array<{ id: string; modelId: string; providerEnabled: boolean; status: { state: string }; slowState: unknown; adaptiveStates: unknown[] }> };
 };
 
 const list = async () => {
@@ -81,6 +81,13 @@ const list = async () => {
   expect(r.status).toBe(200);
   return (await r.json()).combos as Array<{ id: string; status: string; healthyMemberCount: number; slowCooldownCount: number; slowProbeCount: number }>;
 };
+
+function seedAdaptive(comboId: string, modelId: string, values: Partial<typeof sch.comboAdaptiveStates.$inferInsert> = {}) {
+  const combo = db.select().from(sch.combos).all().find((c) => c.id === comboId)!;
+  const member = db.select().from(sch.comboMembers).all().find((m) => m.comboId === comboId && m.modelId === modelId)!;
+  db.insert(sch.comboAdaptiveStates).values({ comboId, modelId, memberId: member.id, generation: combo.slowResponseGeneration,
+    workload: 'complete:plain:short:short', updatedAtMs: Date.now(), ...values }).run();
+}
 
 describe('admin combo create', () => {
   it('derives the public id from the name when no slug is given', async () => {
@@ -93,23 +100,25 @@ describe('admin combo create', () => {
       fallbackOnTotalTimeout: true,
       slowResponseThresholdSeconds: 60,
       slowResponseMaxCount: 3,
+      maxRequestDurationSeconds: null,
     });
   });
 
-  it('includes persisted slow-response state in combo member details', async () => {
+  it('reports workload-specific latency, degradation and recovery without exposing lease tokens', async () => {
     const r = await create({ name: 'Slow state detail', members: [member(modelA)] });
     expect(r.status).toBe(200);
     const created = await r.json();
     const now = Date.now();
-    db.insert(sch.comboMemberSlowStates).values({
-      comboId: created.id,
-      modelId: modelA,
+    seedAdaptive(created.id, modelA, {
       consecutiveSlowCount: 2,
-      cooldownUntilMs: now + 300_000,
+      degraded: 'absolute', probeDueMs: now + 30_000,
       lastLatencyMs: 75_000,
-      lastOutcome: 'slow',
+      lastOutcome: 'soft_timeout',
       updatedAtMs: now,
-    }).run();
+      samplesJson: JSON.stringify([{ latencyMs: 2000, atMs: now }, { latencyMs: 3000, atMs: now }, { latencyMs: 4000, atMs: now }]),
+      probeToken: 'private-lease-token', probeLeaseUntilMs: now + 1000,
+    });
+    seedAdaptive(created.id, modelA, { workload: 'stream:plain:short', updatedAtMs: now - 1, samplesJson: JSON.stringify([{ latencyMs: 500, atMs: now }]) });
 
     const combo = await detail(created.id);
     expect(combo.members[0]?.slowState).toMatchObject({
@@ -117,6 +126,11 @@ describe('admin combo create', () => {
       lastLatencyMs: 75_000,
       lastOutcome: 'slow',
     });
+    expect(combo.members[0]?.adaptiveStates).toEqual(expect.arrayContaining([
+      expect.objectContaining({ workload: 'complete:plain:short:short', latencyKind: 'completion', medianLatencyMs: 3000, sampleCount: 3, state: 'probing' }),
+      expect.objectContaining({ workload: 'stream:plain:short', latencyKind: 'ttft', medianLatencyMs: 500, sampleCount: 1 }),
+    ]));
+    expect(JSON.stringify(combo)).not.toContain('private-lease-token');
   });
 
   it('reports healthy members separately from slow cooldowns and active probes in the combo list', async () => {
@@ -124,10 +138,9 @@ describe('admin combo create', () => {
     expect(r.status).toBe(200);
     const created = await r.json();
     const now = Date.now();
-    db.insert(sch.comboMemberSlowStates).values([
-      { comboId: created.id, modelId: modelA, consecutiveSlowCount: 3, cooldownUntilMs: now + 300_000, lastOutcome: 'slow', updatedAtMs: now },
-      { comboId: created.id, modelId: modelB, consecutiveSlowCount: 3, cooldownUntilMs: now - 1, probeLeaseUntilMs: now + 30_000, lastOutcome: 'error', updatedAtMs: now },
-    ]).run();
+    seedAdaptive(created.id, modelA, { consecutiveSlowCount: 3, degraded: 'absolute', probeDueMs: now + 30_000, lastOutcome: 'soft_timeout', updatedAtMs: now });
+    seedAdaptive(created.id, modelA, { workload: 'stream:plain:short', consecutiveSlowCount: 3, degraded: 'absolute', probeDueMs: now + 30_000, updatedAtMs: now });
+    seedAdaptive(created.id, modelB, { consecutiveSlowCount: 3, degraded: 'absolute', probeDueMs: now - 1, probeLeaseUntilMs: now + 30_000, probeToken: 'probe-b', lastOutcome: 'error', updatedAtMs: now });
 
     const listed = await list();
     expect(listed.find((combo) => combo.id === created.id)).toMatchObject({
@@ -138,25 +151,23 @@ describe('admin combo create', () => {
     });
   });
 
-  it('preserves retained member history and cascades only the removed member history', async () => {
+  it('invalidates decisions and leases when the membership set changes', async () => {
     const r = await create({ name: 'Slow state member diff', members: [member(modelA, 0), member(modelB, 1)] });
     expect(r.status).toBe(200);
     const created = await r.json();
     const generationBefore = db.select().from(sch.combos).all().find((combo) => combo.id === created.id)!.slowResponseGeneration;
     const now = Date.now();
-    db.insert(sch.comboMemberSlowStates).values([
-      { comboId: created.id, modelId: modelA, consecutiveSlowCount: 2, lastLatencyMs: 70_000, lastOutcome: 'slow', updatedAtMs: now },
-      { comboId: created.id, modelId: modelB, consecutiveSlowCount: 1, lastLatencyMs: 65_000, lastOutcome: 'slow', updatedAtMs: now },
-    ]).run();
+    seedAdaptive(created.id, modelA, { consecutiveSlowCount: 2, lastLatencyMs: 70_000, lastOutcome: 'soft_timeout', updatedAtMs: now });
+    seedAdaptive(created.id, modelB, { consecutiveSlowCount: 1, lastLatencyMs: 65_000, lastOutcome: 'soft_timeout', updatedAtMs: now });
 
     const updated = await patch({ id: created.id, members: [member(modelB, 0)] });
     expect(updated.status).toBe(200);
     const combo = await detail(created.id);
     expect(combo.members).toHaveLength(1);
     expect(combo.members[0]?.modelId).toBe(modelB);
-    expect(combo.members[0]?.slowState).toMatchObject({ consecutiveSlowCount: 1, lastLatencyMs: 65_000 });
-    expect(db.select().from(sch.comboMemberSlowStates).all().filter((state) => state.comboId === created.id).map((state) => state.modelId)).toEqual([modelB]);
-    expect(db.select().from(sch.combos).all().find((item) => item.id === created.id)?.slowResponseGeneration).toBe(generationBefore);
+    expect(combo.members[0]?.adaptiveStates).toHaveLength(0);
+    expect(db.select().from(sch.comboAdaptiveStates).all().filter((state) => state.comboId === created.id)).toHaveLength(0);
+    expect(db.select().from(sch.combos).all().find((item) => item.id === created.id)?.slowResponseGeneration).toBe(generationBefore + 1);
   });
 
   it('clears slow history atomically when slow-response settings change', async () => {
@@ -164,16 +175,41 @@ describe('admin combo create', () => {
     expect(r.status).toBe(200);
     const created = await r.json();
     const now = Date.now();
-    db.insert(sch.comboMemberSlowStates).values({
-      comboId: created.id, modelId: modelA, consecutiveSlowCount: 2,
-      cooldownUntilMs: now + 300_000, lastLatencyMs: 75_000, lastOutcome: 'slow', updatedAtMs: now,
-    }).run();
+    seedAdaptive(created.id, modelA, { consecutiveSlowCount: 2, degraded: 'absolute',
+      probeDueMs: now + 30_000, lastLatencyMs: 75_000, lastOutcome: 'soft_timeout', updatedAtMs: now });
     const generationBefore = db.select().from(sch.combos).all().find((combo) => combo.id === created.id)!.slowResponseGeneration;
 
     const updated = await patch({ id: created.id, slowResponseThresholdSeconds: 90 });
     expect(updated.status).toBe(200);
-    expect(db.select().from(sch.comboMemberSlowStates).all().filter((state) => state.comboId === created.id)).toHaveLength(0);
+    expect(db.select().from(sch.comboAdaptiveStates).all().filter((state) => state.comboId === created.id)).toHaveLength(0);
     expect(db.select().from(sch.combos).all().find((combo) => combo.id === created.id)?.slowResponseGeneration).toBe(generationBefore + 1);
+  });
+
+  it('retains measured samples on pure reorder but fences old recovery leases', async () => {
+    const created = await (await create({ name: 'Reorder adaptive', members: [member(modelA), member(modelB, 1)] })).json();
+    const now = Date.now();
+    const samplesJson = JSON.stringify([{ latencyMs: 1000, atMs: now }]);
+    seedAdaptive(created.id, modelA, { samplesJson, degraded: 'relative', comparatorModelId: modelB, probeDueMs: now, probeLeaseUntilMs: now + 30_000, probeToken: 'old-probe' });
+    const old = db.select().from(sch.comboAdaptiveStates).all().find((s) => s.comboId === created.id)!;
+    expect((await patch({ id: created.id, members: [member(modelB), member(modelA, 1)] })).status).toBe(200);
+    const next = db.select().from(sch.comboAdaptiveStates).all().find((s) => s.comboId === created.id)!;
+    expect(next).toMatchObject({ memberId: old.memberId, generation: old.generation + 1, samplesJson, degraded: null, comparatorModelId: null, probeToken: null, probeLeaseUntilMs: null });
+    expect((await detail(created.id)).members.map((m) => m.modelId)).toEqual([modelB, modelA]);
+  });
+
+  it('supports audited adaptive reset and a nullable overall deadline', async () => {
+    const created = await (await create({ name: 'Reset and deadline', maxRequestDurationSeconds: 120, members: [member(modelA)] })).json();
+    expect((await detail(created.id)).maxRequestDurationSeconds).toBe(120);
+    seedAdaptive(created.id, modelA, { consecutiveSlowCount: 2 });
+    const generationBefore = db.select().from(sch.combos).all().find((c) => c.id === created.id)!.slowResponseGeneration;
+    expect((await patch({ id: created.id, maxRequestDurationSeconds: 0 })).status).toBe(400);
+    expect((await patch({ id: created.id, maxRequestDurationSeconds: null })).status).toBe(200);
+    expect((await detail(created.id)).maxRequestDurationSeconds).toBeNull();
+    const reset = await fetch(`${baseUrl}/api/admin/combos/${created.id}/reset-adaptive-state`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: cookies }, body: '{}' });
+    expect(reset.status).toBe(200);
+    expect((await detail(created.id)).members[0]?.adaptiveStates).toHaveLength(0);
+    expect(db.select().from(sch.combos).all().find((c) => c.id === created.id)?.slowResponseGeneration).toBe(generationBefore + 1);
+    expect(db.select().from(sch.auditLogs).all().some((a) => a.action === 'combo.adaptive.reset' && a.targetId === created.id)).toBe(true);
   });
 
   it('accepts an explicitly empty slug as omitted', async () => {
@@ -224,10 +260,11 @@ describe('admin combo create', () => {
 
   it('leaves no orphan combo row when creation fails', async () => {
     const before = db.select().from(sch.combos).all().length;
+    const membersBefore = db.select().from(sch.comboMembers).all();
     const r = await create({ name: 'never-lands', members: [member(modelA), member(modelA)] });
     expect(r.status).toBe(400);
     expect(db.select().from(sch.combos).all().length).toBe(before);
-    expect(db.select().from(sch.comboMembers).all().some((m) => m.modelId === modelA && m.position === 1)).toBe(false);
+    expect(db.select().from(sch.comboMembers).all()).toEqual(membersBefore);
     // The name is still free, so the operator can retry it.
     expect((await create({ name: 'never-lands', members: [member(modelA)] })).status).toBe(200);
   });

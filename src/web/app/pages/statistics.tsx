@@ -5,7 +5,7 @@ import { PageHeader } from '../../components/ui/skeleton';
 import { Tabs, TabsList, TabsTrigger } from '../../components/ui/tabs';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../../components/ui/table';
 import { Card, CardHeader, CardTitle, CardContent } from '../../components/ui/card';
-import { formatNumber, formatPercent } from '../../lib/utils';
+import { formatLatencyMs, formatNumber, formatPercent } from '../../lib/utils';
 import { useLiveStats, type Preset } from '../../lib/use-live-stats';
 import { SummaryCard } from '../../components/statistics/summary-card';
 import { RoutingFlow } from '../../components/statistics/routing-flow';
@@ -45,7 +45,8 @@ export function Statistics() {
         </Tabs>
       } />
 
-      {!snapshot.percentilesAvailable && <p className="mb-3 text-sm text-muted-foreground">Percentiles are unavailable for compacted historical data; cache hit rate is unavailable when provider token semantics were not retained.</p>}
+      {!snapshot.percentilesAvailable && <p className="mb-3 text-sm text-muted-foreground">Percentiles are unavailable for compacted historical data.</p>}
+      {s.cacheHitRate === null && <p className="mb-3 text-sm text-muted-foreground">Cache hit rate is unavailable when provider token semantics were not retained.</p>}
 
       {/* Summary cards */}
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
@@ -63,6 +64,30 @@ export function Statistics() {
       <div className="mt-6">
         <RoutingFlow liveRequests={s.totalRequests} successRate={s.successRate} providers={providers} pulses={pulses} activeRoutes={activeRoutes} />
       </div>
+
+      {(snapshot.historicalProviders?.length ?? 0) > 0 && (
+        <Card className="mt-6">
+          <CardHeader className="pb-2">
+            <CardTitle className="text-base">Historical Provider Attempts</CardTitle>
+            <p className="text-xs text-muted-foreground">Traffic retained for deleted providers, separate from live routing.</p>
+          </CardHeader>
+          <CardContent>
+            <Table>
+              <TableHeader><TableRow><TableHead>Provider</TableHead><TableHead>Attempts</TableHead><TableHead>Error rate</TableHead><TableHead>Avg latency</TableHead></TableRow></TableHeader>
+              <TableBody>
+                {snapshot.historicalProviders?.map((p) => (
+                  <TableRow key={p.id}>
+                    <TableCell className="break-all text-xs">{p.name}</TableCell>
+                    <TableCell className="text-xs">{formatNumber(p.requests)}</TableCell>
+                    <TableCell className="text-xs">{formatPercent(p.errorRate)}</TableCell>
+                    <TableCell className="text-xs">{formatLatencyMs(p.avgLatencyMs)}</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </CardContent>
+        </Card>
+      )}
 
       {/* Recent Requests + Top Models + Top API Keys */}
       <div className="mt-6 grid gap-4 lg:grid-cols-3">

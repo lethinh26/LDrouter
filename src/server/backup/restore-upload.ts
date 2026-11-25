@@ -16,7 +16,8 @@ import { loadConfig, type RuntimeConfig } from '../config/index';
 import { GatewayError } from '../errors';
 import { decryptBackupMasterKey } from '../auth/backup-crypto';
 import { parseMasterKey } from '../auth/crypto';
-import { getSettings } from '../db/repositories/settings';
+import { migrateDatabase } from '../db/index';
+import { CURRENT_SCHEMA_VERSION } from '../db/migrate';
 import {
   readBackupContainerHeader,
   streamBackupPayload,
@@ -127,7 +128,7 @@ export async function receiveBackupUpload(
 
   try {
     let seenFiles = 0;
-    // The global multipart fileSize cap (2 MB, sized for JSON imports) is too small for a backup,
+    // The global multipart fileSize cap (2 MB) is too small for a backup,
     // so the limit is raised per request here; the byte counter below is the real enforcement.
     for await (const part of request.parts({ limits: { fileSize: maxBytes + 1 } })) {
       if (part.type === 'field') {
@@ -226,7 +227,10 @@ export async function validateUploadedBackup(upload: UploadedBackup, passphrase?
     const result = isLegacy
       ? await validateLegacyJson(upload.path, sqlitePath, cfg, passphrase)
       : await validateV2(upload.path, sqlitePath, cfg, passphrase);
-    return { ...result, cleanup };
+    // Upgrade the private staging DB before closing or replacing the live DB.
+    // In particular, old backups must not reintroduce retired provider credentials.
+    await upgradeStagedBackup(sqlitePath);
+    return { ...result, schemaVersion: CURRENT_SCHEMA_VERSION, cleanup };
   } catch (error) {
     await cleanup();
     throw error;
@@ -246,7 +250,7 @@ async function validateV2(
   } catch {
     throw invalidFormat();
   }
-  if (manifest.schemaVersion > getSettings().schemaVersion) {
+  if (manifest.schemaVersion > CURRENT_SCHEMA_VERSION) {
     throw backupError('future_schema', 'Backup was created by a newer schema version than this gateway supports');
   }
 
@@ -285,7 +289,8 @@ async function validateV2(
     throw checksumMismatch();
   }
 
-  await assertUsableSqlite(sqlitePath, manifest.profile);
+  const payloadSchemaVersion = await assertUsableSqlite(sqlitePath, manifest.profile);
+  if (payloadSchemaVersion !== manifest.schemaVersion) throw invalidFormat();
   return {
     sqlitePath,
     schemaVersion: manifest.schemaVersion,
@@ -310,6 +315,12 @@ async function validateLegacyJson(
   if (!envelope || envelope.format !== 'latedev-backup') throw invalidFormat();
   if (typeof envelope.version === 'number' && envelope.version > LEGACY_VERSION) {
     throw backupError('unsupported_version', 'Backup version is not supported');
+  }
+  if (envelope.schemaVersion !== undefined && (!Number.isSafeInteger(envelope.schemaVersion) || envelope.schemaVersion < 0)) {
+    throw invalidFormat();
+  }
+  if (envelope.schemaVersion !== undefined && envelope.schemaVersion > CURRENT_SCHEMA_VERSION) {
+    throw backupError('future_schema', 'Backup was created by a newer schema version than this gateway supports');
   }
   const compressed = Buffer.from(String(envelope.payload ?? ''), 'base64');
   if (compressed.length > cfg.maxBackupUploadBytes) throw tooLarge();
@@ -338,10 +349,11 @@ async function validateLegacyJson(
     throw decompressFailed();
   }
 
-  await assertUsableSqlite(sqlitePath, 'full');
+  const payloadSchemaVersion = await assertUsableSqlite(sqlitePath, 'full');
+  if (envelope.schemaVersion !== undefined && envelope.schemaVersion !== payloadSchemaVersion) throw invalidFormat();
   return {
     sqlitePath,
-    schemaVersion: typeof envelope.schemaVersion === 'number' ? envelope.schemaVersion : getSettings().schemaVersion,
+    schemaVersion: payloadSchemaVersion,
     profile: 'full',
     ...(envelope.keyEnvelope ? { masterKey: decryptMasterKey(envelope.keyEnvelope, passphrase) } : {}),
   };
@@ -361,7 +373,7 @@ function decryptMasterKey(envelope: Parameters<typeof decryptBackupMasterKey>[0]
 
 /** Verify the SQLite header, run a read-only integrity check, and confirm the tables the profile
  *  promises are actually present. */
-async function assertUsableSqlite(file: string, profile: BackupProfile): Promise<void> {
+async function assertUsableSqlite(file: string, profile: BackupProfile): Promise<number> {
   const head = Buffer.alloc(16);
   const fd = fs.openSync(file, 'r');
   try {
@@ -381,9 +393,35 @@ async function assertUsableSqlite(file: string, profile: BackupProfile): Promise
     );
     if (!tables.has('app_settings')) throw invalidFormat();
     if (profile === 'compact' && !COMPACT_AGGREGATE_TABLES.every((table) => tables.has(table))) throw invalidFormat();
+    const settings = db.prepare('SELECT schema_version FROM app_settings WHERE id = 1').get() as { schema_version: number } | undefined;
+    if (!settings || !Number.isSafeInteger(settings.schema_version) || settings.schema_version < 0) throw invalidFormat();
+    if (settings.schema_version > CURRENT_SCHEMA_VERSION) {
+      throw backupError('future_schema', 'Backup was created by a newer schema version than this gateway supports');
+    }
+    return settings.schema_version;
   } catch (error) {
     if (error instanceof GatewayError) throw error;
     throw notSqlite();
+  } finally {
+    db?.close();
+  }
+}
+
+/** Migrate and validate the staging file, keeping the live connection untouched on failure. */
+async function upgradeStagedBackup(file: string): Promise<void> {
+  const Database = (await import('better-sqlite3')).default;
+  let db: import('better-sqlite3').Database | undefined;
+  try {
+    db = new Database(file, { fileMustExist: true });
+    // The subsequent atomic swap copies one standalone SQLite file, not a WAL.
+    db.pragma('journal_mode = DELETE');
+    migrateDatabase(db);
+    if (db.prepare('PRAGMA foreign_key_check').all().length > 0) throw integrityFailed();
+    const result = db.prepare('PRAGMA integrity_check').get() as { integrity_check?: string } | undefined;
+    if (result?.integrity_check !== 'ok') throw integrityFailed();
+  } catch (error) {
+    if (error instanceof GatewayError) throw error;
+    throw backupError('invalid_schema', 'Backup database schema could not be upgraded safely');
   } finally {
     db?.close();
   }

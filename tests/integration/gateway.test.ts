@@ -99,7 +99,8 @@ afterAll(async () => {
 beforeEach(async () => {
   // Reset circuit breaker state between tests
   const { recordSuccess } = await import('../../src/server/routing/circuit');
-  recordSuccess('mock');
+  const { getDb, schema } = await import('../../src/server/db/index');
+  for (const provider of getDb().select({ id: schema.providers.id }).from(schema.providers).all()) recordSuccess(provider.id);
 });
 
 describe('gateway smoke', () => {
@@ -591,7 +592,7 @@ describe('gateway smoke', () => {
     expect(seenModel).toBe('test/gpt-5.5');
   });
 
-  it('falls back on slow non-streaming responses and cools down the member after three slow outcomes', async () => {
+  it('demotes repeated slow responses, serves a reserve on failure, and confirms failback with two successful probes', async () => {
     const { reset, pushHandler } = await import('./_mock-control.js');
     const { getDb, schema } = await import('../../src/server/db/index');
     const { uuid } = await import('../../src/server/auth/ids');
@@ -612,13 +613,21 @@ describe('gateway smoke', () => {
       { id: uuid(), comboId, modelId: fastModelId, position: 1, enabled: true },
     ]).run();
 
-    const invoke = async () => {
+    let backupFails = false;
+    let primarySlow = true;
+    const invoke = async (expected: string) => {
       const seenModels: string[] = [];
       reset();
       pushHandler(async (_req, res, body) => {
         const model = (JSON.parse(body) as { model: string }).model;
         seenModels.push(model);
-        if (model === 'slow-model') await new Promise((resolve) => setTimeout(resolve, 1300));
+        if (model === 'slow-model' && primarySlow) await new Promise((resolve) => setTimeout(resolve, 1300));
+        if (model === 'fast-model' && backupFails) {
+          res.statusCode = 503;
+          res.setHeader('content-type', 'application/json');
+          res.end(JSON.stringify({ error: { code: 'model_unavailable' } }));
+          return;
+        }
         res.statusCode = 200;
         res.setHeader('content-type', 'application/json');
         res.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: model }, finish_reason: 'stop' }], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } }));
@@ -629,18 +638,237 @@ describe('gateway smoke', () => {
       });
       expect(res.status).toBe(200);
       const body = await res.json() as { choices: Array<{ message: { content: string } }> };
-      expect(body.choices[0]?.message.content).toBe('fast-model');
+      expect(body.choices[0]?.message.content).toBe(expected);
       return seenModels;
     };
 
     for (let attempt = 0; attempt < 3; attempt++) {
-      await expect(invoke()).resolves.toEqual(['slow-model', 'fast-model']);
+      await expect(invoke('fast-model')).resolves.toEqual(['slow-model', 'fast-model']);
     }
-    const state = db.select().from(schema.comboMemberSlowStates).all().find((row) => row.comboId === comboId && row.modelId === slowModelId);
-    expect(state).toMatchObject({ consecutiveSlowCount: 3, lastOutcome: 'slow' });
-    expect(state?.cooldownUntilMs).toBeGreaterThan(Date.now());
-    await expect(invoke()).resolves.toEqual(['fast-model']);
+    const { listAdaptiveStates } = await import('../../src/server/routing/combo-adaptive-state');
+    const state = () => listAdaptiveStates(comboId).find((row) => row.modelId === slowModelId);
+    expect(state()).toMatchObject({ consecutiveSlowCount: 3, lastOutcome: 'soft_timeout', degraded: 'absolute', samples: [] });
+    expect(state()?.probeDueMs).toBeGreaterThan(Date.now());
+    await expect(invoke('fast-model')).resolves.toEqual(['fast-model']);
+
+    // A is still eligible while degraded; B's model-scoped error must not
+    // block A even though they use the same provider. A may exceed the soft limit.
+    backupFails = true;
+    await expect(invoke('slow-model')).resolves.toEqual(['fast-model', 'slow-model']);
+    expect(state()?.degraded).toBe('absolute');
+    backupFails = false;
+    primarySlow = false;
+    const makeProbeDue = () => db.update(schema.comboAdaptiveStates)
+      .set({ probeDueMs: Date.now() - 1 }).where(eq(schema.comboAdaptiveStates.modelId, slowModelId)).run();
+    makeProbeDue();
+    await expect(invoke('slow-model')).resolves.toEqual(['slow-model']);
+    expect(state()).toMatchObject({ degraded: 'absolute', recoverySuccesses: 1 });
+    await expect(invoke('fast-model')).resolves.toEqual(['fast-model']);
+    makeProbeDue();
+    await expect(invoke('slow-model')).resolves.toEqual(['slow-model']);
+    expect(state()).toMatchObject({ degraded: null, recoverySuccesses: 0 });
+    await expect(invoke('slow-model')).resolves.toEqual(['slow-model']);
   }, 15_000);
+
+  it.each([2, 3])('allows one soft-timeout rescue replay only within an actual attempt cap of %s', async (cap) => {
+    const { reset, pushHandler, callCount } = await import('./_mock-control.js');
+    const { getDb, schema } = await import('../../src/server/db/index');
+    const { uuid } = await import('../../src/server/auth/ids');
+    const db = getDb();
+    const provider = db.select().from(schema.providers).all().find((p) => p.slug === 'mock')!;
+    const a = uuid();
+    const b = uuid();
+    const comboId = uuid();
+    const modelName = `combo/replay-${comboId}`;
+    db.insert(schema.models).values([
+      { id: a, providerId: provider.id, upstreamModelId: `replay-a-${cap}`, publicModelId: `mock/replay-a-${cap}`, displayName: 'Replay A' },
+      { id: b, providerId: provider.id, upstreamModelId: `replay-b-${cap}`, publicModelId: `mock/replay-b-${cap}`, displayName: 'Replay B' },
+    ]).run();
+    db.insert(schema.combos).values({ id: comboId, name: 'Replay cap', slug: `replay-${comboId}`, publicModelId: modelName, mode: 'fallback', maxTotalAttempts: cap, slowResponseFallbackEnabled: true, slowResponseThresholdSeconds: 1 }).run();
+    db.insert(schema.comboMembers).values([
+      { id: uuid(), comboId, modelId: a, position: 0, enabled: true },
+      { id: uuid(), comboId, modelId: b, position: 1, enabled: true },
+    ]).run();
+    reset();
+    const seen: string[] = [];
+    pushHandler((_req, res, body) => {
+      const model = (JSON.parse(body) as { model: string }).model;
+      seen.push(model);
+      if (model === `replay-b-${cap}`) {
+        res.writeHead(503, { 'content-type': 'application/json' });
+        res.end('{"error":{"code":"model_unavailable"}}');
+        return;
+      }
+      // The first call is censored by the soft watchdog, the replay can run
+      // past that threshold but still within the provider hard timeout.
+      const timer = setTimeout(() => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'rescued' }, finish_reason: 'stop' }] }));
+      }, 1200);
+      res.on('close', () => clearTimeout(timer));
+    });
+    const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey!.secret}` },
+      body: JSON.stringify({ model: modelName, messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    expect(response.status).toBe(cap === 3 ? 200 : 502);
+    const body = await response.json();
+    if (cap === 3) expect(body.choices[0].message.content).toBe('rescued');
+    expect(seen).toEqual(cap === 3 ? [`replay-a-${cap}`, `replay-b-${cap}`, `replay-a-${cap}`] : [`replay-a-${cap}`, `replay-b-${cap}`]);
+    expect(callCount()).toBe(cap);
+    const request = db.select().from(schema.requests).all().find((r) => r.requestedModel === modelName)!;
+    expect(request).toMatchObject({ success: cap === 3, attemptsCount: cap });
+    const attempts = db.select().from(schema.requestAttempts).where(eq(schema.requestAttempts.requestId, request.id)).all().sort((x, y) => x.attemptNumber - y.attemptNumber);
+    expect(attempts.map((r) => r.modelId)).toEqual(cap === 3 ? [a, b, a] : [a, b]);
+    expect(attempts[0]?.failureReason).toBe('slow_response_timeout');
+    if (cap === 3) expect(attempts[2]).toMatchObject({ success: true, selectionReason: 'rescue_replay' });
+  }, 10_000);
+
+  it.each(['single-member', 'cap-one', 'all-slow'] as const)('lets the last viable or known-slow candidate complete: %s', async (scenario) => {
+    const { reset, pushHandler, callCount } = await import('./_mock-control.js');
+    const { getDb, schema } = await import('../../src/server/db/index');
+    const { uuid } = await import('../../src/server/auth/ids');
+    const { loadCombo, selectCandidates } = await import('../../src/server/routing/combo');
+    const { deriveRequiredCapabilities } = await import('../../src/server/routing/capabilities');
+    const { classifyWorkload } = await import('../../src/server/routing/combo-policy');
+    const { recordAdaptiveOutcome } = await import('../../src/server/routing/combo-adaptive-state');
+    const db = getDb();
+    const provider = db.select().from(schema.providers).all().find((p) => p.slug === 'mock')!;
+    const comboId = uuid();
+    const modelName = `combo/viable-${comboId}`;
+    const modelIds = Array.from({ length: scenario === 'single-member' ? 1 : 2 }, () => uuid());
+    const modelRows = modelIds.map((id, index) => ({ id, providerId: provider.id, upstreamModelId: `viable-${scenario}-${index}`, publicModelId: `mock/viable-${scenario}-${index}`, displayName: 'Viable' }));
+    db.insert(schema.models).values(modelRows).run();
+    db.insert(schema.combos).values({ id: comboId, name: 'Viable', slug: `viable-${comboId}`, publicModelId: modelName, mode: 'fallback', maxTotalAttempts: scenario === 'cap-one' ? 1 : 3, slowResponseFallbackEnabled: true, slowResponseThresholdSeconds: 1 }).run();
+    db.insert(schema.comboMembers).values(modelIds.map((modelId, position) => ({ id: uuid(), comboId, modelId, position, enabled: true }))).run();
+    if (scenario === 'all-slow') {
+      const canonical = { model: modelName, messages: [{ role: 'user' as const, content: [{ type: 'text' as const, text: 'hi' }] }], stream: false };
+      const plan = loadCombo(comboId)!;
+      const workload = classifyWorkload(canonical);
+      const candidates = selectCandidates(plan, modelRows.map((m) => ({
+        modelId: m.id, providerId: m.providerId, publicModelId: m.publicModelId, upstreamModelId: m.upstreamModelId,
+        enabled: true, upstreamAvailable: true, circuitOpen: false, providerEnabled: true, capabilities: { chat: true },
+      })), deriveRequiredCapabilities(canonical));
+      const now = Date.now();
+      for (const candidate of candidates) for (let i = 0; i < 3; i++) {
+        recordAdaptiveOutcome({ plan, candidate, workload, startedAtMs: now - 20 + i, now: now - 10 + i, kind: 'soft_timeout', latencyMs: 1000, role: 'normal', comparableCandidates: candidates, learn: true });
+      }
+    }
+    reset();
+    const seen: string[] = [];
+    pushHandler((_req, res, body) => {
+      seen.push((JSON.parse(body) as { model: string }).model);
+      const timer = setTimeout(() => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end('{"choices":[{"message":{"role":"assistant","content":"complete"},"finish_reason":"stop"}]}');
+      }, 1200);
+      res.on('close', () => clearTimeout(timer));
+    });
+    const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey!.secret}` },
+      body: JSON.stringify({ model: modelName, messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    expect(response.status).toBe(200);
+    expect((await response.json()).choices[0].message.content).toBe('complete');
+    expect(callCount()).toBe(1);
+    expect(seen).toEqual([modelRows[0]!.upstreamModelId]);
+  }, 10_000);
+
+  it('rechecks hard eligibility after a failure and does not spend an attempt on a disabled member', async () => {
+    const { reset, pushHandler, callCount } = await import('./_mock-control.js');
+    const { getDb, schema } = await import('../../src/server/db/index');
+    const { uuid } = await import('../../src/server/auth/ids');
+    const db = getDb();
+    const provider = db.select().from(schema.providers).all().find((p) => p.slug === 'mock')!;
+    const comboId = uuid();
+    const modelName = `combo/refresh-${comboId}`;
+    const ids = [uuid(), uuid(), uuid()];
+    db.insert(schema.models).values(ids.map((id, index) => ({
+      id, providerId: provider.id, upstreamModelId: `refresh-${index}`, publicModelId: `mock/refresh-${index}`, displayName: 'Refresh',
+    }))).run();
+    db.insert(schema.combos).values({ id: comboId, name: 'Refresh', slug: `refresh-${comboId}`, publicModelId: modelName, mode: 'fallback', maxTotalAttempts: 2 }).run();
+    db.insert(schema.comboMembers).values(ids.map((modelId, position) => ({ id: uuid(), comboId, modelId, position, enabled: true }))).run();
+    reset();
+    const seen: string[] = [];
+    pushHandler((_req, res, body) => {
+      const model = (JSON.parse(body) as { model: string }).model;
+      seen.push(model);
+      if (model === 'refresh-0') {
+        db.update(schema.models).set({ enabled: false }).where(eq(schema.models.id, ids[1]!)).run();
+        res.writeHead(503, { 'content-type': 'application/json' });
+        res.end('{"error":{"code":"model_unavailable"}}');
+      } else {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end('{"choices":[{"message":{"role":"assistant","content":"third"},"finish_reason":"stop"}]}');
+      }
+    });
+    const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey!.secret}` },
+      body: JSON.stringify({ model: modelName, messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    expect(response.status).toBe(200);
+    expect((await response.json()).choices[0].message.content).toBe('third');
+    expect(seen).toEqual(['refresh-0', 'refresh-2']);
+    expect(callCount()).toBe(2);
+    const request = db.select().from(schema.requests).all().find((r) => r.requestedModel === modelName)!;
+    expect(request.attemptsCount).toBe(2);
+  });
+
+  it.each(['overall-deadline', 'client-disconnect'] as const)('cancels a non-streaming upstream without fallback: %s', async (scenario) => {
+    const { reset, pushHandler, callCount } = await import('./_mock-control.js');
+    const { getDb, schema } = await import('../../src/server/db/index');
+    const { uuid } = await import('../../src/server/auth/ids');
+    const { listAdaptiveStates } = await import('../../src/server/routing/combo-adaptive-state');
+    const db = getDb();
+    const provider = db.select().from(schema.providers).all().find((p) => p.slug === 'mock')!;
+    const comboId = uuid();
+    const modelName = `combo/cancel-${comboId}`;
+    const ids = [uuid(), uuid()];
+    db.insert(schema.models).values(ids.map((id, index) => ({
+      id, providerId: provider.id, upstreamModelId: `cancel-${scenario}-${index}`, publicModelId: `mock/cancel-${scenario}-${index}`, displayName: 'Cancel',
+    }))).run();
+    db.insert(schema.combos).values({
+      id: comboId, name: 'Cancel', slug: `cancel-${comboId}`, publicModelId: modelName, mode: 'fallback', maxTotalAttempts: 2,
+      slowResponseThresholdSeconds: 2, maxRequestDurationSeconds: scenario === 'overall-deadline' ? 1 : null,
+    }).run();
+    db.insert(schema.comboMembers).values(ids.map((modelId, position) => ({ id: uuid(), comboId, modelId, position, enabled: true }))).run();
+    reset();
+    let upstreamClosed = false;
+    let notifyStarted!: () => void;
+    const started = new Promise<void>((resolve) => { notifyStarted = resolve; });
+    pushHandler((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.flushHeaders();
+      res.on('close', () => { upstreamClosed = true; });
+      notifyStarted();
+    });
+    const controller = new AbortController();
+    const pending = fetch(`${baseUrl}/v1/chat/completions`, {
+      method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey!.secret}` },
+      body: JSON.stringify({ model: modelName, messages: [{ role: 'user', content: 'hi' }] }),
+      signal: controller.signal,
+    });
+    if (scenario === 'client-disconnect') {
+      const rejected = expect(pending).rejects.toThrow();
+      await started;
+      controller.abort();
+      await rejected;
+    } else {
+      const response = await pending;
+      expect(response.status).toBe(504);
+      expect((await response.json()).error.code).toBe('combo_overall_timeout');
+    }
+    let request: typeof schema.requests.$inferSelect | undefined;
+    for (let i = 0; i < 60; i++) {
+      request = db.select().from(schema.requests).all().find((r) => r.requestedModel === modelName);
+      if (upstreamClosed && request) break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(upstreamClosed).toBe(true);
+    expect(callCount()).toBe(1);
+    expect(request).toMatchObject({ success: false, attemptsCount: 1, httpStatus: scenario === 'overall-deadline' ? 504 : 499 });
+    expect(listAdaptiveStates(comboId)).toHaveLength(0);
+  }, 10_000);
 
   it('uses first content token rather than SSE metadata as streaming TTFT', async () => {
     const { reset, pushHandler } = await import('./_mock-control.js');
@@ -920,6 +1148,9 @@ describe('gateway smoke', () => {
       const request = db.select().from(schema.requests).all().slice(requestsBefore)
         .find((row) => row.requestedModel === `combo/post-commit-usage-${comboId}`);
       expect(request).toMatchObject({ totalTokens: 18, cacheReadTokens: 4, reasoningTokens: 3 });
+      const { listAdaptiveStates } = await import('../../src/server/routing/combo-adaptive-state');
+      const state = listAdaptiveStates(comboId).find((row) => row.modelId === firstModelId);
+      expect(state?.samples ?? []).toHaveLength(0);
       const providerStats = db.select().from(schema.dailyProviderStats).all()
         .find((row) => row.day === aggregateDay && row.providerId === provider.id);
       expect(providerStats?.cacheReadTokens).toBe(cacheReadBefore + 4);

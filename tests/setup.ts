@@ -17,7 +17,7 @@ async function fetchWithAdminCsrf(input: RequestInfo | URL, init?: RequestInit):
   if (!cookie || requestHeaders.has('x-csrf-token')) return nativeFetch(input, init);
 
   const target = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-  if (!target.includes('/api/admin/') || target.includes('/api/admin/codex/')) return nativeFetch(input, init);
+  if (!target.includes('/api/admin/')) return nativeFetch(input, init);
 
   const csrfUrl = new URL('/api/admin/csrf', target);
   const csrfResponse = await nativeFetch(csrfUrl, { headers: { cookie } });

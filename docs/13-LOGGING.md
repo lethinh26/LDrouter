@@ -33,7 +33,7 @@ Phải log cả:
 * routing
 * combo selection
 * capability detection
-* provider/account selection
+* provider/model selection
 * request gửi upstream
 * upstream HTTP status
 * upstream headers quan trọng
@@ -511,7 +511,7 @@ Tôi cần biết **TẠI SAO từng member bị loại**.
 Nếu filter vì availability:
 
 ```text
-reason=account_locked
+reason=circuit_open
 ```
 
 Nếu filter vì capability:
@@ -528,39 +528,20 @@ reason=rate_limit
 
 Từng candidate phải có rejection reason cụ thể.
 
-Slow-response fallback uses the same candidate rejection records. A member skipped during its
-five-minute cooldown is logged with `reason=slow_response_cooldown`; a member whose recovery probe
-is already leased is logged with `reason=slow_response_probe_active`. The upstream attempt record
-includes `slowResponseTimeoutMs`, and a threshold abort is classified as
-`failureReason=slow_response_timeout`.
+Adaptive fallback records actual upstream dispatches with `selectionReason` (priority, recovery,
+exploration, relative preference, reserve, or rescue) and `slowResponseTimeoutMs` when enabled.
+A soft threshold abort is classified as `failureReason=slow_response_timeout`. Degraded reserves
+remain candidates; hard skips are logged separately and do not consume attempts. Metrics
+`latedev_adaptive_combo_decisions_total` and `latedev_adaptive_combo_outcomes_total` use bounded
+reason/result labels, without credentials, model names or prompts.
 Total request timeouts are classified as `total_timeout`; stream-idle timeouts before content are
 classified as `first_token_timeout` so the corresponding combo trigger remains effective.
 
 ---
 
-# 11. LOG ACCOUNT SELECTION
+# 11. LOG PROVIDER SELECTION
 
-Khi provider có nhiều account/key:
-
-```text
-[req_xxx] [ACCOUNT SELECT]
-
-provider=vl
-accountsTotal=3
-available=2
-locked=1
-selectedAccount=<safe identifier>
-```
-
-Không log API key.
-
-Có thể log account ID/hash cuối:
-
-```text
-accountId=acc_123
-```
-
-hoặc:
+Mỗi provider dùng một API key đã mã hóa. Ghi provider/model đã chọn và lý do routing; có thể ghi fingerprint không nhạy cảm của key:
 
 ```text
 keyFingerprint=...92af
@@ -568,12 +549,11 @@ keyFingerprint=...92af
 
 nhưng tuyệt đối không log full key.
 
-Nếu account locked:
+Nếu provider bị circuit breaker loại:
 
 ```text
-lockedUntil
-lastStatus
-lastError
+circuitState
+failureReason
 ```
 
 ---
@@ -1124,7 +1104,7 @@ tôi phải nhìn được kiểu:
 [req_xxx] Normalize
 [req_xxx] Required capabilities
 [req_xxx] Candidate selection
-[req_xxx] Selected provider/account
+[req_xxx] Selected provider/model
 [req_xxx] Upstream request
 [req_xxx] Upstream response
 [req_xxx] Stream start

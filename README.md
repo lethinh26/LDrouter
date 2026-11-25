@@ -7,7 +7,7 @@ Lightweight self-hosted LLM gateway with a polished admin UI. Presents stable Op
 - OpenAI-compatible and Anthropic-compatible gateways (`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`, `/v1/models`)
 - Selective model discovery (Fetch → select → import) with **Select All**
 - Ordered **combos** with fallback routing and one-hop **aliases**
-- Per-combo slow-response fallback with TTFT-aware streaming, cooldown, and recovery probes
+- Adaptive ordered combos with workload-aware latency, soft reserves, automatic failback, exclusive recovery probes, and optional overall deadlines
 - Provider API keys encrypted at rest with AES-256-GCM
 - Per-key `ld-` bearer tokens (SHA-256 digest storage, displayed once)
 - IP allow/deny (IPv4 + IPv6 CIDR), trusted-proxy configuration
@@ -64,9 +64,15 @@ Backups download from Settings > Backup (or first-run Setup). New backups use th
 
 To restore, upload the `.ldb` file (or legacy `.ldb.json`) and enter the **same six-digit passphrase** used to create it — it decrypts the encrypted master key inside the backup. Without it, restored provider credentials cannot be decrypted. The upload streams to disk with real progress and a Cancel button; **uploads are not resumable**, so an interrupted upload must be restarted. The default upload size limit is 256 MiB (`LATEDEV_MAX_BACKUP_UPLOAD_BYTES`); over-limit uploads are rejected with HTTP 413.
 
-Restore validates the container, checksum, gzip, SQLite integrity, schema version, and key envelope before an atomic swap, and keeps a pre-restore snapshot so a failure rolls back to the previous database.
+Restore validates the container, checksum, gzip, SQLite integrity, schema version, and key envelope, then applies pending migrations to staging before an atomic swap. A pre-restore snapshot allows a failure to roll back to the previous database.
 
 **Limitation:** a compact backup cannot restore individual request/attempt/audit history or cached responses, and after a compact restore historical p95 latency and p95 TTFT percentiles are unavailable for aggregate-only days (average latency/TTFT and top rankings are retained). Use a full backup if you need that row-level detail or percentile history.
+
+### Upgrade from retired provider integrations
+
+Only OpenAI-compatible and Anthropic-compatible providers are supported. Schema migration 0014 permanently removes retired Codex/Qoder provider configuration and account credentials, removes invalid combo members, aliases and model permissions, and invalidates affected response-cache entries. Remaining combo priority and API-key restrictions are preserved; a combo with no surviving members is disabled. Generic request/attempt history and daily statistics are retained, although removed provider/model names may be shown as historical IDs.
+
+Take a full backup before upgrading and retain its passphrase. Older backups are migrated before activation, so restoring one in the new version does not bring retired integrations back. A downgrade requires the earlier application and a pre-upgrade backup; the upgraded schema cannot be downgraded in place.
 
 ## Public API examples
 

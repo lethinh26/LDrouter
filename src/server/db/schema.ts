@@ -105,7 +105,7 @@ export const providers = sqliteTable(
     id: text('id').primaryKey(),
     name: text('name').notNull(),
     slug: text('slug').notNull().unique(),
-    type: text('type', { enum: ['openai', 'anthropic', 'codex', 'qoder'] }).notNull(),
+    type: text('type', { enum: ['openai', 'anthropic'] }).notNull(),
     baseUrl: text('base_url').notNull(),
     encryptedApiKey: text('encrypted_api_key'),
     apiKeyNonce: text('api_key_nonce'),
@@ -130,86 +130,6 @@ export const providers = sqliteTable(
   },
   (t) => ({
     slugIdx: uniqueIndex('uniq_provider_slug').on(t.slug),
-  })
-);
-
-export const codexAccounts = sqliteTable(
-  'codex_accounts',
-  {
-    id: text('id').primaryKey(),
-    providerId: text('provider_id').notNull().references(() => providers.id, { onDelete: 'restrict' }),
-    email: text('email'),
-    workspaceId: text('workspace_id'),
-    chatgptAccountId: text('chatgpt_account_id'),
-    planType: text('plan_type'),
-    encryptedAccessToken: text('encrypted_access_token').notNull(),
-    accessTokenNonce: text('access_token_nonce').notNull(),
-    accessTokenVersion: integer('access_token_version').notNull().default(1),
-    encryptedRefreshToken: text('encrypted_refresh_token').notNull(),
-    refreshTokenNonce: text('refresh_token_nonce').notNull(),
-    refreshTokenVersion: integer('refresh_token_version').notNull().default(1),
-    encryptedIdToken: text('encrypted_id_token'),
-    idTokenNonce: text('id_token_nonce'),
-    idTokenVersion: integer('id_token_version').notNull().default(1),
-    tokenExpiresAt: text('token_expires_at').notNull(),
-    lastRefreshAt: text('last_refresh_at'),
-    authMethod: text('auth_method', { enum: ['oauth', 'access_token'] }).notNull().default('oauth'),
-    enabled: integer('enabled', { mode: 'boolean' }).notNull().default(true),
-    healthState: text('health_state', { enum: ['healthy', 'degraded', 'down', 'unknown'] }).notNull().default('unknown'),
-    lastError: text('last_error'),
-    consecutiveFailures: integer('consecutive_failures').notNull().default(0),
-    priority: integer('priority').notNull().default(0),
-    // Codex quota snapshot (wham/usage) and 5-hour window auto-start state (v1.15.0).
-    codexUsageJson: text('codex_usage_json'),
-    codexUsageUpdatedAt: text('codex_usage_updated_at'),
-    codexUsageError: text('codex_usage_error'),
-    codexAutostartEnabled: integer('codex_autostart_enabled', { mode: 'boolean' }).notNull().default(false),
-    lastPingedResetAt: text('last_pinged_reset_at'),
-    lastPingedResetKey: text('last_pinged_reset_key'),
-    lastPingAt: text('last_ping_at'),
-    createdAt: text('created_at').notNull().default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ','now'))`),
-    updatedAt: text('updated_at').notNull().default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ','now'))`),
-  },
-  (t) => ({
-    providerEnabledPriorityIdx: index('idx_codex_account_provider_enabled_priority').on(t.providerId, t.enabled, t.priority),
-    providerEmailIdx: index('idx_codex_account_provider_email').on(t.providerId, t.email),
-    providerChatgptIdx: index('idx_codex_account_provider_chatgpt').on(t.providerId, t.chatgptAccountId),
-  })
-);
-
-// ============================================================================
-// Qoder accounts
-// ============================================================================
-
-export const qoderAccounts = sqliteTable(
-  'qoder_accounts',
-  {
-    id: text('id').primaryKey(),
-    providerId: text('provider_id').notNull().references(() => providers.id, { onDelete: 'restrict' }),
-    label: text('label'),
-    email: text('email'),
-    qoderUserId: text('qoder_user_id').notNull(),
-    machineId: text('machine_id').notNull(),
-    encryptedPat: text('encrypted_pat').notNull(),
-    patNonce: text('pat_nonce').notNull(),
-    patVersion: integer('pat_version').notNull().default(1),
-    encryptedJobToken: text('encrypted_job_token').notNull(),
-    jobTokenNonce: text('job_token_nonce').notNull(),
-    jobTokenVersion: integer('job_token_version').notNull().default(1),
-    jobTokenExpiresAt: text('job_token_expires_at').notNull(),
-    catalogJson: text('catalog_json'),
-    catalogFetchedAt: text('catalog_fetched_at'),
-    enabled: integer('enabled', { mode: 'boolean' }).notNull().default(true),
-    healthState: text('health_state', { enum: ['healthy', 'degraded', 'down', 'unknown'] }).notNull().default('unknown'),
-    lastError: text('last_error'),
-    consecutiveFailures: integer('consecutive_failures').notNull().default(0),
-    priority: integer('priority').notNull().default(0),
-    createdAt: text('created_at').notNull().default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ','now'))`),
-    updatedAt: text('updated_at').notNull().default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ','now'))`),
-  },
-  (t) => ({
-    providerEnabledPriorityIdx: index('idx_qoder_account_provider_enabled_priority').on(t.providerId, t.enabled, t.priority),
-    providerUserIdx: index('idx_qoder_account_provider_user').on(t.providerId, t.qoderUserId),
   })
 );
 
@@ -270,6 +190,7 @@ export const combos = sqliteTable(
     slowResponseThresholdSeconds: integer('slow_response_threshold_seconds').notNull().default(60),
     slowResponseMaxCount: integer('slow_response_max_count').notNull().default(3),
     slowResponseGeneration: integer('slow_response_generation').notNull().default(1),
+    maxRequestDurationSeconds: integer('max_request_duration_seconds'),
     cacheOverrideEnabled: integer('cache_override_enabled', { mode: 'boolean' }),
     configVersion: integer('config_version').notNull().default(1),
     createdAt: text('created_at').notNull().default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ','now'))`),
@@ -296,32 +217,56 @@ export const comboMembers = sqliteTable(
   },
   (t) => ({
     uniqMember: uniqueIndex('uniq_combo_model').on(t.comboId, t.modelId),
+    identityIdx: uniqueIndex('uniq_combo_member_identity').on(t.id, t.comboId, t.modelId),
     posIdx: index('idx_combo_pos').on(t.comboId, t.position),
   })
 );
 
-export const comboMemberSlowStates = sqliteTable(
-  'combo_member_slow_states',
+export const comboAdaptiveStates = sqliteTable(
+  'combo_adaptive_states',
   {
     comboId: text('combo_id').notNull(),
+    memberId: text('member_id').notNull(),
     modelId: text('model_id').notNull(),
+    workload: text('workload').notNull(),
+    generation: integer('generation').notNull(),
+    samplesJson: text('samples_json').notNull().default('[]'),
     consecutiveSlowCount: integer('consecutive_slow_count').notNull().default(0),
-    cooldownUntilMs: integer('cooldown_until_ms'),
+    relativeSlowCount: integer('relative_slow_count').notNull().default(0),
+    degraded: text('degraded', { enum: ['absolute','relative'] }),
+    comparatorModelId: text('comparator_model_id'),
+    probeDueMs: integer('probe_due_ms'),
     probeLeaseUntilMs: integer('probe_lease_until_ms'),
+    probeToken: text('probe_token'),
+    recoverySuccesses: integer('recovery_successes').notNull().default(0),
+    probeFailures: integer('probe_failures').notNull().default(0),
     lastLatencyMs: integer('last_latency_ms'),
-    lastOutcome: text('last_outcome', { enum: ['slow', 'fast', 'error', 'unknown'] }).notNull().default('unknown'),
+    lastOutcome: text('last_outcome', { enum: ['success','soft_timeout','error','cancel','unknown'] }).notNull().default('unknown'),
     updatedAtMs: integer('updated_at_ms').notNull().default(0),
+    lastObservationMs: integer('last_observation_ms'),
+    lastStartMs: integer('last_start_ms'),
+    lastStartSequence: integer('last_start_sequence').notNull().default(0),
+    baselineLatencyMs: integer('baseline_latency_ms'),
+    suspectCount: integer('suspect_count').notNull().default(0),
   },
   (t) => ({
-    pk: primaryKey({ columns: [t.comboId, t.modelId] }),
-    cooldownIdx: index('idx_combo_slow_cooldown').on(t.cooldownUntilMs),
+    pk: primaryKey({ columns: [t.memberId, t.workload] }),
+    comboIdx: index('idx_adaptive_combo_workload').on(t.comboId, t.workload),
+    updatedIdx: index('idx_adaptive_updated').on(t.updatedAtMs),
     memberFk: foreignKey({
-      columns: [t.comboId, t.modelId],
-      foreignColumns: [comboMembers.comboId, comboMembers.modelId],
-      name: 'fk_combo_slow_state_member',
+      columns: [t.memberId, t.comboId, t.modelId],
+      foreignColumns: [comboMembers.id, comboMembers.comboId, comboMembers.modelId],
+      name: 'fk_combo_adaptive_state_member',
     }).onDelete('cascade'),
   })
 );
+
+export const comboAdaptiveExploration = sqliteTable('combo_adaptive_exploration', {
+  comboId: text('combo_id').notNull().references(() => combos.id, { onDelete: 'cascade' }),
+  workload: text('workload').notNull(),
+  generation: integer('generation').notNull(),
+  nextDueMs: integer('next_due_ms').notNull(),
+}, (t) => ({ pk: primaryKey({ columns: [t.comboId, t.workload] }) }));
 
 // ============================================================================
 // Aliases
@@ -468,8 +413,6 @@ export const requestAttempts = sqliteTable(
     attemptNumber: integer('attempt_number').notNull(),
     providerId: text('provider_id').notNull(),
     modelId: text('model_id').notNull(),
-    codexAccountId: text('codex_account_id').references(() => codexAccounts.id, { onDelete: 'set null' }),
-    qoderAccountId: text('qoder_account_id').references(() => qoderAccounts.id, { onDelete: 'set null' }),
     startedAt: text('started_at').notNull(),
     completedAt: text('completed_at'),
     statusCode: integer('status_code'),
@@ -491,8 +434,6 @@ export const requestAttempts = sqliteTable(
   (t) => ({
     requestIdx: index('idx_attempt_request').on(t.requestId, t.attemptNumber),
     providerModelIdx: index('idx_attempt_provider_model').on(t.providerId, t.modelId, t.startedAt),
-    codexAccountIdx: index('idx_attempt_codex_account').on(t.codexAccountId, t.startedAt),
-    qoderAccountIdx: index('idx_attempt_qoder_account').on(t.qoderAccountId, t.startedAt),
   })
 );
 
@@ -645,8 +586,6 @@ export const schemaMigrations = sqliteTable('schema_migrations', {
 
 // Convenience type re-exports
 export type Provider = typeof providers.$inferSelect;
-export type CodexAccount = typeof codexAccounts.$inferSelect;
-export type QoderAccount = typeof qoderAccounts.$inferSelect;
 export type Model = typeof models.$inferSelect;
 export type Combo = typeof combos.$inferSelect;
 export type ComboMember = typeof comboMembers.$inferSelect;

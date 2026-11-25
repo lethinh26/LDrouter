@@ -57,7 +57,7 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
 
   app.get('/api/admin/providers', async () => {
     const db = getDb();
-    const providers = db.select().from(schema.providers).all().filter((provider) => provider.type === 'openai' || provider.type === 'anthropic');
+    const providers = db.select().from(schema.providers).all();
     const modelCounts = db
       .select({ providerId: schema.models.providerId, c: sql<number>`COUNT(*)` })
       .from(schema.models)
@@ -158,8 +158,6 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
     const models = db.select({ id: schema.models.id }).from(schema.models).where(eq(schema.models.providerId, id)).all();
     const modelIds = models.map((model) => model.id);
     db.transaction((tx) => {
-      tx.delete(schema.codexAccounts).where(eq(schema.codexAccounts.providerId, id)).run();
-      tx.delete(schema.qoderAccounts).where(eq(schema.qoderAccounts.providerId, id)).run();
       if (modelIds.length > 0) {
         tx.delete(schema.comboMembers).where(inArray(schema.comboMembers.modelId, modelIds)).run();
         tx.delete(schema.modelAliases).where(sql`target_kind = 'model' AND target_id IN (${sql.join(modelIds.map((modelId) => sql`${modelId}`), sql`, `)})`).run();

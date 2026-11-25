@@ -7,7 +7,7 @@ import { getDb, schema } from '../../db/index';
 import { requireAdminAuth } from '../../auth/middleware';
 import { GatewayError } from '../../errors';
 import { toSummary, loadSummaryMaps } from './requests';
-import type { StatsSummary, StatsRange, RoutingProvider } from '../../../shared/types';
+import type { StatsSummary, StatsRange, RoutingProvider, HistoricalProviderStats } from '../../../shared/types';
 
 /**
  * Midnight UTC, `offsetDays` from the day containing `now`.
@@ -51,19 +51,28 @@ const PRESETS: Record<string, () => { from: Date; to: Date; bucket: 'hour' | 'da
 function cacheHitRateFor(
   db: BetterSQLite3Database<typeof schema>,
   conds: Parameters<typeof and>
-): number {
+): number | null {
   const anthropic = sql`${schema.providers.type} = 'anthropic'`;
   const r = db
     .select({
       cacheRead: sql<number>`COALESCE(SUM(${schema.requests.cacheReadTokens}),0)`,
       anthropicPrompt: sql<number>`COALESCE(SUM(CASE WHEN ${anthropic} THEN ${schema.requests.inputTokens} + ${schema.requests.cacheReadTokens} ELSE 0 END),0)`,
       otherPrompt: sql<number>`COALESCE(SUM(CASE WHEN ${anthropic} THEN 0 ELSE ${schema.requests.inputTokens} END),0)`,
+      unknownSemantics: sql<number>`COALESCE(SUM(CASE WHEN ${schema.providers.type} IS NULL AND ${schema.requests.cacheReadTokens} > 0 THEN 1 ELSE 0 END),0)`,
     })
     .from(schema.requests)
     .leftJoin(schema.models, eq(schema.models.id, schema.requests.finalModelId))
-    .leftJoin(schema.providers, eq(schema.providers.id, schema.models.providerId))
+    .leftJoin(schema.providers, eq(schema.providers.id, sql`COALESCE(${schema.models.providerId}, (
+      SELECT ${schema.requestAttempts.providerId} FROM ${schema.requestAttempts}
+      WHERE ${schema.requestAttempts.requestId} = ${schema.requests.id}
+        AND ${schema.requestAttempts.modelId} = ${schema.requests.finalModelId}
+      ORDER BY ${schema.requestAttempts.attemptNumber} DESC LIMIT 1
+    ))`))
     .where(and(...conds))
     .get();
+  // Missing provider metadata makes the denominator ambiguous when cache reads
+  // exist. Without cache reads both supported denominator conventions agree.
+  if (Number(r?.unknownSemantics ?? 0) > 0) return null;
   const prompt = Number(r?.anthropicPrompt ?? 0) + Number(r?.otherPrompt ?? 0);
   return prompt > 0 ? Number(r?.cacheRead ?? 0) / prompt : 0;
 }
@@ -243,8 +252,8 @@ export async function registerStatsRoutes(app: FastifyInstance): Promise<void> {
     const models = db.select().from(schema.models).all();
     const modelMap = new Map(models.map((m) => [m.id, m]));
     const mergedModels = new Map<string, { requests: number; errors: number; tokens: number }>();
-    for (const r of topModels) { const id = r.modelId ? modelMap.get(r.modelId)?.publicModelId ?? r.modelId : 'unknown'; const v = mergedModels.get(id) ?? { requests: 0, errors: 0, tokens: 0 }; v.requests += Number(r.c); v.errors += Number(r.err); v.tokens += Number(r.tokens); mergedModels.set(id, v); }
-    for (const r of aggregateRows.filter((x) => aggregateDays.includes(x.day))) { const id = r.modelId ? modelMap.get(r.modelId)?.publicModelId ?? r.modelId : 'unknown'; const v = mergedModels.get(id) ?? { requests: 0, errors: 0, tokens: 0 }; v.requests += r.requests; v.errors += r.failedRequests; v.tokens += r.inputTokens + r.outputTokens; mergedModels.set(id, v); }
+    for (const r of topModels) { const id = r.modelId ? modelMap.get(r.modelId)?.publicModelId ?? `Deleted model (${r.modelId})` : 'unknown'; const v = mergedModels.get(id) ?? { requests: 0, errors: 0, tokens: 0 }; v.requests += Number(r.c); v.errors += Number(r.err); v.tokens += Number(r.tokens); mergedModels.set(id, v); }
+    for (const r of aggregateRows.filter((x) => aggregateDays.includes(x.day))) { const id = r.modelId ? modelMap.get(r.modelId)?.publicModelId ?? `Deleted model (${r.modelId})` : 'unknown'; const v = mergedModels.get(id) ?? { requests: 0, errors: 0, tokens: 0 }; v.requests += r.requests; v.errors += r.failedRequests; v.tokens += r.inputTokens + r.outputTokens; mergedModels.set(id, v); }
     const topKeys = db
       .select({
         apiKeyId: schema.requests.apiKeyId,
@@ -289,7 +298,11 @@ export async function registerStatsRoutes(app: FastifyInstance): Promise<void> {
         avgLat:    sql<number>`COALESCE(AVG(CASE WHEN success=1 THEN latency_ms END),0)`,
       })
       .from(schema.requestAttempts)
-      .where(and(gte(schema.requestAttempts.startedAt, fromIso), lte(schema.requestAttempts.startedAt, toIso)))
+      .where(and(
+        gte(schema.requestAttempts.startedAt, fromIso),
+        lte(schema.requestAttempts.startedAt, toIso),
+        aggregateDays.length ? sql`substr(${schema.requestAttempts.startedAt},1,10) NOT IN (${sql.join(aggregateDays.map((day) => sql`${day}`), sql`, `)})` : undefined,
+      ))
       .groupBy(schema.requestAttempts.providerId)
       .all();
     const allProviders = db.select().from(schema.providers).all();
@@ -303,10 +316,19 @@ export async function registerStatsRoutes(app: FastifyInstance): Promise<void> {
     const providerTotals = new Map(providerAggs.map((r) => [r.providerId, { total: Number(r.total), errors: Number(r.err), latencySum: Number(r.avgLat) * (Number(r.total) - Number(r.err)), latencyCount: Number(r.total) - Number(r.err) }]));
     const providerAggregateRows = db.select().from(schema.dailyProviderStats).where(and(gte(schema.dailyProviderStats.day, fromIso.slice(0, 10)), lte(schema.dailyProviderStats.day, toIso.slice(0, 10)))).all().filter((r) => aggregateDays.includes(r.day));
     for (const r of providerAggregateRows) { const a = providerTotals.get(r.providerId) ?? { total: 0, errors: 0, latencySum: 0, latencyCount: 0 }; a.total += r.attempts; a.errors += r.failedAttempts; a.latencySum += r.latencySuccessSumMs; a.latencyCount += r.latencySuccessCount; providerTotals.set(r.providerId, a); }
+    const historicalProviders: HistoricalProviderStats[] = [];
     const providers: RoutingProvider[] = [...providerTotals].map(([providerId, r]) => {
         const p = providerLookup.get(providerId);
-        if (!p) return null;
         const total = r.total;
+        const traffic = {
+          requests: total,
+          errorRate: total > 0 ? r.errors / total : 0,
+          avgLatencyMs: r.latencyCount ? r.latencySum / r.latencyCount : 0,
+        };
+        if (!p) {
+          historicalProviders.push({ id: providerId, name: `Deleted provider (${providerId})`, ...traffic });
+          return null;
+        }
         return {
           id: providerId,
           name: p.name,
@@ -314,9 +336,7 @@ export async function registerStatsRoutes(app: FastifyInstance): Promise<void> {
           health: p.healthState as RoutingProvider['health'],
           enabled: p.enabled,
           modelCount: countMap.get(providerId) ?? 0,
-          requests: total,
-          errorRate: total > 0 ? r.errors / total : 0,
-          avgLatencyMs: r.latencyCount ? r.latencySum / r.latencyCount : 0,
+          ...traffic,
         };
       })
       .filter((x): x is RoutingProvider => x !== null)
@@ -333,6 +353,7 @@ export async function registerStatsRoutes(app: FastifyInstance): Promise<void> {
       topApiKeys: [...mergedKeys].map(([name, v]) => ({ name, requests: v.requests, totalTokens: v.tokens })).sort((a, b) => b.requests - a.requests).slice(0, 10),
       recent,
       providers,
+      historicalProviders: historicalProviders.sort((a, b) => b.requests - a.requests),
     };
   });
 }

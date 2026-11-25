@@ -2,23 +2,17 @@
 
 import { getDb, getRawDb, schema } from '../db/index';
 import { desc, eq } from 'drizzle-orm';
-import { GatewayError, preserveClientDisconnect } from '../errors';
+import { GatewayError, clientDisconnectedError } from '../errors';
 import { resolveRequestedModel, unwrapAlias } from '../routing/resolver';
 import { bareModelName, deriveRequiredCapabilities, describeRejections, firstMissingCapability, type CanonicalRequest, type RejectedMember, type RejectionReason, type RequiredCapabilities } from '../routing/capabilities';
-import { loadCombo, selectCandidates, orderCandidates, shouldFallback, expandCodexAccountCandidates, expandQoderAccountCandidates, type ComboPlan, type CandidateModel } from '../routing/combo';
-import { claimComboSlowProbe, getComboSlowState, listComboSlowStates, recordComboSlowOutcome, releaseComboSlowProbe } from '../routing/combo-slow-fallback';
-import { listCodexAccountsForProvider, setCodexAccountHealth } from '../db/repositories/codex-accounts';
-import { listQoderAccountsForProvider, setQoderAccountHealth } from '../db/repositories/qoder-accounts';
-import { qoderAttemptFailure, qoderCredentialsFor } from '../providers/qoder/credentials';
-import { refreshQoderCreditsIfStale } from '../providers/qoder/credits';
-import { callQoderNonStreaming, callQoderStreaming } from '../providers/qoder/client';
-import { refreshCodexUsageIfStale } from '../providers/codex-autostart';
-import { getEffectiveState, recordSuccess, recordFailure, halfOpenProbeAllowed, circuitBlocks } from '../routing/circuit';
+import { loadCombo, selectCandidates, orderCandidates, shouldFallback, type ComboPlan, type CandidateModel } from '../routing/combo';
+import { classifyWorkload, pickAdaptiveCandidate, type AdaptiveDecision } from '../routing/combo-policy';
+import { beginAdaptiveAttempt, listAdaptiveStates, claimAdaptiveProbe, claimAdaptiveExploration, recordAdaptiveOutcome, releaseAdaptiveProbe } from '../routing/combo-adaptive-state';
+import { claimCircuitAttempt, releaseCircuitAttempt, recordSuccess, recordFailure, recordThrottle, recordModelThrottle, modelThrottleBlocks, circuitBlocks } from '../routing/circuit';
 import { checkRpm, checkTpm, acquireConcurrent, releaseConcurrent } from '../routing/ratelimit';
 import { checkDailyMonthly, consumeUsage } from '../routing/quota';
 import { keyAllowedFor, type AuthenticatedKey } from '../auth/api-key';
-import { providerToUpstreamConfig, callUpstreamNonStreaming, callUpstreamStreaming, upstreamUrl, upstreamHttpError, type UpstreamCall } from '../upstream/client';
-import { callCodexNonStreaming, callCodexStreaming } from '../providers/codex';
+import { providerToUpstreamConfig, callUpstreamNonStreaming, callUpstreamStreaming, upstreamUrl, upstreamHttpError, retryAfterMs, type UpstreamCall } from '../upstream/client';
 import { canonicalToOpenAIRequest, openAIResponseToCanonical } from '../protocols/canonical';
 import { canonicalToAnthropicRequest, anthropicResponseToCanonical } from '../protocols/anthropic';
 import { uuid } from '../auth/ids';
@@ -41,6 +35,8 @@ export interface GatewayContext {
   requestedModel: string;
   key: AuthenticatedKey | null;
   reply: FastifyReply;
+  /** Admin diagnostics exercise real routing without training user workload or caching. */
+  synthetic?: boolean;
 }
 
 export interface GatewayRequest {
@@ -73,8 +69,6 @@ export interface AttemptOutcome {
   streamStarted: boolean;
   partialResponse: boolean;
   selectionReason: string;
-  codexAccountId?: string;
-  qoderAccountId?: string;
   failureReason: string | null;
   sanitizedError: string | null;
   upstreamRequestId: string | null;
@@ -106,7 +100,7 @@ export interface GatewayOutcome {
 export class GatewayRunner {
   async execute(req: GatewayRequest, ctx: GatewayContext): Promise<GatewayOutcome> {
     const start = Date.now();
-    metrics.activeRequests.inc();
+    const startMono = performance.now();
     let concurrencyAcquired = false;
 
     const usage: UsageSummary = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, total: 0 };
@@ -165,6 +159,34 @@ export class GatewayRunner {
       concurrencyAcquired = true;
     }
 
+    metrics.activeRequests.inc();
+    const requestAbort = new AbortController();
+    let deadlineAt = Infinity;
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+    const tightenDeadline = (plan: ComboPlan | null) => {
+      if (plan?.maxRequestDurationSeconds == null) return;
+      const next = startMono + plan.maxRequestDurationSeconds * 1000;
+      if (next >= deadlineAt) return;
+      deadlineAt = next;
+      if (deadlineTimer) clearTimeout(deadlineTimer);
+      const remaining = deadlineAt - performance.now();
+      if (remaining <= 0) requestAbort.abort(overallDeadlineError());
+      else deadlineTimer = setTimeout(() => requestAbort.abort(overallDeadlineError()), remaining);
+    };
+    tightenDeadline(comboPlan);
+    const response = ctx.reply.raw;
+    const detachDownstream = typeof response.on === 'function' && typeof response.off === 'function'
+      ? watchDownstreamDisconnect(response, () => requestAbort.abort(clientDisconnectedError()))
+      : undefined;
+    const abortError = (): GatewayError | null => {
+      if (requestAbort.signal.aborted) return requestAbort.signal.reason as GatewayError;
+      if (performance.now() >= deadlineAt) {
+        const error = overallDeadlineError();
+        requestAbort.abort(error);
+        return error;
+      }
+      return null;
+    };
     try {
       // --- Capability requirements ---
       const required = deriveRequiredCapabilities(req.canonical);
@@ -181,13 +203,11 @@ export class GatewayRunner {
 
       // --- Determine candidates ---
       let candidates: CandidateModel[] = [];
-      const selectionReasons: string[] = [];
       const rejected: RejectedMember[] = [];
       if (resolved.kind === 'model') {
-        const loaded = await this.loadModelCandidate(resolved.modelId, required, ctx.requestId);
+        const loaded = this.loadModelCandidate(resolved.modelId, required, ctx.requestId);
         candidates = loaded.candidates;
         rejected.push(...loaded.rejected);
-        selectionReasons.push('direct_model');
       } else if (comboPlan) {
         // A disabled combo is a configuration decision, not a routing failure:
         // say so instead of blaming its members for not being available.
@@ -195,30 +215,13 @@ export class GatewayRunner {
           const s = describeRejections({ kind: 'combo', publicModelId: resolved.publicModelId }, [{ publicModelId: resolved.publicModelId, reason: 'combo_disabled' }]);
           throw new GatewayError(s.type, s.message, { status: s.status, code: s.type });
         }
-        const all = await this.loadAllModels();
+        const all = this.loadAllModels();
         const filtered = selectCandidates(comboPlan, all, required, (c, reason) => {
           rejected.push({ publicModelId: c.publicModelId, reason });
           debugHttp(ctx.requestId, 'CAPABILITY REJECT', [`model=${c.publicModelId}`, `reason=${reason}`]);
         });
-        let eligibleFiltered = filtered;
-        if (comboPlan.slowResponseFallbackEnabled) {
-          const now = Date.now();
-          const slowStates = new Map(listComboSlowStates(comboPlan.comboId).map((state) => [state.modelId, state]));
-          eligibleFiltered = filtered.flatMap((candidate) => {
-            const state = slowStates.get(candidate.modelId);
-            if (!state) return [candidate];
-            if (state.probeLeaseUntilMs !== null && state.probeLeaseUntilMs > now) {
-              rejected.push({ publicModelId: candidate.publicModelId, reason: 'slow_response_probe_active' });
-              return [];
-            }
-            if (state.cooldownUntilMs !== null && state.cooldownUntilMs > now) {
-              rejected.push({ publicModelId: candidate.publicModelId, reason: 'slow_response_cooldown' });
-              return [];
-            }
-            if (state.cooldownUntilMs !== null) return [{ ...candidate, slowResponseProbe: true }];
-            return [candidate];
-          });
-        }
+        // Slow/degraded members remain hard eligible: they may serve as reserves.
+        const eligibleFiltered = filtered;
         // docs/13 §10: always report why EACH member was filtered out
         debugHttp(ctx.requestId, 'CANDIDATE FILTER', [
           `comboMembers=${comboPlan.members.length}`,
@@ -228,19 +231,13 @@ export class GatewayRunner {
         ]);
         if (eligibleFiltered.length === 0) {
           const s = describeRejections({ kind: 'combo', publicModelId: resolved.publicModelId }, rejected);
-          throw new GatewayError(s.type, s.message, { status: s.status, code: s.type });
+          throw new GatewayError(s.type, s.message, { status: comboPlan.slowResponseFallbackEnabled && s.type === 'upstream_unavailable' ? 503 : s.status, code: s.type });
         }
-        candidates = orderCandidates(comboPlan, eligibleFiltered).flatMap((candidate) => {
-          const provider = getDb().select().from(schema.providers).where(eq(schema.providers.id, candidate.providerId)).get();
-          if (provider?.type === 'codex') return expandCodexAccountCandidates(candidate, listCodexAccountsForProvider(provider.id));
-          if (provider?.type === 'qoder') return expandQoderAccountCandidates(candidate, listQoderAccountsForProvider(provider.id));
-          return [candidate];
-        });
+        candidates = orderCandidates(comboPlan, eligibleFiltered);
         debugHttp(ctx.requestId, 'CANDIDATES ORDERED', [
           `mode=${comboPlan.mode}`,
           ...candidates.map((c, i) => `candidate[${i}]: providerModelId=${c.modelId} publicModelId=${c.publicModelId}`),
         ]);
-        selectionReasons.push('combo');
       }
 
       if (candidates.length === 0) {
@@ -252,13 +249,15 @@ export class GatewayRunner {
       const settings = getSettings();
       const keyCacheOverride = ctx.key?.cacheOverrideEnabled ?? null;
       const targetCacheOverride = this.getTargetCacheOverride(resolved);
-      const allowed = cacheAllowed({
+      const allowed = !ctx.synthetic && cacheAllowed({
         globalEnabled: settings.gatewayCacheEnabled,
         keyAllowed: keyCacheOverride,
         targetAllowed: targetCacheOverride,
         streaming: req.canonical.stream,
       });
       if (allowed && !req.canonical.stream && !hasTools(req.canonical)) {
+        const cancelled = abortError();
+        if (cancelled) throw cancelled;
         const configVersion = this.getTargetConfigVersion(resolved);
         const cacheKey = buildCacheKey({
           protocol: req.protocol,
@@ -287,10 +286,8 @@ export class GatewayRunner {
 
       // --- Attempt loop with fallback ---
       const firstProvider = getDb().select().from(schema.providers).where(eq(schema.providers.id, candidates[0]!.providerId)).get();
-      const maxAttempts = comboPlan?.maxTotalAttempts
-        ?? (candidates.length > 1 ? candidates.length : 1 + (firstProvider?.maxRetries ?? 0));
+      let maxAttempts = comboPlan?.maxTotalAttempts ?? (1 + (firstProvider?.maxRetries ?? 0));
       let lastError: GatewayError | null = null;
-      let sentToClient = false; // semantically committed output sent
       let resultText = '';
       let resultToolCalls: Array<{ id: string; name: string; input: unknown }> = [];
       let resultFinishReason: string | null = null;
@@ -298,52 +295,152 @@ export class GatewayRunner {
       let completedSuccessfully = false;
 
       let attemptNumber = 0;
-      let candidateRetries = 0;
-      for (let i = 0; i < candidates.length && attemptNumber < maxAttempts;) {
-        const candidate = candidates[i]!;
-        finalModelId = candidate.modelId;
+      const workload = classifyWorkload(req.canonical);
+      const attempted = new Set<string>();
+      const softTimedOut = new Set<string>();
+      const softTimedOutMembers = new Map<string, string | undefined>();
+      const hardFailed = new Set<string>();
+      const skipped = new Set<string>();
+      const blockedProbes = new Set<string>();
+      let replayed = false;
+      let allowExploration = !ctx.synthetic;
+      let pendingRetry: CandidateModel | null = null;
+      const retriesByModel = new Map<string, number>();
+      while (attemptNumber < maxAttempts) {
+        const cancelled = abortError();
+        if (cancelled) { lastError = cancelled; break; }
+        // Configuration and provider state can change while an earlier attempt
+        // is in flight. Re-read them before choosing every actual dispatch.
+        if (resolved.kind === 'combo') {
+          const fresh = loadCombo(resolved.comboId);
+          if (!fresh || fresh.enabled === false) {
+            lastError = new GatewayError('upstream_unavailable', 'Combo is no longer available', { status: 503 });
+            break;
+          }
+          comboPlan = fresh;
+          maxAttempts = Math.min(maxAttempts, fresh.maxTotalAttempts);
+          tightenDeadline(fresh);
+          if (attemptNumber >= maxAttempts) break;
+          if (lastError && !shouldRetryAttempt(fresh, lastError)) break;
+          candidates = orderCandidates(fresh, selectCandidates(fresh, this.loadAllModels(), required));
+          // A deleted/re-added membership cannot inherit a prior soft timeout.
+          for (const [modelId, memberId] of softTimedOutMembers) {
+            if (!fresh.members.some((m) => m.modelId === modelId && m.id === memberId && m.enabled)) softTimedOut.delete(modelId);
+          }
+        } else {
+          candidates = this.loadModelCandidate(resolved.modelId, required, ctx.requestId).candidates;
+        }
+        if (ctx.key) {
+          const currentKey = getDb().select().from(schema.apiKeys).where(eq(schema.apiKeys.id, ctx.key.id)).get();
+          if (!currentKey || !currentKey.enabled || (currentKey.expiresAt && Date.parse(currentKey.expiresAt) <= Date.now())
+            || !keyAllowedFor({ ...ctx.key, allowAllModels: currentKey.allowAllModels }, resolved.kind, this.resolvedId(resolved))) {
+            lastError = new GatewayError('permission_error', 'Model no longer permitted for this API key', { status: 403 });
+            break;
+          }
+        }
+        const afterRefresh = abortError();
+        if (afterRefresh) { lastError = afterRefresh; break; }
+        const eligible = candidates.filter((c) => !skipped.has(c.modelId));
+        const adaptive = comboPlan?.slowResponseFallbackEnabled === true;
+        const comparableCandidates = eligible.filter((c) => !hardFailed.has(c.modelId));
+        const retry: CandidateModel | undefined = pendingRetry === null ? undefined : eligible.find((c) => c.modelId === pendingRetry!.modelId && c.comboMemberId === pendingRetry!.comboMemberId);
+        pendingRetry = null;
+        const decision: AdaptiveDecision | null = retry
+          ? { candidate: retry, role: 'normal' as const, reason: 'retry_empty_response', softTimeout: false }
+          : adaptive && comboPlan
+            ? pickAdaptiveCandidate({
+                candidates: comparableCandidates,
+                plan: comboPlan,
+                states: listAdaptiveStates(comboPlan.comboId, workload),
+                attempted,
+                actualAttempts: attemptNumber,
+                softTimedOut,
+                replayed,
+                now: Date.now(),
+                blockedProbes: ctx.synthetic ? new Set(comparableCandidates.map((c) => c.modelId)) : blockedProbes,
+                allowExploration,
+              })
+            : (() => {
+                const candidate = eligible.find((c) => !attempted.has(c.modelId));
+                return candidate ? { candidate, role: 'normal' as const, reason: comboPlan ? (attemptNumber ? 'fallback_after_error' : 'priority') : 'direct_model', softTimeout: false } : null;
+              })();
+        if (!decision) break;
+        const { candidate, role }: Pick<AdaptiveDecision, 'candidate' | 'role'> = decision;
         const provider = getDb().select().from(schema.providers).where(eq(schema.providers.id, candidate.providerId)).get();
         if (!provider || !provider.enabled) {
-          attemptNumber++;
-          debugHttp(ctx.requestId, 'ATTEMPT SKIP', [`attempt=${attemptNumber} model=${candidate.publicModelId} reason=skipped_disabled_provider`]);
-          attempts.push(this.failedAttempt(attemptNumber, candidate, provider?.name ?? '', 'skipped_disabled_provider', null, null, 0, null, null));
-          i++;
+          skipped.add(candidate.modelId);
+          debugHttp(ctx.requestId, 'ATTEMPT SKIP', [`model=${candidate.publicModelId} reason=skipped_disabled_provider`]);
           continue;
         }
-        const eff = getEffectiveState(provider.id, provider.cbCooldownSeconds);
-        if (eff === 'open' && !halfOpenProbeAllowed(provider.id)) {
-          attemptNumber++;
-          debugHttp(ctx.requestId, 'ATTEMPT SKIP', [`attempt=${attemptNumber} model=${candidate.publicModelId} provider=${provider.name} reason=circuit_open`]);
-          attempts.push(this.failedAttempt(attemptNumber, candidate, provider.name, 'circuit_open', null, null, 0, null, null));
-          if (comboPlan && shouldFallback(comboPlan, { type: 'connection_error' })) {
-            metrics.fallbackCount.inc();
-            i++;
-            continue;
-          }
-          lastError = new GatewayError('upstream_unavailable', 'Provider circuit is open', { status: 502 });
+        let baseCfg: ReturnType<typeof providerToUpstreamConfig>;
+        try { baseCfg = providerToUpstreamConfig(provider); }
+        catch (e) {
+          lastError = e instanceof GatewayError ? e : new GatewayError('upstream_error', (e as Error).message, { cause: e });
           break;
         }
-
-        const baseCfg = providerToUpstreamConfig(provider, candidate.codexAccountId);
-        const cfg = comboPlan?.slowResponseFallbackEnabled && comboPlan.slowResponseThresholdMs
-          ? { ...baseCfg, slowResponseTimeoutMs: comboPlan.slowResponseThresholdMs }
-          : baseCfg;
-        if (candidate.slowResponseProbe && comboPlan && !claimComboSlowProbe(
-          comboPlan.comboId,
-          candidate.modelId,
-          candidate.comboMemberId ?? '',
-          Date.now(),
-          (comboPlan.slowResponseThresholdMs ?? 60_000) + 30_000,
-          comboPlan.slowResponseGeneration,
-        )) {
-          debugHttp(ctx.requestId, 'ATTEMPT SKIP', [`model=${candidate.publicModelId} reason=slow_response_probe_active`]);
-          i++;
+        const circuitPermit = claimCircuitAttempt(provider.id, provider.cbCooldownSeconds);
+        if (!circuitPermit) {
+          skipped.add(candidate.modelId);
+          debugHttp(ctx.requestId, 'ATTEMPT SKIP', [`model=${candidate.publicModelId} reason=circuit_open`]);
           continue;
         }
+        const attemptPlan = comboPlan;
+        const threshold = attemptPlan?.slowResponseThresholdMs ?? 60_000;
+        const remainingMs = deadlineAt - performance.now();
+        const softTimeout = adaptive && decision.softTimeout && role !== 'replay'
+          && attemptNumber + 1 < maxAttempts && remainingMs > threshold
+          && baseCfg.totalTimeoutMs > threshold;
+        const cfg = { ...baseCfg, requestSignal: requestAbort.signal, ...(softTimeout ? { slowResponseTimeoutMs: threshold } : {}) };
+        let probeToken: string | null = null;
+        let claimOk = false;
+        try {
+          if (adaptive && attemptPlan && !ctx.synthetic) {
+            if (role === 'probe') {
+              probeToken = claimAdaptiveProbe(attemptPlan, candidate, workload, Date.now(), Math.min(baseCfg.totalTimeoutMs, remainingMs) + 30_000);
+              if (!probeToken) {
+                blockedProbes.add(candidate.modelId);
+                continue;
+              }
+            } else if (role === 'explore') {
+              if (!claimAdaptiveExploration(attemptPlan, workload, Date.now())) {
+                allowExploration = false;
+                continue;
+              }
+              allowExploration = false;
+            }
+          }
+          claimOk = true;
+        } finally {
+          // Failed claims must roll back the provider half-open token before re-picking.
+          if (!claimOk) releaseCircuitAttempt(provider.id, circuitPermit);
+        }
+        const beforeDispatch = abortError();
+        if (beforeDispatch) {
+          try {
+            if (probeToken && attemptPlan) releaseAdaptiveProbe(attemptPlan, candidate, workload, probeToken);
+          } finally { releaseCircuitAttempt(provider.id, circuitPermit); }
+          lastError = beforeDispatch;
+          break;
+        }
+        let attemptFence: ReturnType<typeof beginAdaptiveAttempt> | null = null;
+        try {
+          if (adaptive && !ctx.synthetic) attemptFence = beginAdaptiveAttempt();
+        } catch (e) {
+          try {
+            if (probeToken && attemptPlan) releaseAdaptiveProbe(attemptPlan, candidate, workload, probeToken);
+          } finally { releaseCircuitAttempt(provider.id, circuitPermit); }
+          throw e;
+        }
         attemptNumber++;
+        if (attemptNumber > 1 && finalModelId !== candidate.modelId) metrics.fallbackCount.inc();
+        if (adaptive && !ctx.synthetic) metrics.adaptiveDecisions.inc({ reason: decision.reason });
+        attempted.add(candidate.modelId);
+        if (role === 'replay') replayed = true;
+        finalModelId = candidate.modelId;
         const attemptStart = Date.now();
-        // docs/13 §11–§12: provider/account + upstream request summary
-        const upstreamModel = candidate.publicModelId.split('/').slice(1).join('/');
+        const attemptStartMono = performance.now();
+        // docs/13 §11–§12: provider + upstream request summary
+        const upstreamModel = candidate.upstreamModelId;
         debugHttp(ctx.requestId, 'ATTEMPT', [
           `attempt=${attemptNumber}/${maxAttempts}`,
           `provider=${provider.name}`,
@@ -370,51 +467,41 @@ export class GatewayRunner {
           usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, total: 0 },
           streamStarted: false,
           partialResponse: false,
-          selectionReason: candidate.selectionReason ?? selectionReasons[0] ?? 'direct',
-          codexAccountId: candidate.codexAccountId,
-          qoderAccountId: candidate.qoderAccountId,
+          selectionReason: decision.reason,
           failureReason: null,
           sanitizedError: null,
           upstreamRequestId: null,
         };
 
-        let slowStateRecordedFast = false;
+        const learnOutcome = (kind: 'success' | 'soft_timeout' | 'error' | 'cancel', latencyMs: number | null) => {
+          if (!adaptive || !attemptPlan || !attemptFence || ctx.synthetic) return;
+          metrics.adaptiveOutcomes.inc({ role, result: kind });
+          try {
+            const currentlyComparable = selectCandidates(attemptPlan, this.loadAllModels(), required)
+              .filter((c) => !hardFailed.has(c.modelId) && !skipped.has(c.modelId));
+            recordAdaptiveOutcome({
+              plan: attemptPlan, candidate, workload, startedAtMs: attemptStart, now: Date.now(),
+              kind, latencyMs, role, probeToken, comparableCandidates: currentlyComparable, learn: true, attemptFence,
+            });
+          } catch (e) {
+            // Learning failure must never duplicate an upstream request or turn
+            // a delivered result into an error.
+            errorLine(ctx.requestId, 'ADAPTIVE STATE ERROR', [redactString((e as Error).message)]);
+          }
+        };
         try {
           const out = await this.runOneAttempt(req, ctx, candidate, provider.name, cfg, required, (isStreamStarted) => {
             attempt.streamStarted = isStreamStarted;
           }, (ttftMs) => {
             attempt.ttftMs = ttftMs;
-            if (comboPlan?.slowResponseFallbackEnabled
-              && comboPlan.slowResponseThresholdMs !== undefined
-              && ttftMs < comboPlan.slowResponseThresholdMs
-              && getComboSlowState(comboPlan.comboId, candidate.modelId)) {
-              recordComboSlowOutcome(
-                comboPlan.comboId,
-                candidate.modelId,
-                candidate.comboMemberId ?? '',
-                'fast',
-                comboPlan.slowResponseMaxCount ?? 3,
-                ttftMs,
-                Date.now(),
-                comboPlan.slowResponseGeneration,
-              );
-              slowStateRecordedFast = true;
-            }
             // Live signal for the monitoring dashboard: the request is now
             // being served by this provider (lit up from TTFT until the
             // completion event fires on persist).
             emitRequestStarted(ctx.requestId, provider.id, candidate.modelId, ctx.requestedModel, ttftMs);
           });
-          const attemptLatencyMs = Date.now() - attemptStart;
-          if (comboPlan?.slowResponseFallbackEnabled && !req.canonical.stream
-            && comboPlan.slowResponseThresholdMs !== undefined
-            && out.ttftMs !== null && out.ttftMs >= comboPlan.slowResponseThresholdMs) {
-            throw new GatewayError('timeout_error', 'Combo slow response threshold exceeded', {
-              status: 504,
-              code: 'combo_slow_response_timeout',
-              cause: { usage: out.usage },
-            });
-          }
+          const attemptLatencyMs = Math.round(performance.now() - attemptStartMono);
+          const cancelled = req.canonical.stream && attempt.streamStarted ? null : abortError();
+          if (cancelled) throw new GatewayError(cancelled.type, cancelled.message, { status: cancelled.status, code: cancelled.code, cause: { usage: out.usage } });
           attempt.statusCode = (out as { statusCode?: number | null }).statusCode ?? null;
           attempt.success = true;
           completedSuccessfully = true;
@@ -436,46 +523,27 @@ export class GatewayRunner {
           resultText = out.result.text;
           resultToolCalls = out.result.toolCalls;
           resultFinishReason = out.result.finishReason;
-          if (!req.canonical.stream && comboPlan?.slowResponseFallbackEnabled && getComboSlowState(comboPlan.comboId, candidate.modelId)) {
-            const measuredLatency = out.ttftMs;
-            if (measuredLatency !== null) {
-              recordComboSlowOutcome(comboPlan.comboId, candidate.modelId, candidate.comboMemberId ?? '', 'fast', comboPlan.slowResponseMaxCount ?? 3, measuredLatency, Date.now(), comboPlan.slowResponseGeneration);
-            }
+          // A streaming TTFT is a successful sample only after the stream has
+          // completed; non-streaming samples measure the entire valid response.
+          learnOutcome('success', req.canonical.stream ? out.ttftMs : attemptLatencyMs);
+          if (recordSuccess(provider.id, circuitPermit)) {
+            try {
+              getDb().update(schema.providers).set({ healthState: 'healthy', updatedAt: new Date().toISOString() }).where(eq(schema.providers.id, provider.id)).run();
+            } catch (e) { errorLine(ctx.requestId, 'PROVIDER HEALTH UPDATE ERROR', [redactString((e as Error).message)]); }
           }
-          recordSuccess(provider.id);
-          if (candidate.codexAccountId) setCodexAccountHealth(candidate.codexAccountId, 'healthy');
-          if (candidate.qoderAccountId) setQoderAccountHealth(candidate.qoderAccountId, 'healthy');
-          // Refresh the quota snapshot in the background so the dashboard reflects real usage.
-          // Never awaited: it is a second upstream call, and the response is already complete.
-          // Throttled inside each helper, so a burst of requests costs at most one refresh.
-          if (candidate.codexAccountId) void refreshCodexUsageIfStale(candidate.codexAccountId).catch(() => {});
-          if (candidate.qoderAccountId) void refreshQoderCreditsIfStale(candidate.qoderAccountId).catch(() => {});
-          getDb().update(schema.providers).set({ healthState: 'healthy', updatedAt: new Date().toISOString() }).where(eq(schema.providers.id, provider.id)).run();
           attempts.push(attempt);
-          sentToClient = (out as { streamStarted?: boolean }).streamStarted ?? false;
           break;
         } catch (e) {
           const err = e instanceof GatewayError ? e : new GatewayError('upstream_error', (e as Error).message, { cause: e });
-          if (comboPlan?.slowResponseFallbackEnabled) {
-            if (err.code === 'combo_slow_response_timeout') {
-              recordComboSlowOutcome(
-                comboPlan.comboId,
-                candidate.modelId,
-                candidate.comboMemberId ?? '',
-                'slow',
-                comboPlan.slowResponseMaxCount ?? 3,
-                Date.now() - attemptStart,
-                Date.now(),
-                comboPlan.slowResponseGeneration,
-              );
-            } else if (!slowStateRecordedFast && candidate.slowResponseProbe) {
-              releaseComboSlowProbe(comboPlan.comboId, candidate.modelId, candidate.comboMemberId ?? '', err.code !== 'client_disconnected', Date.now(), comboPlan.slowResponseGeneration);
-            }
+          const cancelled = err.code === 'client_disconnected' || err.code === 'combo_overall_timeout';
+          if (err.code === 'combo_slow_response_timeout') {
+            softTimedOut.add(candidate.modelId);
+            softTimedOutMembers.set(candidate.modelId, candidate.comboMemberId);
+            learnOutcome('soft_timeout', threshold);
+          } else {
+            hardFailed.add(candidate.modelId);
+            learnOutcome(cancelled ? 'cancel' : 'error', null);
           }
-          const quotaFailure = isQuotaFailure(err);
-          // Only a final verdict retires the account (below); a transient refresh failure still moves
-          // the request to a sibling account but must leave this one enabled.
-          const credentialFailure = isPermanentCredentialFailure(err);
           debugUpstream(ctx.requestId, 'ATTEMPT ERROR', [
             `attempt=${attemptNumber}`,
             `provider=${provider.name}`,
@@ -484,13 +552,10 @@ export class GatewayRunner {
             `status=${err.status}`,
             `willFallback=${shouldRetryAttempt(comboPlan, err)}`,
           ]);
-          // Quota failures always advance (see shouldRetryAttempt): the next candidate for a pool
-          // provider is the next account, and the exhausted one was just disabled so the retry cannot
-          // land on it again.
           const shouldRetry = shouldRetryAttempt(comboPlan, err);
           attempt.statusCode = err.status;
           attempt.success = false;
-          attempt.latencyMs = Date.now() - attemptStart;
+          attempt.latencyMs = Math.round(performance.now() - attemptStartMono);
           attempt.completedAt = new Date().toISOString();
           attempt.failureReason = classifyFailure(err);
           attempt.sanitizedError = redactString(err.message);
@@ -510,58 +575,66 @@ export class GatewayRunner {
             usage.reasoning += normalizedFailedUsage.reasoning;
             usage.total += normalizedFailedUsage.total;
           }
-          if (isUpstreamHealthFailure(err)) {
-            recordFailure(provider.id, provider.cbFailureThreshold, provider.cbCooldownSeconds);
-            if (candidate.codexAccountId) setCodexAccountHealth(candidate.codexAccountId, 'down', redactString(err.message));
-            if (candidate.qoderAccountId) setQoderAccountHealth(candidate.qoderAccountId, 'down', redactString(err.message));
-            getDb().update(schema.providers).set({ healthState: 'down', updatedAt: new Date().toISOString() }).where(eq(schema.providers.id, provider.id)).run();
+          if (isUpstreamHealthFailure(err) && recordFailure(provider.id, provider.cbFailureThreshold, provider.cbCooldownSeconds, circuitPermit)) {
+            try {
+              getDb().update(schema.providers).set({ healthState: 'down', updatedAt: new Date().toISOString() }).where(eq(schema.providers.id, provider.id)).run();
+            } catch (e) { errorLine(ctx.requestId, 'PROVIDER HEALTH UPDATE ERROR', [redactString((e as Error).message)]); }
+          }
+          const retryAfter = (err.cause as { retryAfterMs?: number } | undefined)?.retryAfterMs;
+          if (typeof retryAfter === 'number' && classifyFailure(err) === 'http_status'
+            && (err.cause as { status?: number } | undefined)?.status === 429) {
+            if (isModelScopedFailure(err)) recordModelThrottle(candidate.modelId, retryAfter, { providerId: provider.id, permit: circuitPermit });
+            else recordThrottle(provider.id, retryAfter, circuitPermit);
           }
           // The caller is gone; stop the combo rather than spending attempts on
           // fallback members that cannot deliver a response to anyone.
-          if (err.code === 'client_disconnected') {
+          if (cancelled) {
             attempt.partialResponse = attempt.streamStarted;
             attempts.push(attempt);
             lastError = err;
-            sentToClient = attempt.streamStarted;
             break;
           }
           // If stream already started sending content, do NOT fallback
           if (attempt.streamStarted) {
             attempt.partialResponse = true;
             attempts.push(attempt);
-            sentToClient = true;
-            void sentToClient;
             lastError = err;
             break;
           }
           attempts.push(attempt);
           lastError = err;
-          // An exhausted account leaves the pool outright: without this the combo retried the same
-          // dead account on every request for hours (verified live) and answered "usage limited".
-          if (quotaFailure) markQuotaExhausted(candidate, err.message);
-          // A dead refresh token also leaves the pool outright: the account cannot serve anything
-          // again until it is re-imported, so a retry may only be spent on a sibling account. Without
-          // this the retry landed on the same dead account and the request answered 502.
-          if (credentialFailure) markCredentialsDead(candidate, err.message);
           // Retry an empty 200 on the same model using its provider retry settings.
           // Reserve one attempt for a combo's next member whenever possible.
-          const reserveFallback = comboPlan && i + 1 < candidates.length ? 1 : 0;
+          const reserveFallback = comboPlan && eligible.some((c) => !attempted.has(c.modelId)) ? 1 : 0;
+          const candidateRetries = retriesByModel.get(candidate.modelId) ?? 0;
           if (err.code === 'upstream_empty_response'
+            && (!comboPlan || shouldRetry)
             && candidateRetries < provider.maxRetries
             && attemptNumber + reserveFallback < maxAttempts) {
             const delay = Math.min(provider.retryMaxMs, provider.retryBaseMs * 2 ** candidateRetries);
-            candidateRetries++;
-            if (delay > 0) await new Promise<void>((resolve) => setTimeout(resolve, delay));
+            retriesByModel.set(candidate.modelId, candidateRetries + 1);
+            pendingRetry = candidate;
+            // Release before sleeping: an empty response doesn't settle a
+            // provider half-open health probe.
+            if (probeToken && attemptPlan) {
+              try { releaseAdaptiveProbe(attemptPlan, candidate, workload, probeToken); }
+              catch (e) { errorLine(ctx.requestId, 'ADAPTIVE LEASE RELEASE ERROR', [redactString((e as Error).message)]); }
+            }
+            releaseCircuitAttempt(provider.id, circuitPermit);
+            if (delay > 0) await waitForRetry(delay, requestAbort.signal);
             continue;
           }
-          candidateRetries = 0;
-          i++;
-          if (shouldRetry && attemptNumber < maxAttempts && i < candidates.length) {
-            metrics.fallbackCount.inc();
-            continue;
+          if (shouldRetry && attemptNumber < maxAttempts) continue;
+        } finally {
+          try {
+            if (probeToken && attemptPlan) releaseAdaptiveProbe(attemptPlan, candidate, workload, probeToken);
+          } catch (e) {
+            errorLine(ctx.requestId, 'ADAPTIVE LEASE RELEASE ERROR', [redactString((e as Error).message)]);
+          } finally {
+            releaseCircuitAttempt(provider.id, circuitPermit);
           }
-          break;
         }
+        break;
       }
 
       // Build outcome
@@ -570,7 +643,12 @@ export class GatewayRunner {
       if (!completedSuccessfully && !lastError) {
         lastError = new GatewayError('upstream_unavailable', 'No upstream candidate completed successfully', { status: 503 });
       }
-      const latencyMs = Date.now() - start;
+      if (!completedSuccessfully) lastError = abortError() ?? lastError;
+      const retryAfter = (lastError?.cause as { retryAfterMs?: number } | undefined)?.retryAfterMs;
+      if (typeof retryAfter === 'number' && retryAfter > 0 && !attempts.some((a) => a.streamStarted) && typeof ctx.reply.header === 'function') {
+        ctx.reply.header('retry-after', String(Math.ceil(retryAfter / 1000)));
+      }
+      const latencyMs = Math.round(performance.now() - startMono);
       const outcome: GatewayOutcome = {
         success: !lastError,
         httpStatus: lastError ? lastError.status : 200,
@@ -593,7 +671,7 @@ export class GatewayRunner {
 
       // Store in gateway cache if eligible
       const cacheMeta = (req as unknown as { _cacheKey?: string; _cacheConfigVersion?: number });
-      if (outcome.success && cacheMeta._cacheKey && !req.canonical.stream && !hasTools(req.canonical)) {
+      if (!ctx.synthetic && outcome.success && cacheMeta._cacheKey && !req.canonical.stream && !hasTools(req.canonical)) {
         const payload = this.buildCachedPayload(req, ctx, outcome);
         storeCache({
           cacheKey: cacheMeta._cacheKey,
@@ -620,6 +698,8 @@ export class GatewayRunner {
 
       return outcome;
     } finally {
+      if (deadlineTimer) clearTimeout(deadlineTimer);
+      detachDownstream?.();
       if (concurrencyAcquired && ctx.key) releaseConcurrent(ctx.key.id);
       metrics.activeRequests.dec();
     }
@@ -627,11 +707,11 @@ export class GatewayRunner {
 
   /** Resolve a direct physical model into a candidate, reporting the exact
    *  reason it cannot serve the request instead of a blanket "no candidates". */
-  private async loadModelCandidate(
+  private loadModelCandidate(
     modelId: string,
     required: RequiredCapabilities,
     requestId?: string
-  ): Promise<{ candidates: CandidateModel[]; rejected: RejectedMember[] }> {
+  ): { candidates: CandidateModel[]; rejected: RejectedMember[] } {
     const db = getDb();
     const reject = (publicModelId: string, reason: RejectionReason): RejectedMember[] => {
       if (requestId) debugHttp(requestId, 'CAPABILITY REJECT', [`modelId=${modelId}`, `reason=${reason}`]);
@@ -654,9 +734,8 @@ export class GatewayRunner {
       // Cooldown-aware, not the raw flag: `isOpen()` stays true until some request decays it,
       // so a raw read here refused every candidate forever and the provider was unroutable
       // until a restart.
-      circuitOpen: circuitBlocks(m.providerId, p.cbCooldownSeconds),
+      circuitOpen: circuitBlocks(m.providerId, p.cbCooldownSeconds) || modelThrottleBlocks(m.id),
       capabilities: caps as never,
-      providerType: p.type,
     };
     if (!m.enabled) return { candidates: [], rejected: reject(m.publicModelId, 'model_disabled') };
     if (!m.upstreamAvailable) return { candidates: [], rejected: reject(m.publicModelId, 'upstream_unavailable') };
@@ -671,27 +750,14 @@ export class GatewayRunner {
       `caps.image_input=${(caps as { image_input?: boolean }).image_input}`,
       `caps.structured_output=${(caps as { structured_output?: boolean }).structured_output}`,
     ]);
-    // Codex providers route through their account pool: one candidate per
-    // eligible account, so fallback can move between accounts of the same model.
-    if (p.type === 'codex') {
-      const expanded = expandCodexAccountCandidates(candidate, listCodexAccountsForProvider(p.id));
-      if (expanded.length === 0) return { candidates: [], rejected: reject(m.publicModelId, 'codex_account_unavailable') };
-      return { candidates: expanded, rejected: [] };
-    }
-    if (p.type === 'qoder') {
-      const expanded = expandQoderAccountCandidates(candidate, listQoderAccountsForProvider(p.id));
-      if (expanded.length === 0) return { candidates: [], rejected: reject(m.publicModelId, 'qoder_account_unavailable') };
-      return { candidates: expanded, rejected: [] };
-    }
     return { candidates: [candidate], rejected: [] };
   }
 
-  private async loadAllModels(): Promise<CandidateModel[]> {
+  private loadAllModels(): CandidateModel[] {
     const db = getDb();
     const models = db.select().from(schema.models).all();
     const providers = db.select().from(schema.providers).all();
     const providerEnabled = new Map(providers.map((p) => [p.id, p.enabled]));
-    const providerType = new Map(providers.map((p) => [p.id, p.type as string]));
     const providerCooldown = new Map(providers.map((p) => [p.id, p.cbCooldownSeconds]));
     // Deliberately unfiltered: every combo member must reach selectCandidates so
     // it can report WHY it was skipped. Pre-filtering here erased the model rows
@@ -702,14 +768,13 @@ export class GatewayRunner {
       upstreamModelId: m.upstreamModelId,
       providerId: m.providerId,
       enabled: m.enabled,
-      providerEnabled: providerEnabled.get(m.providerId),
+      providerEnabled: providerEnabled.get(m.providerId) ?? false,
       upstreamAvailable: m.upstreamAvailable,
       // Cooldown-aware: a raw `isOpen()` here froze the whole combo on one bad minute,
       // because the flags are computed once per request while the breaker stays open
       // until some request decays it — which this filter prevented from ever happening.
-      circuitOpen: circuitBlocks(m.providerId, providerCooldown.get(m.providerId) ?? 0),
+      circuitOpen: circuitBlocks(m.providerId, providerCooldown.get(m.providerId) ?? 0) || modelThrottleBlocks(m.id),
       capabilities: safeJson(m.capabilitiesJson) as never,
-      providerType: providerType.get(m.providerId),
     }));
   }
 
@@ -740,24 +805,6 @@ export class GatewayRunner {
     ctx: GatewayContext
   ): Promise<{ statusCode: number; ttftMs: number | null; upstreamRequestId: string | null; usage: UsageSummary; result: { text: string; toolCalls: Array<{ id: string; name: string; input: unknown }>; finishReason: string | null } }> {
     const upstreamModel = candidate.upstreamModelId;
-    if (cfg.type === 'codex') {
-      const out = await callCodexNonStreaming({ baseUrl: cfg.baseUrl, accountId: cfg.codexAccountId ?? '', accountRecordId: cfg.accountRecordId, customHeaders: cfg.customHeaders, totalTimeoutMs: cfg.totalTimeoutMs }, { ...req.canonical, model: upstreamModel });
-      return { statusCode: out.status, ttftMs: null, upstreamRequestId: out.upstreamRequestId, usage: out.usage, result: { text: out.text, toolCalls: out.toolCalls, finishReason: out.finishReason } };
-    }
-    if (cfg.type === 'qoder') {
-      const accountRecordId = candidate.qoderAccountId ?? cfg.qoderAccountRecordId;
-      if (!accountRecordId) throw new GatewayError('upstream_unavailable', 'No Qoder account is available for this request', { status: 503, code: 'qoder_account_unavailable' });
-      try {
-        const { config } = await qoderCredentialsFor(accountRecordId);
-        const out = await callQoderNonStreaming(
-          { ...config, accountRecordId, name: config.label ?? undefined, email: config.email, totalTimeoutMs: cfg.totalTimeoutMs },
-          { ...req.canonical, model: upstreamModel },
-        );
-        return { statusCode: out.status, ttftMs: null, upstreamRequestId: out.upstreamRequestId, usage: out.usage, result: { text: out.text, toolCalls: out.toolCalls, finishReason: out.finishReason } };
-      } catch (error) {
-        return qoderAttemptFailure(accountRecordId, error) as never;
-      }
-    }
     let call: UpstreamCall;
     if (cfg.type === 'openai') {
       const payload = canonicalToOpenAIRequest(req.canonical, upstreamModel);
@@ -769,7 +816,7 @@ export class GatewayRunner {
       call = await callUpstreamNonStreaming(cfg, upstreamUrl(cfg, '/v1/messages'), payload, ctx.requestId);
     }
     if (!call.ok) {
-      throw upstreamHttpError(call.status, redactString(call.text.slice(0, 300)), { status: call.status });
+      throw upstreamHttpError(call.status, redactString(call.text.slice(0, 500)), { status: call.status, retryAfterMs: retryAfterMs(call.headers['retry-after']) });
     }
     let parsed: unknown;
     try {
@@ -832,6 +879,7 @@ export class GatewayRunner {
 
     let streamStarted = false;
     let streamStartTs = Date.now();
+    let streamStartMono = performance.now();
     let textBuf = '';
     const toolBuf: Array<{ id: string; name: string; input: unknown }> = [];
     let finishReason: string | null = null;
@@ -868,6 +916,7 @@ export class GatewayRunner {
     // writeHead/write/end but no `.on` — skip disconnect tracking in that case.
 
     const chunkHandler = (chunk: { data: string; event?: string }, isFirst: boolean): boolean => {
+      if (cfg.requestSignal?.aborted) throw cfg.requestSignal.reason;
       chunkCount++;
       bytesReceived += chunk.data.length;
       lastChunkTime = Date.now();
@@ -877,11 +926,21 @@ export class GatewayRunner {
         loggedFirstChunks.push(chunk.data);
         debugStream(ctx.requestId, `STREAM FIRST CHUNK ${loggedFirstChunks.length}`, [truncate(chunk.data, 2000)]);
       }
+      let obj: ReturnType<typeof JSON.parse>;
       try {
-        const obj = JSON.parse(chunk.data);
-        // Qoder emits OpenAI-shaped chunks and pipes them through this same handler
-        // (see the qoder branch below), so its usage block is parsed here too.
-        if (cfg.type === 'openai' || cfg.type === 'qoder') {
+        obj = JSON.parse(chunk.data);
+      } catch {
+        throw new GatewayError('upstream_error', 'Upstream returned invalid streaming JSON', { status: 502, code: 'upstream_bad_response' });
+      }
+      if (!obj || typeof obj !== 'object') {
+        throw new GatewayError('upstream_error', 'Upstream returned invalid streaming event', { status: 502, code: 'upstream_bad_response' });
+      }
+      if (obj.type === 'error' || obj.error || chunk.event === 'error') {
+        const message = typeof obj.error?.message === 'string' ? redactString(obj.error.message.slice(0, 300)) : 'Upstream returned a streaming error';
+        throw new GatewayError('upstream_error', message, { status: 502, code: 'upstream_bad_response' });
+      }
+      try {
+        if (cfg.type === 'openai') {
           const choice = obj.choices?.[0];
           if (choice?.delta?.content) {
             textBuf += choice.delta.content;
@@ -942,7 +1001,7 @@ export class GatewayRunner {
           }
         }
       } catch {
-        // ignore parse errors in stream
+        throw new GatewayError('upstream_error', 'Upstream returned malformed streaming content', { status: 502, code: 'upstream_bad_response' });
       }
 
       const encoded = encoder(chunk.data, chunk.event);
@@ -957,16 +1016,9 @@ export class GatewayRunner {
           }
           return false;
         }
-        if (cfg.slowResponseTimeoutMs !== undefined && Date.now() - streamStartTs >= cfg.slowResponseTimeoutMs) {
-          throw new GatewayError('timeout_error', 'Combo slow response threshold exceeded before first token', {
-            status: 504,
-            code: 'combo_slow_response_timeout',
-            cause: { usage },
-          });
-        }
         // Only real text/tool output commits the stream. Metadata-only streams
         // can still retry or fall back with an ordinary HTTP error response.
-        meaningfulTtftMs = Date.now() - streamStartTs;
+        meaningfulTtftMs = Math.round(performance.now() - streamStartMono);
         onFirstToken(meaningfulTtftMs);
         writeHead();
         // Commit markers move only after pre-commit bookkeeping and writeHead
@@ -982,58 +1034,16 @@ export class GatewayRunner {
     };
 
     try {
-      if (cfg.type === 'codex') {
-        const events: Array<ReturnType<typeof import('../providers/codex').codexStreamEventToCanonical>> = [];
-        let firstCodexEvent = true;
-        const meta = await callCodexStreaming({ baseUrl: cfg.baseUrl, accountId: cfg.codexAccountId ?? '', accountRecordId: cfg.accountRecordId, customHeaders: cfg.customHeaders, totalTimeoutMs: cfg.totalTimeoutMs }, { ...req.canonical, model: upstreamModel }, (event) => {
-          if (event.text || event.isLast || event.toolCall) {
-            events.push(event);
-            if (event.usage) Object.assign(usage, event.usage);
-            chunkHandler({ data: codexStreamEventToClient(req.protocol, event, upstreamModel, ctx.requestId) }, firstCodexEvent);
-            firstCodexEvent = false;
-          }
-        }, downstreamAbort.signal);
-        if (!streamStarted) throw emptyGenerationError(candidate, usage);
-        pipe.write('data: [DONE]\n\n');
-        pipe.end();
-        if (!usage.total) usage.total = usage.input + usage.output;
-        return { statusCode: meta.status, ttftMs: meaningfulTtftMs, upstreamRequestId: meta.upstreamRequestId, usage, result: { text: textBuf, toolCalls: toolBuf, finishReason } };
-      }
-      if (cfg.type === 'qoder') {
-        const accountRecordId = candidate.qoderAccountId ?? cfg.qoderAccountRecordId;
-        if (!accountRecordId) throw new GatewayError('upstream_unavailable', 'No Qoder account is available for this request', { status: 503, code: 'qoder_account_unavailable' });
-        let firstQoderChunk = true;
-        let qoderTtftMs: number | null = null;
-        try {
-          const { config } = await qoderCredentialsFor(accountRecordId);
-          const out = await callQoderStreaming(
-            { ...config, accountRecordId, name: config.label ?? undefined, email: config.email, totalTimeoutMs: cfg.totalTimeoutMs },
-            { ...req.canonical, model: upstreamModel },
-            // Qoder already emits OpenAI-shaped chunks, so they pipe through unchanged.
-            (chunk) => {
-              if (firstQoderChunk) { qoderTtftMs = Date.now() - streamStartTs; firstQoderChunk = false; }
-              chunkHandler({ data: chunk.data }, false);
-            },
-            { signal: downstreamAbort.signal },
-          );
-          if (!streamStarted) throw emptyGenerationError(candidate, usage);
-          pipe.write('data: [DONE]\n\n');
-          pipe.end();
-          if (!usage.total) usage.total = usage.input + usage.output;
-          return { statusCode: out.status, ttftMs: meaningfulTtftMs ?? qoderTtftMs, upstreamRequestId: out.upstreamRequestId, usage, result: { text: out.text, toolCalls: out.toolCalls, finishReason: out.finishReason } };
-        } catch (error) {
-          if (error instanceof GatewayError && error.code === 'client_disconnected') throw error;
-          return preserveClientDisconnect(downstreamAbort.signal, () => qoderAttemptFailure(accountRecordId, error)) as never;
-        }
-      }
       const url = cfg.type === 'openai' ? upstreamUrl(cfg, '/v1/chat/completions') : upstreamUrl(cfg, '/v1/messages');
       const payload = cfg.type === 'openai' ? canonicalToOpenAIRequest(req.canonical, upstreamModel) : canonicalToAnthropicRequest(req.canonical, upstreamModel);
       logUpstreamRequest(ctx.requestId, cfg, url, payload, true);
       debugStream(ctx.requestId, 'STREAM START', [`upstreamConnected=true`]);
       streamStartTs = Date.now();
+      streamStartMono = performance.now();
       const meta = await callUpstreamStreaming(cfg, url, payload, chunkHandler, ctx.requestId, streamStartTs, downstreamAbort.signal);
       // Upstream completed cleanly: ensure head + terminator are written.
       if (!streamStarted) throw emptyGenerationError(candidate, usage);
+      if (cfg.requestSignal?.aborted) throw cfg.requestSignal.reason;
       pipe.write('data: [DONE]\n\n');
       pipe.end();
       debugStream(ctx.requestId, 'STREAM END', [
@@ -1116,39 +1126,6 @@ export class GatewayRunner {
     } finally {
       detachDownstreamClose?.();
     }
-  }
-
-  private failedAttempt(
-    n: number,
-    candidate: CandidateModel,
-    providerName: string,
-    failureReason: string,
-    statusCode: number | null,
-    sanitizedError: string | null,
-    latencyMs: number,
-    ttftMs: number | null,
-    upstreamRequestId: string | null
-  ): AttemptOutcome {
-    const now = new Date().toISOString();
-    return {
-      attemptNumber: n,
-      providerId: candidate.providerId,
-      modelId: candidate.modelId,
-      providerName,
-      startedAt: now,
-      completedAt: now,
-      statusCode,
-      success: false,
-      latencyMs,
-      ttftMs,
-      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, total: 0 },
-      streamStarted: false,
-      partialResponse: false,
-      selectionReason: 'candidate',
-      failureReason,
-      sanitizedError,
-      upstreamRequestId,
-    };
   }
 
   private getTargetCacheOverride(resolved: { kind: 'model' | 'combo' } & { modelId?: string; comboId?: string }): boolean | null {
@@ -1288,8 +1265,6 @@ export class GatewayRunner {
       attemptNumber: a.attemptNumber,
       providerId: a.providerId,
       modelId: a.modelId,
-      codexAccountId: a.codexAccountId ?? null,
-      qoderAccountId: a.qoderAccountId ?? null,
       startedAt: a.startedAt,
       completedAt: a.completedAt,
       statusCode: a.statusCode,
@@ -1368,114 +1343,37 @@ export class GatewayRunner {
   }
 }
 
-export function isUpstreamHealthFailure(err: GatewayError): boolean {
-  return ['connection_error', 'connect_timeout', 'first_token_timeout', 'stream_idle_timeout', 'total_timeout', 'http_status', 'upstream_rate_limit', 'empty_response'].includes(classifyFailure(err));
+/** Explicit model-scoped refusals must not disable other models of this provider. */
+export function isModelScopedFailure(err: GatewayError): boolean {
+  const cause = err.cause as { bodyExcerpt?: unknown; status?: unknown } | undefined;
+  const detail = typeof cause?.bodyExcerpt === 'string' ? cause.bodyExcerpt : '';
+  return /\bmodel[_-](?:not[_-]found|not[_-]available|unavailable|overloaded|rate[_-]limit(?:ed|_exceeded)?|disabled|capacity)\b/i.test(detail)
+    || /\b(?:this|requested|specific) model (?:is |was )?(?:not available|unavailable|overloaded|rate limited|disabled|not found)\b/i.test(detail);
 }
 
-/**
- * An exhausted quota is a durable, per-account verdict — the account cannot serve anything again
- * until its window resets, so it must leave the pool instead of being retried.
- *
- * Deliberately NOT part of `isUpstreamHealthFailure`: that path opens the provider's circuit
- * breaker, which here would take down every sibling account of a healthy pool because one member
- * ran dry. The exhaustion is applied account-by-account by `markQuotaExhausted` instead.
- *
- * Detection needs both signals because the two upstreams refuse differently, and neither reports a
- * status the router can trust alone:
- *  - Codex answers 429 but the credential layer re-wraps it (status 502, cause 429), and a plain
- *    rate limit is also a 429 — the "usage limit"/"quota" wording is what distinguishes "come back
- *    in an hour" from "this account is spent".
- *  - Qoder refuses with a billing envelope carrying status 403/code 112, surfaced as the
- *    `qoder_billing_block` code.
- * Wording is only consulted when the status is quota-shaped, so a 400 that merely mentions the word
- * "quota" cannot disable a working account.
- */
+export function isUpstreamHealthFailure(err: GatewayError): boolean {
+  if (isModelScopedFailure(err)) return false;
+  const reason = classifyFailure(err);
+  if (['connection_error', 'connect_timeout', 'stream_idle_timeout', 'total_timeout'].includes(reason)) return true;
+  if (reason !== 'http_status') return false;
+  const status = (err.cause as { status?: unknown } | undefined)?.status ?? err.status;
+  return typeof status === 'number' && status >= 500 && status < 600;
+}
+
+/** Distinguish exhausted upstream quota from transient throttling using status and message. */
 export function isQuotaFailure(err: GatewayError): boolean {
-  if (err.code === 'qoder_billing_block') return true;
   const cause = err.cause as { status?: unknown } | undefined;
   const upstreamStatus = typeof cause?.status === 'number' ? cause.status : err.status;
   if (upstreamStatus !== 429 && upstreamStatus !== 403) return false;
-  return /usage[_ -]?limit|quota|out of credits|insufficient[_ -]?(credit|balance)|exceeded your current quota|billing/i.test(err.message);
+  const body = (err.cause as { bodyExcerpt?: string } | undefined)?.bodyExcerpt ?? '';
+  return /usage[_ -]?limit|quota|out of credits|insufficient[_ -]?(credit|balance)|exceeded your current quota|billing/i.test(`${err.message} ${body}`);
 }
 
-/**
- * Take an exhausted account out of the pool: mark it down and disable it.
- *
- * `enabled=0` (not just `health_state='down'`) is what the operator asked for and what actually
- * stops the churn: every selection path — `expandCodexAccountCandidates`,
- * `expandQoderAccountCandidates`, `getCodexAccountForProvider`, `findEligibleQoderAccount` — filters
- * on `enabled`, so disabling is the one write that makes the next request pick a different account.
- * The account stays visible in the admin UI, where re-enabling it after the window resets is a
- * one-click action.
- */
-export function markQuotaExhausted(candidate: CandidateModel, message: string): void {
-  const reason = redactString(message);
-  if (candidate.codexAccountId) setCodexAccountHealth(candidate.codexAccountId, 'down', reason, false);
-  if (candidate.qoderAccountId) setQoderAccountHealth(candidate.qoderAccountId, 'down', reason, false);
-}
-
-/**
- * A credential failure is a durable, per-account verdict — the same class as quota exhaustion.
- *
- * `withCodexCredentials` throws these as bare codes when the account's refresh token is dead
- * (Auth0 answers `refresh_token_invalidated`, "Your session has ended. Please log in again.").
- * The account cannot serve anything again until it is re-imported, so retrying it is pure waste
- * and leaving it in the pool answers 502 to every client.
- *
- * Live evidence (production, 2026-09-19): two accounts holding invalidated refresh tokens sat at
- * the head of the pool, so every request landed on one of them — `oauth_refresh_failed`,
- * classified `unknown`, `attempts_count=1`, 502 straight to the client (226 of 241 failed
- * requests had exactly one attempt while healthy accounts sat idle behind them).
- *
- * Deliberately NOT part of `isUpstreamHealthFailure`: one re-imported account must not open the
- * provider circuit breaker for its healthy siblings. The verdict is applied per account by
- * `markCredentialsDead` instead.
- *
- * Both spellings are checked because the code travels either raw (from `withCodexCredentials`
- * inside the gateway) or wrapped by `codexCredentialError`, which now keeps it as `cause`.
- */
-export function isCredentialFailure(err: GatewayError): boolean {
-  const codes = /^(oauth_refresh_failed|oauth_refresh_unavailable|invalid_refresh_response|credential_unavailable|account_not_found)$/;
-  const cause = err.cause as { message?: unknown } | undefined;
-  return codes.test(err.message) || (typeof cause?.message === 'string' && codes.test(cause.message));
-}
-
-/**
- * Whether the verdict is final, i.e. the account cannot serve again until an operator re-imports it.
- *
- * A transient refresh failure (timeout, network error, token-endpoint 5xx, rolled-back write) is
- * still a credential failure for routing — the request should move to a sibling account — but it
- * must NOT retire this one. Treating both classes as final is what degraded healthy accounts and
- * disabled them (`enabled=0`) on a single flaky moment; every live account carried
- * `consecutive_failures = 0`, so no pattern was ever required before the verdict.
- */
-export function isPermanentCredentialFailure(err: GatewayError): boolean {
-  const codes = /^(oauth_refresh_failed|credential_unavailable|account_not_found)$/;
-  const cause = err.cause as { message?: unknown } | undefined;
-  return codes.test(err.message) || (typeof cause?.message === 'string' && codes.test(cause.message));
-}
-
-/** Takes an account with a dead refresh token out of the pool. `enabled=0` is what stops the churn. */
-export function markCredentialsDead(candidate: CandidateModel, message: string): void {
-  const reason = redactString(message);
-  if (candidate.codexAccountId) setCodexAccountHealth(candidate.codexAccountId, 'down', reason, false);
-  if (candidate.qoderAccountId) setQoderAccountHealth(candidate.qoderAccountId, 'down', reason, false);
-}
-
-/**
- * Whether a failed attempt should advance to the next candidate.
- *
- * A quota failure always advances, with or without a combo plan. For a pool provider the next
- * candidate is the next *account*, so requiring a combo plan left a direct `codex/…` or `qoder/…`
- * request pinned to the exhausted account — the reported bug ("does not switch to a new account,
- * just answers usage limited"). Safe because the exhausted account was just disabled: the retry
- * cannot land on it again. Everything else keeps the combo's configured triggers, where no combo
- * plan means no fallback.
- */
+/** Whether a failed attempt should advance to the next configured candidate. */
 export function shouldRetryAttempt(comboPlan: ComboPlan | null, err: GatewayError): boolean {
-  if (isCredentialFailure(err)) return true;
+  if (err.code === 'client_disconnected' || err.code === 'combo_overall_timeout') return false;
   if (isQuotaFailure(err)) return true;
-  if (err.code === 'upstream_empty_response') return comboPlan?.trigger.on5xx ?? false;
+  if (err.code === 'upstream_empty_response' || err.code === 'upstream_bad_response') return comboPlan?.trigger.on5xx ?? false;
   if (err.code === 'combo_slow_response_timeout') return comboPlan?.slowResponseFallbackEnabled ?? false;
   const causeStatus = (err.cause as { status?: unknown } | undefined)?.status;
   const status = typeof causeStatus === 'number' ? causeStatus : err.status;
@@ -1484,18 +1382,15 @@ export function shouldRetryAttempt(comboPlan: ComboPlan | null, err: GatewayErro
 
 export function classifyFailure(err: GatewayError): string {
   if (err.code === 'client_disconnected') return 'client_disconnected';
+  if (err.code === 'combo_overall_timeout') return 'overall_timeout';
+  if (err.code === 'upstream_bad_response') return 'bad_response';
   if (err.code === 'upstream_empty_response') return 'empty_response';
   if (err.code === 'combo_slow_response_timeout') return 'slow_response_timeout';
   if (err.code === 'upstream_connect_timeout') return 'connect_timeout';
   if (err.code === 'upstream_first_token_timeout') return 'first_token_timeout';
   if (err.code === 'upstream_stream_idle_timeout') return 'stream_idle_timeout';
   if (err.code === 'upstream_total_timeout') return 'total_timeout';
-  // Checked before the type switch for the same reason as quota: a dead account is not a routing
-  // decision the combo's triggers were meant to gate, and `unknown` is not a routing decision at all.
-  if (isCredentialFailure(err)) return 'credential';
-  // Checked first, before the type switch: a quota refusal arrives as `upstream_rate_limit` (a
-  // 429) or `upstream_error` (Codex rewraps it as a 502 with a 429 cause; Qoder uses code 112) and
-  // must not fall through to `http_status`/`unknown`, neither of which is a routing decision.
+  // Preserve quota exhaustion as a distinct upstream failure category.
   if (isQuotaFailure(err)) return 'quota';
   switch (err.type) {
     case 'timeout_error':
@@ -1517,13 +1412,31 @@ export function classifyFailure(err: GatewayError): string {
   }
 }
 
-/** Zero reported output is only an error when the provider produced neither text nor tool calls.
- * A number of OpenAI-compatible services omit usage even for valid generations. */
+function overallDeadlineError(): GatewayError {
+  return new GatewayError('timeout_error', 'Combo overall request deadline exceeded', { status: 504, code: 'combo_overall_timeout' });
+}
+
+function waitForRetry(delayMs: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted || delayMs <= 0) return Promise.resolve();
+  return new Promise((resolve) => {
+    const finish = () => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, delayMs);
+    signal.addEventListener('abort', finish, { once: true });
+    if (signal.aborted) finish();
+  });
+}
+
+/** Only semantic output establishes a generation. Usage alone is not a response,
+ * and a number of OpenAI-compatible services omit usage even for valid generations. */
 function isEmptyGeneration(
-  usage: UsageSummary,
+  _usage: UsageSummary,
   result: { text: string; toolCalls: Array<{ id: string; name: string; input: unknown }> }
 ): boolean {
-  return usage.output === 0 && result.text.length === 0 && result.toolCalls.length === 0;
+  return result.text.length === 0 && result.toolCalls.length === 0;
 }
 
 function emptyGenerationError(candidate: CandidateModel, usage: UsageSummary): GatewayError {
@@ -1629,31 +1542,6 @@ function safeJsonParse(s: string): unknown {
 
 function usageFromCache(u: { input: number; output: number; cacheRead: number; cacheWrite: number; reasoning: number } | null): UsageSummary {
   return u ? { ...u, total: u.input + u.output } : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, total: 0 };
-}
-
-// Map Codex's native response events to the public protocol stream shape.
-export function codexStreamEventToClient(
-  protocol: 'openai' | 'anthropic',
-  event: { text: string; isLast: boolean; toolCall?: { id: string; name: string; input: unknown } },
-  model: string,
-  requestId: string,
-): string {
-  if (protocol === 'openai') {
-    const delta = event.toolCall
-      ? { tool_calls: [{ index: 0, id: event.toolCall.id, type: 'function', function: { name: event.toolCall.name, arguments: JSON.stringify(event.toolCall.input) } }] }
-      : event.isLast ? {} : { content: event.text };
-    return JSON.stringify({
-      id: `chatcmpl-${requestId}`,
-      object: 'chat.completion.chunk',
-      created: Math.floor(Date.now() / 1000),
-      model,
-      choices: [{ index: 0, delta, finish_reason: event.isLast ? 'stop' : null }],
-    });
-  }
-  if (event.toolCall) return JSON.stringify({ type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: event.toolCall.id, name: event.toolCall.name, input: event.toolCall.input } });
-  return JSON.stringify(event.isLast
-    ? { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: 0 } }
-    : { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: event.text } });
 }
 
 // SSE encoders: canonical stream chunk -> client protocol event

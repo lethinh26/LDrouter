@@ -29,6 +29,7 @@ import {
 interface RequestRow extends RequestExplorerRow {
   finalModelPublicId: string | null;
   finalModelUpstreamId?: string | null; resolvedTargetKind?: string; resolvedTargetId?: string | null; providerId?: string | null; providerName?: string | null; providerSlug?: string | null;
+  finalModelDeleted?: boolean; providerDeleted?: boolean;
   endpoint: string; ttftMs: number | null; inputTokens: number;
   outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number; reasoningTokens: number;
   totalTokens: number; attemptsCount: number; errorType: string | null; errorMessage: string | null;
@@ -328,9 +329,9 @@ export function Requests() {
               <TabsContent value="overview" className="space-y-3 text-sm">
                 <div className="grid grid-cols-2 gap-2">
                 <div><div className="text-muted-foreground text-xs">Requested model</div><span className="font-mono text-xs">{detail.request.requestedModel}</span></div>
-                <div><div className="text-muted-foreground text-xs">Upstream model</div><span className="font-mono text-xs">{detail.request.finalModelUpstreamId ?? '—'}</span></div>
-                <div><div className="text-muted-foreground text-xs">Provider</div>{detail.request.providerId ? <Link className="text-primary underline" to={`/providers?providerId=${encodeURIComponent(detail.request.providerId)}`}>{detail.request.providerName ?? detail.request.providerSlug ?? detail.request.providerId}</Link> : '—'}</div>
-                <div><div className="text-muted-foreground text-xs">Route</div>{detail.request.resolvedTargetId ? <Link className="text-primary underline" to={detail.request.resolvedTargetKind === 'combo' ? '/combos' : '/models'}>{detail.request.resolvedTargetKind ?? 'target'}</Link> : '—'}</div>
+                <div><div className="text-muted-foreground text-xs">Upstream model</div><span className="break-all font-mono text-xs">{detail.request.finalModelUpstreamId ?? (detail.request.finalModelDeleted ? detail.request.finalModelPublicId : null) ?? '—'}</span></div>
+                <div><div className="text-muted-foreground text-xs">Provider</div>{detail.request.providerId && !detail.request.providerDeleted ? <Link className="text-primary underline" to={`/providers?providerId=${encodeURIComponent(detail.request.providerId)}`}>{detail.request.providerName ?? detail.request.providerSlug ?? detail.request.providerId}</Link> : <span className="break-all">{detail.request.providerName ?? '—'}</span>}</div>
+                <div><div className="text-muted-foreground text-xs">Route</div>{detail.request.resolvedTargetId ? (detail.request.resolvedTargetKind === 'model' && detail.request.finalModelDeleted ? <span className="text-muted-foreground">Deleted model</span> : <Link className="text-primary underline" to={detail.request.resolvedTargetKind === 'combo' ? '/combos' : '/models'}>{detail.request.resolvedTargetKind ?? 'target'}</Link>) : '—'}</div>
                 <div><div className="text-muted-foreground text-xs">Status</div>{detail.request.success ? <Badge variant="success">{detail.request.httpStatus}</Badge> : <Badge variant="destructive">{detail.request.httpStatus}</Badge>}</div>
                 <div><div className="text-muted-foreground text-xs">Latency</div>{formatLatencyMs(detail.request.totalLatencyMs)}</div>
                 <div><div className="text-muted-foreground text-xs">Tokens</div>in {formatNumber(detail.request.inputTokens)} · out {formatNumber(detail.request.outputTokens)} · cache {formatNumber(detail.request.cacheReadTokens)}</div>
@@ -352,7 +353,7 @@ export function Requests() {
                       <TableRow key={a.id as string}>
                         <TableCell>{a.attemptNumber as number}</TableCell>
                         <TableCell>{a.providerName as string}</TableCell>
-                        <TableCell><div className="font-mono text-xs">{a.modelPublicId as string}</div><div className="text-[11px] text-muted-foreground">upstream: {a.upstreamModelId as string}</div></TableCell>
+                        <TableCell><div className="break-all font-mono text-xs">{a.modelPublicId as string}</div><div className="text-[11px] text-muted-foreground">upstream: {(a.upstreamModelId as string) || '—'}</div></TableCell>
                         <TableCell>{a.success ? <Badge variant="success">{String(a.statusCode ?? 'OK')}</Badge> : <Badge variant="destructive">{String(a.statusCode ?? 'err')}</Badge>}</TableCell>
                         <TableCell className="text-xs">{formatLatencyMs(a.latencyMs as number)}</TableCell>
                         <TableCell className="text-xs">{a.selectionReason as string}</TableCell>

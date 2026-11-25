@@ -8,8 +8,6 @@
 //     Anthropic's `input_tokens` EXCLUDES the cached prefix while OpenAI-compatible
 //     `prompt_tokens` INCLUDES it, so the blanket formula double-counted the cache
 //     (measured: 21.75% where the truth was 27.80%).
-//   - Codex, 46% of traffic, reported zero cached tokens because the Responses API
-//     nests them under `input_tokens_details` (covered in unit/codex-provider.test.ts).
 // The fallback logging is asserted end-to-end here; the derived rates are unit-tested.
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import fs from 'node:fs';
@@ -158,7 +156,6 @@ describe('cache-hit rate denominators follow provider token semantics', () => {
   it('keeps the prompt as reported for OpenAI-compatible providers', () => {
     // `prompt_tokens` (100) already includes the 40 cached ones, so the prompt is 100.
     expect(promptTokensFor(100, 40, 'openai')).toBe(100);
-    expect(promptTokensFor(100, 40, 'codex')).toBe(100);
     expect(promptTokensFor(100, 40, null)).toBe(100);
   });
 

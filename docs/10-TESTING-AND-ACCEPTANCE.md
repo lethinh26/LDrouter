@@ -16,8 +16,8 @@ Cover pure logic:
 - non-streaming total timeout obeys `fallback_on_total_timeout`; repeated total timeouts count toward provider circuit health
 - connect timeout aborts streaming and non-streaming requests before response headers
 - metadata-only SSE events do not stop the first-token watchdog
-- combo slow-response state increments, resets on fast responses, and persists across requests
-- one recovery probe is admitted after cooldown; concurrent probes are excluded
+- adaptive workload history, median, freshness, relative/absolute demotion and hysteresis
+- exclusive recovery lease, two successful probes, backoff, generation and stale-outcome fencing
 - ordered combo routing
 - retry/backoff calculations
 - circuit breaker transitions
@@ -36,7 +36,7 @@ Run server against temporary SQLite database and mock upstream HTTP servers.
 Cover:
 
 - migrations from empty DB
-- combo slow-response migration defaults and foreign-key integrity
+- adaptive migration defaults, reset of unsegmented cooldown data, history preservation, and foreign-key integrity
 - first-run admin setup
 - login/session/logout
 - TOTP enable/verify/recovery/disable
@@ -133,7 +133,7 @@ Expected:
 With deterministic member positions, confirm the first eligible model is tried first and unavailable
 models are skipped in favor of later members.
 
-### Slow-response fallback
+### Adaptive ordered fallback
 
 Configure a combo with a one-second threshold, three consecutive slow outcomes, and two members.
 Make the first member exceed the threshold on three requests while the second member responds
@@ -142,10 +142,14 @@ quickly.
 Expected:
 
 - each slow attempt is aborted and the current request succeeds through member two
-- the first member's consecutive slow count reaches three and a five-minute cooldown is stored
-- the next request skips member one without waiting for its response timeout
-- after cooldown, only one concurrent request may probe member one
-- a fast probe clears its cooldown and slow count
+- the first member becomes a soft reserve after three slow outcomes; the next request selects member two
+- when member two fails or is circuit-blocked, member one can serve immediately without waiting for recovery
+- if both are slow, the final viable model gets its hard deadline rather than a soft abort
+- soft-aborted A can replay once after B fails (cap 3); cap 2 forbids the third dispatch
+- similar measured speeds favor member one; substantial sustained differences demote it
+- one recovery probe per member/workload is admitted; two comparable successes restore priority
+- stale data, comparator failure, configuration changes and expired leases cannot pin or resurrect stale state
+- deadline exhaustion, caller disconnect, fallback trigger off, cache hits, and synthetic admin requests obey their distinct rules
 - for streaming, metadata-only SSE events do not count as TTFT and no content from the slow member
   reaches the client before fallback
 - once real text/tool output is sent, later stream errors still never fallback
@@ -218,7 +222,7 @@ Proven by `tests/integration/statistics-fix.test.ts`; the one-time backfill by `
 
 ## Packaging acceptance
 
-Codex OAuth acceptance includes redacted JSON/JSONL import, provider-scoped identity deduplication, encrypted token storage, refresh/rotation, account-aware routing, CSRF-protected admin mutations, and safe error/log redaction. ZIP import and Codex CLI config-file generation/mutation are explicitly unsupported. The account test endpoint is intentionally HTTP 501 (`not_implemented`) until a real upstream account-test contract is available; it must not mutate account state or expose credentials.
+Provider removal acceptance includes: fresh schema accepts only OpenAI/Anthropic provider types, unsupported create/update requests return HTTP 400, retired account/import API routes are absent, and npm build output cannot retain deleted modules. Upgrading an older database removes unsupported provider/model/credential configuration, preserves valid combo priority, restricted ACLs, request/attempt/audit history and daily aggregates, and rejects future or invalid backups before live replacement.
 
 The following must succeed from a clean checkout:
 

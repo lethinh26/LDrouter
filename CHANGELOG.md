@@ -4,6 +4,23 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- Adaptive ordered combo routing: compare recent workload-specific latency, preserve configured priority when speeds are similar, demote persistently slow members to reserves, recover automatically, and allow a bounded rescue replay within the attempt/deadline budget. Migration 0015 resets old unsegmented cooldown history while retaining configuration and historical requests/statistics.
+- Per-workload adaptive status and history reset in the combo editor, an optional combo-wide deadline, and bounded routing decision/outcome metrics.
+
+### Removed
+
+- Remove native Codex and Qoder integrations, including their adapters, credential/account pools, OAuth and quota-refresh flows, administration routes and components. OpenAI-compatible and Anthropic-compatible endpoints remain supported.
+- Apply forward migration 0014 to remove retired provider/model/account configuration, clean invalid combo members and dependent permissions/aliases/cache, and disable newly empty combos while retaining request/attempt history, daily statistics and restricted-key semantics. Take a full backup before upgrading; retired credentials are removed from the upgraded database.
+
+### Fixed
+
+- Validate and migrate older backup databases on staging before replacing the live database. Reject incomplete migration assets and newer schemas.
+- Clean generated server files before building so deleted adapters cannot remain in the npm package.
+
 ## [1.22.0] - 2026-11-22
 
 ### Added
