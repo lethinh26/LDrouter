@@ -54,7 +54,9 @@ class MockUpstream(BaseHTTPRequestHandler):
 def smoke(base, upstream):
     with sync_playwright() as p:
         browser = p.chromium.launch()
-        page = browser.new_page(base_url=base)
+        # Keep both sortable rows visible and avoid animation-dependent keyboard
+        # collision measurements inside the scrollable edit dialog.
+        page = browser.new_page(base_url=base, viewport={"width": 1440, "height": 1200}, reduced_motion="reduce")
         page.set_default_timeout(15000)
 
         def post(path, data, headers=None):
@@ -95,10 +97,20 @@ def smoke(base, upstream):
         expect(dialog.get_by_text("Adaptive routing by workload")).to_be_visible()
         expect(dialog.get_by_text("Degraded · reserve", exact=True)).to_be_visible()
         handle = dialog.get_by_role("button", name="Reorder ci/b")
+        handle.scroll_into_view_if_needed()
         handle.focus()
         handle.press("Space")
+        expect(handle).to_have_attribute("aria-pressed", "true")
+        # The keyboard sensor installs its keydown listener asynchronously.
+        # Wait for the drag state and collision target before dropping.
+        expect(page.get_by_text("Draggable item 1 was moved over droppable area 1.", exact=True)).to_be_attached()
         handle.press("ArrowUp")
+        expect(page.get_by_text("Draggable item 1 was moved over droppable area 0.", exact=True)).to_be_attached()
         handle.press("Space")
+        expect(dialog.get_by_role("button", name="Reorder ci/b")).not_to_have_attribute("aria-pressed", "true")
+        expect(dialog.get_by_role("button", name="Reorder ci/b")).to_be_visible()
+        handles = dialog.locator('button[aria-label^="Reorder "]')
+        expect(handles.first).to_have_attribute("aria-label", "Reorder ci/b")
         dialog.get_by_role("button", name="Save", exact=True).click()
         expect(dialog).not_to_be_visible()
 
