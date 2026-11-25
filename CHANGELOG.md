@@ -6,6 +6,17 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [2.0.1] - 2026-11-26
+
+### Fixed
+
+- Recognize supported reasoning and thinking as generated streaming content, preventing long reasoning streams from failing with a false empty-response error before the answer arrives.
+- Normalize supported response content parts, refusal, tool calls and complete OpenAI JSON responses to streaming requests without losing generated output.
+- Parse SSE incrementally across UTF-8 and network chunk boundaries; preserve usage and terminal events and distinguish incomplete or truncated streams from genuinely empty generations.
+- Preserve retry and fallback before stream commitment, measure streaming TTFT from the first deliverable generated token, and record structural upstream diagnostics without logging raw generation content.
+
+No database migration or adaptive-state reset is required for this patch.
+
 ## [2.0.0] - 2026-11-25
 
 ### Added
