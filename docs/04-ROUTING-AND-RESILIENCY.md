@@ -88,15 +88,18 @@ Combo-level safety:
 
 Never multiply retries without a global cap.
 
-An upstream HTTP 200 with zero generated output tokens and no assistant text or tool calls is
-an `upstream_empty_response` failure (HTTP 502 to the client if no attempt succeeds), even if
-the upstream reports consumed input tokens. Retry the same provider model up to its configured
+An otherwise well-formed upstream HTTP 200 with no deliverable generation (text, refusal,
+valid tool call, or supported reasoning) is an `upstream_empty_response` failure (HTTP 502
+if no attempt succeeds), regardless of reported token usage. Retry the same provider model up to its configured
 `max_retries` for this failure, honoring the combo's `max_total_attempts` limit and reserving an
 attempt for the next combo model where possible. Empty-response fallback respects the combo's
 HTTP 5xx fallback setting. Streaming prelude/usage events do not commit a downstream HTTP 200;
-the stream commits on the first actual text or tool call. Once streaming output has been sent,
-fallback is prohibited. A valid tool call or real text still counts as generated output when a
-provider omits usage statistics or reports zero output tokens.
+the stream commits on the first deliverable generated token, including same-family reasoning,
+text, refusal or a valid tool call. Once streaming output has been sent, fallback is prohibited.
+Reasoning is preserved separately from answer text. A reasoning-only length/max_tokens termination
+is a valid truncated generation; reasoning-only normal termination without an answer is incomplete.
+Metadata prelude limits, invalid framing, incompatible content types and premature EOF are bad
+responses rather than empty generations. Valid output counts even when usage is absent or zero.
 Legacy cached empty successes are evicted when read, allowing the live upstream to be retried.
 
 ## Adaptive ordered fallback
@@ -108,8 +111,9 @@ Each combo can enable adaptive ordered fallback (enabled by default, using the e
 
 The measured interval depends on the response mode:
 
-- streaming: request start until the first actual text or tool-call content (TTFT); SSE metadata,
-  role/start events, and usage-only events do not satisfy the first-token watchdog
+- streaming: request start until the first deliverable generated token (TTFT), including supported
+  reasoning, text, refusal or a valid tool call; SSE metadata, role/start events, and usage-only
+  events do not satisfy the first-token watchdog. Hard idle/total deadlines continue after TTFT.
 - non-streaming: request start until the complete response body is received
 
 Provider `first_token_timeout` starts after response headers, while the combo TTFT threshold starts
@@ -124,6 +128,8 @@ for relative comparisons. Demote after three consecutive observations exceeding 
 by max(3 seconds, 30%); restore priority within max(2 seconds, 20%). The distinct thresholds
 avoid oscillation. The configured absolute slow count can also trigger degradation. Missing or
 stale evidence cannot permanently favor a lower-priority model.
+After the TTFT definition changes, older samples expire via the existing 15-minute window;
+no stored routing state is reset as part of the parser update.
 
 Degradation is a soft reserve, not unavailability. When an alternative could be faster, the
 soft watchdog can abort an attempt before downstream commitment. The last viable model, a
