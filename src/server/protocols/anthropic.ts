@@ -2,6 +2,7 @@
 
 import type { CanonicalRequest, CanonicalMessage, CanonicalContentBlock, CanonicalTool } from '../routing/capabilities';
 import { normalizeJsonSchema } from './json-schema';
+import { tokenCount } from './canonical';
 
 export interface AnthropicMessage {
   role: 'user' | 'assistant';
@@ -28,9 +29,9 @@ export interface AnthropicResponse {
   type: 'message';
   role: 'assistant';
   model: string;
-  content: Array<{ type: 'text'; text: string } | { type: 'tool_use'; id: string; name: string; input: unknown }>;
+  content: Array<{ type: 'text'; text: string } | { type: 'tool_use'; id: string; name: string; input: unknown } | { type: 'thinking'; thinking: string; signature?: string }>;
   stop_reason: 'end_turn' | 'max_tokens' | 'stop_sequence' | 'tool_use' | string | null;
-  usage: {
+  usage?: {
     input_tokens: number;
     output_tokens: number;
     cache_read_input_tokens?: number;
@@ -146,23 +147,27 @@ export function canonicalToAnthropicRequest(req: CanonicalRequest, targetModel: 
 }
 
 export function anthropicResponseToCanonical(res: AnthropicResponse, requestedModel: string) {
-  const text = res.content.filter((b) => b.type === 'text').map((b) => (b as { type: 'text'; text: string }).text).join('');
-  const toolCalls = res.content.filter((b) => b.type === 'tool_use').map((b) => {
-    const t = b as { type: 'tool_use'; id: string; name: string; input: unknown };
-    return { id: t.id, name: t.name, input: t.input };
-  });
+  const content = Array.isArray(res.content) ? res.content : [];
+  const text = content.map((b) => b?.type === 'text' && typeof b.text === 'string' ? b.text : '').join('');
+  const toolCalls = content.flatMap((b) => b?.type === 'tool_use' && typeof b.id === 'string' && b.id && typeof b.name === 'string' && b.name
+    ? [{ id: b.id, name: b.name, input: b.input ?? {} }] : []);
+  const thinkingBlocks = content.flatMap((b) => b?.type === 'thinking' && typeof b.thinking === 'string' && b.thinking
+    ? [{ type: 'thinking' as const, thinking: b.thinking, ...(typeof b.signature === 'string' ? { signature: b.signature } : {}) }] : []);
+  const input = tokenCount(res.usage?.input_tokens);
+  const output = tokenCount(res.usage?.output_tokens);
   return {
     model: requestedModel,
     text,
     toolCalls,
+    ...(thinkingBlocks.length ? { thinkingBlocks } : {}),
     finishReason: res.stop_reason ?? null,
     usage: {
-      input: res.usage.input_tokens ?? 0,
-      output: res.usage.output_tokens ?? 0,
-      cacheRead: res.usage.cache_read_input_tokens ?? 0,
-      cacheWrite: res.usage.cache_creation_input_tokens ?? 0,
+      input,
+      output,
+      cacheRead: tokenCount(res.usage?.cache_read_input_tokens),
+      cacheWrite: tokenCount(res.usage?.cache_creation_input_tokens),
       reasoning: 0,
-      total: (res.usage.input_tokens ?? 0) + (res.usage.output_tokens ?? 0),
+      total: input + output,
     },
   };
 }

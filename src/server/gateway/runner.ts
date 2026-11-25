@@ -13,7 +13,7 @@ import { checkRpm, checkTpm, acquireConcurrent, releaseConcurrent } from '../rou
 import { checkDailyMonthly, consumeUsage } from '../routing/quota';
 import { keyAllowedFor, type AuthenticatedKey } from '../auth/api-key';
 import { providerToUpstreamConfig, callUpstreamNonStreaming, callUpstreamStreaming, upstreamUrl, upstreamHttpError, retryAfterMs, type UpstreamCall } from '../upstream/client';
-import { canonicalToOpenAIRequest, openAIResponseToCanonical } from '../protocols/canonical';
+import { canonicalToOpenAIRequest, openAIResponseToCanonical, extractAssistantText, tokenCount } from '../protocols/canonical';
 import { canonicalToAnthropicRequest, anthropicResponseToCanonical } from '../protocols/anthropic';
 import { uuid } from '../auth/ids';
 import { redactString, redactValue } from '../security/redact';
@@ -25,7 +25,7 @@ import type { FastifyReply } from 'fastify';
 import { emitRequestLogged, emitRequestStarted } from './events';
 import { nextRequestCompletionTimestamp } from './request-timestamps';
 import { watchDownstreamDisconnect } from './downstream';
-import { debugHttp, debugBody, debugUpstream, debugStream, errorLine, formatError, getDebugFlags, truncate } from '../logging/debug';
+import { debugHttp, debugBody, debugUpstream, debugStream, errorLine, getDebugFlags } from '../logging/debug';
 
 export interface GatewayContext {
   requestId: string;
@@ -54,6 +54,24 @@ export interface UsageSummary {
   total: number;
 }
 
+interface GenerationResult {
+  text: string;
+  toolCalls: Array<{ id: string; name: string; input: unknown }>;
+  finishReason: string | null;
+  reasoning?: string;
+  refusal?: string;
+  legacyFunctionCall?: { name: string; arguments: string };
+  thinkingBlocks?: Array<{ type: 'thinking'; thinking: string; signature?: string }>;
+}
+
+interface AttemptResult {
+  statusCode: number;
+  ttftMs: number | null;
+  upstreamRequestId: string | null;
+  usage: UsageSummary;
+  result: GenerationResult;
+}
+
 export interface AttemptOutcome {
   attemptNumber: number;
   providerId: string;
@@ -72,7 +90,7 @@ export interface AttemptOutcome {
   failureReason: string | null;
   sanitizedError: string | null;
   upstreamRequestId: string | null;
-  result?: { text: string; toolCalls: Array<{ id: string; name: string; input: unknown }>; finishReason: string | null };
+  result?: GenerationResult;
 }
 
 export interface GatewayOutcome {
@@ -84,6 +102,10 @@ export interface GatewayOutcome {
    *  so the route layer can reproduce the exact error the runner raised. */
   errorCode: string | null;
   text: string | null;
+  reasoning?: string;
+  refusal?: string;
+  legacyFunctionCall?: GenerationResult['legacyFunctionCall'];
+  thinkingBlocks?: GenerationResult['thinkingBlocks'];
   toolCalls: Array<{ id: string; name: string; input: unknown }> | null;
   finishReason: string | null;
   usage: UsageSummary;
@@ -291,6 +313,7 @@ export class GatewayRunner {
       let resultText = '';
       let resultToolCalls: Array<{ id: string; name: string; input: unknown }> = [];
       let resultFinishReason: string | null = null;
+      let resultExtensions: Pick<GenerationResult, 'reasoning' | 'refusal' | 'thinkingBlocks' | 'legacyFunctionCall'> = {};
       let finalModelId: string | null = null;
       let completedSuccessfully = false;
 
@@ -495,7 +518,7 @@ export class GatewayRunner {
           }
         };
         try {
-          const out = await this.runOneAttempt(req, ctx, candidate, provider.name, cfg, required, (isStreamStarted) => {
+          const out = await this.runOneAttempt(req, ctx, candidate, cfg, (isStreamStarted) => {
             attempt.streamStarted = isStreamStarted;
           }, (ttftMs) => {
             attempt.ttftMs = ttftMs;
@@ -528,6 +551,7 @@ export class GatewayRunner {
           resultText = out.result.text;
           resultToolCalls = out.result.toolCalls;
           resultFinishReason = out.result.finishReason;
+          resultExtensions = { reasoning: out.result.reasoning, refusal: out.result.refusal, thinkingBlocks: out.result.thinkingBlocks, legacyFunctionCall: out.result.legacyFunctionCall };
           // A streaming TTFT is a successful sample only after the stream has
           // completed; non-streaming samples measure the entire valid response.
           learnOutcome('success', req.canonical.stream ? out.ttftMs : attemptLatencyMs);
@@ -564,6 +588,8 @@ export class GatewayRunner {
           attempt.completedAt = new Date().toISOString();
           attempt.failureReason = classifyFailure(err);
           attempt.sanitizedError = redactString(err.message);
+          const failedRequestId = (err.cause as { upstreamRequestId?: unknown } | undefined)?.upstreamRequestId;
+          if (typeof failedRequestId === 'string') attempt.upstreamRequestId = failedRequestId;
           // A malformed 200 response may still report real input tokens. Preserve that
           // usage on the failed attempt and request instead of discarding it on throw.
           const failedUsage = (err.cause as { usage?: UsageSummary } | undefined)?.usage;
@@ -663,6 +689,7 @@ export class GatewayRunner {
         text: lastError ? null : resultText,
         toolCalls: lastError ? null : resultToolCalls,
         finishReason: lastError ? null : resultFinishReason,
+        ...(!lastError ? resultExtensions : {}),
         usage,
         ttftMs: attempts.find((a) => a.ttftMs != null)?.ttftMs ?? null,
         latencyMs,
@@ -676,7 +703,10 @@ export class GatewayRunner {
 
       // Store in gateway cache if eligible
       const cacheMeta = (req as unknown as { _cacheKey?: string; _cacheConfigVersion?: number });
-      if (!ctx.synthetic && outcome.success && cacheMeta._cacheKey && !req.canonical.stream && !hasTools(req.canonical)) {
+      // The legacy cache stores text/tool calls only. Do not cache a response
+      // whose reasoning/refusal extensions would be lost on replay.
+      if (!ctx.synthetic && outcome.success && cacheMeta._cacheKey && !req.canonical.stream && !hasTools(req.canonical)
+        && !outcome.reasoning && !outcome.refusal && !outcome.legacyFunctionCall && !outcome.thinkingBlocks?.length) {
         const payload = this.buildCachedPayload(req, ctx, outcome);
         storeCache({
           cacheKey: cacheMeta._cacheKey,
@@ -787,18 +817,32 @@ export class GatewayRunner {
     req: GatewayRequest,
     ctx: GatewayContext,
     candidate: CandidateModel,
-    providerName: string,
     cfg: ReturnType<typeof providerToUpstreamConfig>,
-    required: RequiredCapabilities,
     onStreamStart: (started: boolean) => void,
     onFirstToken: (ttftMs: number) => void
-  ): Promise<{ statusCode: number; ttftMs: number | null; upstreamRequestId: string | null; usage: UsageSummary; result: { text: string; toolCalls: Array<{ id: string; name: string; input: unknown }>; finishReason: string | null } }> {
+  ): Promise<AttemptResult> {
     if (req.canonical.stream) {
       return this.runStreamingAttempt(req, ctx, candidate, cfg, onStreamStart, onFirstToken);
     }
     const outcome = await this.runNonStreamingAttempt(req, candidate, cfg, ctx);
-    if (isEmptyGeneration(outcome.usage, outcome.result)) {
-      throw emptyGenerationError(candidate, outcome.usage);
+    const result = outcome.result;
+    const detail = { usage: outcome.usage, upstreamStatus: outcome.statusCode, upstreamRequestId: outcome.upstreamRequestId };
+    if (result.legacyFunctionCall && req.endpoint !== 'chat/completions') {
+      throw badGenerationError('Legacy function call requires a compatible client protocol', 'unsupported_shape', detail);
+    }
+    const hasAnswer = !isEmptyGeneration(outcome.usage, result) || Boolean(result.legacyFunctionCall);
+    const hasReasoning = Boolean(result.reasoning || result.thinkingBlocks?.some((block) => block.thinking.length > 0));
+    const canDeliverReasoning = (cfg.type === 'openai' && req.endpoint === 'chat/completions')
+      || (cfg.type === 'anthropic' && req.endpoint === 'messages');
+    if (!hasAnswer) {
+      if (hasReasoning && (!canDeliverReasoning || !isLengthFinish(result.finishReason))) {
+        errorLine(ctx.requestId, 'GENERATION ERROR', [`stage=incomplete_generation`, `upstreamStatus=${outcome.statusCode}`, `upstreamRequestId=${diagnosticLabel(outcome.upstreamRequestId)}`, `providerProtocol=${cfg.type}`, `clientEndpoint=${req.endpoint}`, `finishReason=${diagnosticLabel(result.finishReason)}`, `outputTokens=${outcome.usage.output}`, 'reasoning=true', 'answer=false']);
+        throw badGenerationError('Upstream returned reasoning without a deliverable answer', 'incomplete_generation', detail);
+      }
+      if (!hasReasoning) {
+        errorLine(ctx.requestId, 'GENERATION ERROR', ['stage=no_generation_at_eof', `upstreamStatus=${outcome.statusCode}`, `upstreamRequestId=${diagnosticLabel(outcome.upstreamRequestId)}`, `providerProtocol=${cfg.type}`, `clientEndpoint=${req.endpoint}`, `finishReason=${diagnosticLabel(result.finishReason)}`, `outputTokens=${outcome.usage.output}`]);
+        throw emptyGenerationError(candidate, outcome.usage, detail);
+      }
     }
     return outcome;
   }
@@ -808,7 +852,7 @@ export class GatewayRunner {
     candidate: CandidateModel,
     cfg: ReturnType<typeof providerToUpstreamConfig>,
     ctx: GatewayContext
-  ): Promise<{ statusCode: number; ttftMs: number | null; upstreamRequestId: string | null; usage: UsageSummary; result: { text: string; toolCalls: Array<{ id: string; name: string; input: unknown }>; finishReason: string | null } }> {
+  ): Promise<AttemptResult> {
     const upstreamModel = candidate.upstreamModelId;
     let call: UpstreamCall;
     if (cfg.type === 'openai') {
@@ -821,34 +865,40 @@ export class GatewayRunner {
       call = await callUpstreamNonStreaming(cfg, upstreamUrl(cfg, '/v1/messages'), payload, ctx.requestId);
     }
     if (!call.ok) {
-      throw upstreamHttpError(call.status, redactString(call.text.slice(0, 500)), { status: call.status, retryAfterMs: retryAfterMs(call.headers['retry-after']) });
+      const error = upstreamHttpError(call.status, redactString(call.text.slice(0, 500)), { status: call.status, requestId: call.upstreamRequestId, retryAfterMs: retryAfterMs(call.headers['retry-after']) });
+      throw new GatewayError(error.type, error.message, { status: error.status, code: error.code, safe: error.safe, cause: {
+        ...error.cause as Record<string, unknown>, upstreamStatus: call.status, upstreamRequestId: call.upstreamRequestId, contentType: call.headers['content-type'] ?? null,
+      } });
     }
+    const detail = { upstreamStatus: call.status, upstreamRequestId: call.upstreamRequestId, contentType: call.headers['content-type'] ?? null };
     let parsed: unknown;
     try {
       parsed = JSON.parse(call.text);
     } catch {
-      throw new GatewayError('upstream_error', `Upstream returned invalid JSON for "${bareModelName(candidate.publicModelId)}"`, { status: 502, code: 'upstream_bad_response' });
+      throw badGenerationError(`Upstream returned invalid JSON for "${bareModelName(candidate.publicModelId)}"`, 'invalid_json', detail);
     }
     // A 200 carrying the wrong shape used to explode into a raw
     // "Cannot read properties of undefined (reading '0')" that reached the client
     // verbatim. Name the model and the missing field instead.
     const expectedField = cfg.type === 'openai' ? 'choices' : 'content';
     if (!parsed || typeof parsed !== 'object' || !Array.isArray((parsed as Record<string, unknown>)[expectedField])) {
-      throw new GatewayError(
-        'upstream_error',
+      const usage = parsed && typeof parsed === 'object' ? (cfg.type === 'openai'
+        ? openAIResponseToCanonical(parsed as never, req.canonical.model).usage
+        : anthropicResponseToCanonical(parsed as never, req.canonical.model).usage) : undefined;
+      throw badGenerationError(
         `Upstream response for "${bareModelName(candidate.publicModelId)}" has no "${expectedField}" array`,
-        { status: 502, code: 'upstream_bad_response' }
+        'unsupported_shape', { ...detail, ...(usage ? { usage } : {}) }
       );
     }
-    let result: { text: string; toolCalls: Array<{ id: string; name: string; input: unknown }>; finishReason: string | null };
+    let result: GenerationResult;
     let usage: UsageSummary;
     if (cfg.type === 'openai') {
       const conv = openAIResponseToCanonical(parsed as never, req.canonical.model);
-      result = { text: conv.text, toolCalls: conv.toolCalls, finishReason: conv.finishReason };
+      result = { text: conv.text, toolCalls: conv.toolCalls, finishReason: conv.finishReason, reasoning: conv.reasoning, refusal: conv.refusal, legacyFunctionCall: conv.legacyFunctionCall };
       usage = conv.usage;
     } else {
       const conv = anthropicResponseToCanonical(parsed as never, req.canonical.model);
-      result = { text: conv.text, toolCalls: conv.toolCalls, finishReason: conv.finishReason };
+      result = { text: conv.text, toolCalls: conv.toolCalls, finishReason: conv.finishReason, thinkingBlocks: conv.thinkingBlocks };
       usage = conv.usage;
     }
     return { statusCode: call.status, ttftMs: call.ttftMs, upstreamRequestId: call.upstreamRequestId, usage, result };
@@ -861,9 +911,10 @@ export class GatewayRunner {
     cfg: ReturnType<typeof providerToUpstreamConfig>,
     onStreamStart: (started: boolean) => void,
     onFirstToken: (ttftMs: number) => void
-  ): Promise<{ statusCode: number; ttftMs: number | null; upstreamRequestId: string | null; usage: UsageSummary; result: { text: string; toolCalls: Array<{ id: string; name: string; input: unknown }>; finishReason: string | null } }> {
+  ): Promise<AttemptResult> {
     const upstreamModel = candidate.upstreamModelId;
     const encoder = req.protocol === 'openai' ? openaiStreamEncoder : anthropicStreamEncoder;
+    const sameFamily = cfg.type === req.protocol && req.endpoint !== 'responses';
 
     // Hard streaming invariant: the client SSE head is NOT written until the
     // upstream confirms by delivering its first chunk (or completes). Before
@@ -886,7 +937,11 @@ export class GatewayRunner {
     let streamStartTs = Date.now();
     let streamStartMono = performance.now();
     let textBuf = '';
-    const toolBuf: Array<{ id: string; name: string; input: unknown }> = [];
+    let refusalBuf = '';
+    // Arguments arrive in fragments. Keep one logical call per protocol index;
+    // the original deltas are forwarded immediately to the client.
+    const toolBuf = new Map<number, { id: string; name: string; arguments: string; input?: unknown }>();
+    const legacyFunctionCall = { name: '', arguments: '' };
     let finishReason: string | null = null;
     const usage: UsageSummary = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, total: 0 };
     let meaningfulTtftMs: number | null = null;
@@ -894,13 +949,22 @@ export class GatewayRunner {
     // Committing HTTP 200 for metadata alone makes an empty 200 un-retryable.
     const initialEvents: string[] = [];
     let initialBytes = 0;
+    let initialEventCount = 0;
+    let openaiRoleQueued = false;
 
     // docs/13 §15–§16: stream counters + client disconnect tracking
     let chunkCount = 0;
     let bytesReceived = 0;
     let firstChunkTime: number | null = null;
     let lastChunkTime: number | null = null;
-    const loggedFirstChunks: string[] = [];
+    let textEvents = 0;
+    let reasoningEvents = 0;
+    let toolEvents = 0;
+    let metadataEvents = 0;
+    let unknownEvents = 0;
+    let firstAnswerMs: number | null = null;
+    let terminalEvent: string | null = null;
+    let responseMeta: Awaited<ReturnType<typeof callUpstreamStreaming>> | undefined;
     let clientDisconnected = false;
     const downstreamAbort = new AbortController();
     let detachDownstreamClose: (() => void) | null = null;
@@ -923,21 +987,21 @@ export class GatewayRunner {
     const chunkHandler = (chunk: { data: string; event?: string }, isFirst: boolean): boolean => {
       if (cfg.requestSignal?.aborted) throw cfg.requestSignal.reason;
       chunkCount++;
-      bytesReceived += chunk.data.length;
+      bytesReceived += Buffer.byteLength(chunk.data);
       lastChunkTime = Date.now();
       if (isFirst) firstChunkTime = Date.now() - streamStartTs;
-      let hasOutput = false;
-      if (loggedFirstChunks.length < 3) {
-        loggedFirstChunks.push(chunk.data);
-        debugStream(ctx.requestId, `STREAM FIRST CHUNK ${loggedFirstChunks.length}`, [truncate(chunk.data, 2000)]);
-      }
+      let hasAnswer = false;
+      let hasReasoning = false;
+      let hasTool = false;
+      let recognizedShape: boolean;
+      let skipPrelude = false;
       let obj: ReturnType<typeof JSON.parse>;
       try {
         obj = JSON.parse(chunk.data);
       } catch {
         throw new GatewayError('upstream_error', 'Upstream returned invalid streaming JSON', { status: 502, code: 'upstream_bad_response' });
       }
-      if (!obj || typeof obj !== 'object') {
+      if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
         throw new GatewayError('upstream_error', 'Upstream returned invalid streaming event', { status: 502, code: 'upstream_bad_response' });
       }
       if (obj.type === 'error' || obj.error || chunk.event === 'error') {
@@ -946,82 +1010,151 @@ export class GatewayRunner {
       }
       try {
         if (cfg.type === 'openai') {
+          recognizedShape = Array.isArray(obj.choices) || Boolean(obj.usage && typeof obj.usage === 'object');
           const choice = obj.choices?.[0];
-          if (choice?.delta?.content) {
-            textBuf += choice.delta.content;
-            hasOutput = true;
+          if (chunk.event === 'json' && (!Array.isArray(obj.choices) || (obj.choices.length > 0 && (!choice?.message || choice.delta)))) {
+            throw badGenerationError('Upstream JSON is not a complete chat completion', 'unsupported_shape');
           }
-          if (typeof choice?.delta?.refusal === 'string' && choice.delta.refusal.length > 0) {
-            // OpenAI refusal text is generated content too; preserve it in the
-            // canonical result so refusal-only streams commit and are not retried.
-            textBuf += choice.delta.refusal;
-            hasOutput = true;
+          // Some compatible relays send a single complete chat message in an
+          // SSE frame. Convert it once; never append a cumulative snapshot to
+          // already delivered deltas.
+          if (choice?.message && !choice.delta) {
+            if (streamStarted || !sameFamily || !nonemptyString(choice.finish_reason)) {
+              throw badGenerationError('Unsupported complete-message streaming snapshot', 'unsupported_shape');
+            }
+            const { message, ...rest } = choice;
+            const delta = { ...message };
+            if (Array.isArray(message.tool_calls)) {
+              delta.tool_calls = message.tool_calls.map((call: Record<string, unknown>, index: number) => ({ ...call, index }));
+            }
+            obj = { ...obj, object: 'chat.completion.chunk', choices: [{ ...rest, delta }] };
           }
-          if (Array.isArray(choice?.delta?.tool_calls)) {
-            for (const tc of choice.delta.tool_calls) {
+          const normalizedChoice = obj.choices?.[0];
+          const delta = normalizedChoice?.delta;
+          const text = extractAssistantText(delta?.content);
+          if (Array.isArray(delta?.content)) delta.content = text;
+          if (text) {
+            textBuf += text;
+            hasAnswer = true;
+          }
+          if (nonemptyString(delta?.refusal)) {
+            refusalBuf += delta.refusal;
+            hasAnswer = true;
+          }
+          if (nonemptyString(delta?.reasoning_content)) {
+            if (!sameFamily) throw badGenerationError('Reasoning stream requires a compatible client protocol', 'unsupported_shape');
+            hasReasoning = true;
+          }
+          if (Array.isArray(delta?.tool_calls)) {
+            for (const [position, tc] of delta.tool_calls.entries()) {
+              if (!tc || typeof tc !== 'object') throw badGenerationError('Invalid streaming tool call', 'unsupported_shape');
+              const index = Number.isSafeInteger(tc.index) && tc.index >= 0 ? tc.index : position;
               const rawArguments = tc.function?.arguments;
-              const hasToolCallContent = (typeof tc.id === 'string' && tc.id.length > 0)
-                || (typeof tc.function?.name === 'string' && tc.function.name.length > 0)
-                || (typeof rawArguments === 'string' && rawArguments.length > 0)
-                || (rawArguments !== null && typeof rawArguments === 'object' && Object.keys(rawArguments).length > 0);
-              if (!hasToolCallContent) continue;
-              const id = typeof tc.id === 'string' ? tc.id : `toolu-${Math.random().toString(36).slice(2)}`;
-              const name = typeof tc.function?.name === 'string' ? tc.function.name : 'unknown';
-              let input = {};
-              if (typeof rawArguments === 'string') {
-                try { input = JSON.parse(rawArguments); } catch { /* ignore */ }
-              } else if (rawArguments !== null && typeof rawArguments === 'object') {
-                input = rawArguments;
-              }
-              toolBuf.push({ id, name, input });
-              hasOutput = true;
+              if (!nonemptyString(tc.id) && !nonemptyString(tc.function?.name) && !nonemptyString(rawArguments)
+                && !(rawArguments && typeof rawArguments === 'object')) continue;
+              const tool = toolBuf.get(index) ?? { id: '', name: '', arguments: '', input: undefined as unknown };
+              if (nonemptyString(tc.id)) tool.id = tc.id;
+              if (nonemptyString(tc.function?.name)) tool.name += tc.function.name;
+              if (typeof rawArguments === 'string') tool.arguments += rawArguments;
+              else if (rawArguments && typeof rawArguments === 'object') tool.input = rawArguments;
+              toolBuf.set(index, tool);
+              if (tool.id && tool.name) hasTool = true;
             }
           }
-          if (choice?.finish_reason) finishReason = choice.finish_reason;
+          if (delta?.function_call) {
+            if (!sameFamily) throw badGenerationError('Legacy function call requires a compatible client protocol', 'unsupported_shape');
+            if (nonemptyString(delta.function_call.name)) legacyFunctionCall.name += delta.function_call.name;
+            if (typeof delta.function_call.arguments === 'string') legacyFunctionCall.arguments += delta.function_call.arguments;
+            if (legacyFunctionCall.name) hasTool = true;
+          }
+          if (nonemptyString(normalizedChoice?.finish_reason)) finishReason = normalizedChoice.finish_reason;
           if (obj.usage) {
-            usage.input = obj.usage.prompt_tokens ?? usage.input;
-            usage.output = obj.usage.completion_tokens ?? usage.output;
-            usage.cacheRead = obj.usage.prompt_tokens_details?.cached_tokens ?? usage.cacheRead;
-            usage.reasoning = obj.usage.completion_tokens_details?.reasoning_tokens ?? usage.reasoning;
-            usage.total = obj.usage.total_tokens ?? usage.total;
+            usage.input = tokenCount(obj.usage.prompt_tokens, usage.input);
+            usage.output = tokenCount(obj.usage.completion_tokens, usage.output);
+            usage.cacheRead = tokenCount(obj.usage.prompt_tokens_details?.cached_tokens, usage.cacheRead);
+            usage.reasoning = tokenCount(obj.usage.completion_tokens_details?.reasoning_tokens, usage.reasoning);
+            usage.total = tokenCount(obj.usage.total_tokens, usage.total);
+          }
+          // Empty delta frames and duplicate role announcements are no-ops.
+          // Retain usage, finish, tool fragments and unknown extension fields.
+          if (!hasAnswer && !hasReasoning && !hasTool && normalizedChoice && !obj.usage && !normalizedChoice.finish_reason
+            && obj.choices.length === 1 && delta && typeof delta === 'object' && !Array.isArray(delta)
+            && Object.keys(delta).every((key) => key === 'role' || (['content', 'refusal', 'reasoning_content'].includes(key) && (delta[key] === null || delta[key] === '')))) {
+            if (delta.role === 'assistant' && !openaiRoleQueued) openaiRoleQueued = true;
+            else skipPrelude = true;
           }
         } else {
-          // anthropic stream events
-          if (obj.type === 'content_block_delta' && obj.delta?.text) {
-            textBuf += obj.delta.text;
-            hasOutput = true;
+          recognizedShape = ['message_start', 'message_delta', 'message_stop', 'content_block_start', 'content_block_delta', 'content_block_stop', 'ping'].includes(obj.type);
+          const block = obj.type === 'content_block_start' ? obj.content_block : undefined;
+          const delta = obj.type === 'content_block_delta' ? obj.delta : undefined;
+          const text = block?.type === 'text' ? block.text : delta?.type === 'text_delta' ? delta.text : undefined;
+          if (nonemptyString(text)) {
+            textBuf += text;
+            hasAnswer = true;
           }
-          if (obj.type === 'content_block_start' && obj.content_block?.type === 'tool_use') {
-            toolBuf.push({ id: obj.content_block.id, name: obj.content_block.name, input: obj.content_block.input ?? {} });
-            hasOutput = true;
+          const thinking = block?.type === 'thinking' ? block.thinking : delta?.type === 'thinking_delta' ? delta.thinking : undefined;
+          if (nonemptyString(thinking)) {
+            if (!sameFamily) throw badGenerationError('Thinking stream requires a compatible client protocol', 'unsupported_shape');
+            hasReasoning = true;
           }
-          if (obj.type === 'message_delta' && obj.delta?.stop_reason) finishReason = obj.delta.stop_reason;
+          if (block?.type === 'tool_use' && nonemptyString(block.id) && nonemptyString(block.name)) {
+            const index = Number.isSafeInteger(obj.index) && obj.index >= 0 ? obj.index : toolBuf.size;
+            toolBuf.set(index, { id: block.id, name: block.name, arguments: '', input: block.input ?? {} });
+            hasTool = true;
+          }
+          if (delta?.type === 'input_json_delta' && nonemptyString(delta.partial_json)) {
+            const tool = toolBuf.get(obj.index);
+            if (tool) { tool.arguments += delta.partial_json; hasTool = true; }
+          }
+          if (obj.type === 'message_delta' && nonemptyString(obj.delta?.stop_reason)) finishReason = obj.delta.stop_reason;
           if (obj.type === 'message_start' && obj.message?.usage) {
-            usage.input = obj.message.usage.input_tokens ?? 0;
-            usage.cacheRead = obj.message.usage.cache_read_input_tokens ?? 0;
-            usage.cacheWrite = obj.message.usage.cache_creation_input_tokens ?? 0;
+            usage.input = tokenCount(obj.message.usage.input_tokens);
+            usage.output = tokenCount(obj.message.usage.output_tokens, usage.output);
+            usage.cacheRead = tokenCount(obj.message.usage.cache_read_input_tokens);
+            usage.cacheWrite = tokenCount(obj.message.usage.cache_creation_input_tokens);
           }
           if (obj.type === 'message_delta' && obj.usage) {
-            usage.output = obj.usage.output_tokens ?? usage.output;
+            usage.output = tokenCount(obj.usage.output_tokens, usage.output);
           }
         }
-      } catch {
-        throw new GatewayError('upstream_error', 'Upstream returned malformed streaming content', { status: 502, code: 'upstream_bad_response' });
+      } catch (e) {
+        if (e instanceof GatewayError) throw e;
+        throw badGenerationError('Upstream returned malformed streaming content', 'unsupported_shape');
       }
 
-      const encoded = encoder(chunk.data, chunk.event);
+      if (hasAnswer) textEvents++;
+      if (hasReasoning) reasoningEvents++;
+      if (hasTool) toolEvents++;
+      const hasOutput = hasAnswer || hasTool || hasReasoning;
+      if (!hasOutput) metadataEvents++;
+      if (!recognizedShape) unknownEvents++;
+      if ((hasAnswer || hasTool) && firstAnswerMs === null) firstAnswerMs = Math.round(performance.now() - streamStartMono);
+      if (chunkCount <= 3) debugStream(ctx.requestId, `STREAM FIRST CHUNK ${chunkCount}`, [
+        `bytes=${Buffer.byteLength(chunk.data)}`, `text=${hasAnswer}`, `tool=${hasTool}`, `reasoning=${hasReasoning}`,
+      ]);
+      // Anthropic's authoritative terminal is emitted only after the attempt
+      // validates completion; do not report a clean terminal for a partial stream.
+      const encoded = encoder(JSON.stringify(obj), cfg.type === 'anthropic' && sameFamily ? obj.type ?? chunk.event : chunk.event);
+      if (cfg.type === 'anthropic' && obj.type === 'message_stop') {
+        terminalEvent = encoded;
+        return false;
+      }
       if (!streamStarted) {
-        if (encoded) {
+        if (!hasOutput && encoded) {
+          // Repeated pings carry no semantic state and must not exhaust the
+          // prelude budget. Retain required role/start and usage frames.
+          if (obj.type === 'ping' || skipPrelude) return false;
           initialEvents.push(encoded);
-          initialBytes += encoded.length;
+          initialBytes += Buffer.byteLength(encoded);
+          initialEventCount++;
         }
         if (!hasOutput) {
           if (initialBytes > 65536 || initialEvents.length > 128) {
-            throw emptyGenerationError(candidate, usage);
+            throw badGenerationError('Upstream streaming metadata exceeded the prelude limit', 'prelude_limit');
           }
           return false;
         }
-        // Only real text/tool output commits the stream. Metadata-only streams
+        // Deliverable reasoning, text and tool output commit the stream. Metadata-only streams
         // can still retry or fall back with an ordinary HTTP error response.
         meaningfulTtftMs = Math.round(performance.now() - streamStartMono);
         onFirstToken(meaningfulTtftMs);
@@ -1032,6 +1165,7 @@ export class GatewayRunner {
         onStreamStart(true);
         for (const event of initialEvents) pipe.write(event);
         initialEvents.length = 0;
+        if (encoded) pipe.write(encoded);
         return true;
       }
       if (encoded) pipe.write(encoded);
@@ -1045,11 +1179,25 @@ export class GatewayRunner {
       debugStream(ctx.requestId, 'STREAM START', [`upstreamConnected=true`]);
       streamStartTs = Date.now();
       streamStartMono = performance.now();
-      const meta = await callUpstreamStreaming(cfg, url, payload, chunkHandler, ctx.requestId, streamStartTs, downstreamAbort.signal);
-      // Upstream completed cleanly: ensure head + terminator are written.
-      if (!streamStarted) throw emptyGenerationError(candidate, usage);
+      const meta = responseMeta = await callUpstreamStreaming(cfg, url, payload, chunkHandler, ctx.requestId, streamStartTs, downstreamAbort.signal);
+      const detail = { upstreamStatus: meta.upstreamStatus, upstreamRequestId: meta.upstreamRequestId, contentType: meta.contentType, terminalSeen: meta.terminalSeen };
+      if (!streamStarted) {
+        if (unknownEvents > 0) throw badGenerationError('Upstream stream contained unrecognized output events', 'unsupported_shape', detail);
+        throw emptyGenerationError(candidate, usage, detail);
+      }
+      if (!meta.terminalSeen && !finishReason) {
+        throw badGenerationError('Upstream stream ended before a completion marker', 'truncated_stream', detail);
+      }
+      if (reasoningEvents > 0 && textEvents === 0 && toolEvents === 0 && !isLengthFinish(finishReason)) {
+        throw badGenerationError('Upstream returned reasoning without a final answer', 'incomplete_generation', detail);
+      }
       if (cfg.requestSignal?.aborted) throw cfg.requestSignal.reason;
-      pipe.write('data: [DONE]\n\n');
+      if (req.protocol === 'anthropic' && cfg.type === 'anthropic') {
+        pipe.write(terminalEvent ?? anthropicStreamEncoder('{"type":"message_stop"}', 'message_stop'));
+      } else {
+        if (terminalEvent) pipe.write(terminalEvent);
+        pipe.write('data: [DONE]\n\n');
+      }
       pipe.end();
       debugStream(ctx.requestId, 'STREAM END', [
         `chunks=${chunkCount}`,
@@ -1062,50 +1210,18 @@ export class GatewayRunner {
       ]);
       if (!usage.total) usage.total = usage.input + usage.output;
       return {
-        statusCode: 200,
+        statusCode: meta.upstreamStatus,
         ttftMs: meaningfulTtftMs ?? meta.ttftMs,
         upstreamRequestId: meta.upstreamRequestId,
         usage,
-        result: { text: textBuf, toolCalls: toolBuf, finishReason },
+        result: { text: textBuf || refusalBuf, ...(refusalBuf ? { refusal: refusalBuf } : {}), toolCalls: Array.from(toolBuf.values()).filter((tool) => tool.id && tool.name).map((tool) => ({
+          id: tool.id, name: tool.name, input: tool.arguments ? safeJsonParse(tool.arguments) : tool.input ?? {},
+        })), finishReason, ...(legacyFunctionCall.name ? { legacyFunctionCall } : {}) },
       };
     } catch (e) {
-      // Stream ended with failure. If we already sent content, mark partial and terminate.
-      if (streamStarted) {
-        // Ensure the (already-committed) response is closed.
-        if (!headWritten) writeHead();
-        pipe.end();
-        const gatewayError = e instanceof GatewayError ? e : new GatewayError('upstream_error', (e as Error).message, { cause: e });
-        errorLine(ctx.requestId, 'STREAM ERROR', [
-          `chunksBeforeError=${chunkCount}`,
-          `bytesBeforeError=${bytesReceived}`,
-          `clientDisconnected=${clientDisconnected}`,
-          ...formatErrorPublic(e),
-        ]);
-        const originalCause = gatewayError.cause;
-        const causeRecord = originalCause && typeof originalCause === 'object'
-          ? originalCause as Record<string, unknown>
-          : {};
-        throw new GatewayError(gatewayError.type, gatewayError.message, {
-          status: gatewayError.status,
-          code: gatewayError.code,
-          cause: {
-            ...causeRecord,
-            message: typeof causeRecord.message === 'string'
-              ? causeRecord.message
-              : originalCause instanceof Error ? originalCause.message : undefined,
-            status: typeof causeRecord.status === 'number' ? causeRecord.status : undefined,
-            bodyExcerpt: typeof causeRecord.bodyExcerpt === 'string' ? causeRecord.bodyExcerpt : undefined,
-            originalCause,
-            usage,
-          },
-        });
-      }
-      errorLine(ctx.requestId, 'STREAM ERROR (before first chunk)', [
-        `chunksBeforeError=${chunkCount}`,
-        `bytesBeforeError=${bytesReceived}`,
-        `clientDisconnected=${clientDisconnected}`,
-        ...formatErrorPublic(e),
-      ]);
+      // Once committed, end the partial stream without a clean terminal. The
+      // outer attempt loop must not try another model on this connection.
+      if (streamStarted && !pipe.writableEnded) pipe.end();
       const gatewayError = e instanceof GatewayError ? e : new GatewayError('upstream_error', (e as Error).message, { cause: e });
       const originalCause = gatewayError.cause;
       const causeRecord = originalCause && typeof originalCause === 'object'
@@ -1115,6 +1231,10 @@ export class GatewayRunner {
       // Preserve it for every pre-content failure, including first-token and total timeouts.
       const cause = {
         ...causeRecord,
+        upstreamStatus: causeRecord.upstreamStatus ?? responseMeta?.upstreamStatus ?? null,
+        upstreamRequestId: causeRecord.upstreamRequestId ?? responseMeta?.upstreamRequestId ?? null,
+        contentType: causeRecord.contentType ?? responseMeta?.contentType ?? null,
+        terminalSeen: causeRecord.terminalSeen ?? responseMeta?.terminalSeen ?? false,
         message: typeof causeRecord.message === 'string'
           ? causeRecord.message
           : originalCause instanceof Error ? originalCause.message : undefined,
@@ -1123,10 +1243,23 @@ export class GatewayRunner {
         originalCause,
         usage,
       };
+      errorLine(ctx.requestId, streamStarted ? 'STREAM ERROR' : 'STREAM ERROR (before first chunk)', [
+        `stage=${diagnosticLabel(causeRecord.stage ?? gatewayError.code)}`,
+        `providerProtocol=${cfg.type}`, `clientEndpoint=${req.endpoint}`,
+        `upstreamStatus=${cause.upstreamStatus ?? 'unknown'}`, `upstreamRequestId=${diagnosticLabel(cause.upstreamRequestId)}`,
+        `contentType=${diagnosticLabel(cause.contentType)}`, `terminalSeen=${cause.terminalSeen}`,
+        `finishReason=${diagnosticLabel(finishReason)}`, `committed=${streamStarted}`,
+        `chunksBeforeError=${chunkCount}`, `bytesBeforeError=${bytesReceived}`,
+        `preludeBytes=${initialBytes}`, `preludeEvents=${initialEventCount}`,
+        `textEvents=${textEvents}`, `reasoningEvents=${reasoningEvents}`, `toolEvents=${toolEvents}`, `metadataEvents=${metadataEvents}`, `unknownEvents=${unknownEvents}`,
+        `firstGeneratedMs=${meaningfulTtftMs ?? 'null'}`, `firstAnswerMs=${firstAnswerMs ?? 'null'}`,
+        `inputTokens=${usage.input}`, `outputTokens=${usage.output}`, `reasoningTokens=${usage.reasoning}`,
+        `clientDisconnected=${clientDisconnected}`,
+      ]);
       throw new GatewayError(gatewayError.type, gatewayError.message, {
         status: gatewayError.status,
         code: gatewayError.code,
-        cause,
+        safe: gatewayError.safe, cause,
       });
     } finally {
       detachDownstreamClose?.();
@@ -1444,12 +1577,34 @@ function isEmptyGeneration(
   return result.text.length === 0 && result.toolCalls.length === 0;
 }
 
-function emptyGenerationError(candidate: CandidateModel, usage: UsageSummary): GatewayError {
+function emptyGenerationError(candidate: CandidateModel, usage: UsageSummary, detail: Record<string, unknown> = {}): GatewayError {
   return new GatewayError(
     'upstream_error',
     `Upstream model "${bareModelName(candidate.publicModelId)}" returned no generated output`,
-    { status: 502, code: 'upstream_empty_response', cause: { usage: { ...usage, total: usage.total || usage.input + usage.output } } },
+    { status: 502, code: 'upstream_empty_response', cause: { ...detail, stage: 'no_generation_at_eof', usage: { ...usage, total: usage.total || usage.input + usage.output } } },
   );
+}
+
+function badGenerationError(message: string, stage: string, detail: Record<string, unknown> = {}): GatewayError {
+  return new GatewayError('upstream_error', message, { status: 502, code: 'upstream_bad_response', cause: { ...detail, stage } });
+}
+
+function nonemptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0;
+}
+
+function isLengthFinish(reason: string | null): boolean {
+  return reason === 'length' || reason === 'max_tokens';
+}
+
+// Provider-controlled labels may be useful for correlation, but never log raw
+// response fields or allow newlines/control characters in diagnostic lines.
+function diagnosticLabel(value: unknown): string {
+  if (typeof value !== 'string') return 'unknown';
+  return Array.from(redactString(value).slice(0, 160), (char) => {
+    const code = char.charCodeAt(0);
+    return code < 32 || code === 127 ? '?' : char;
+  }).join('');
 }
 
 function hasTools(req: CanonicalRequest): boolean {
@@ -1498,11 +1653,6 @@ function logUpstreamRequest(
       json.length > LIMIT ? `${json.slice(0, LIMIT)}…(+${json.length - LIMIT} chars, truncated)` : json,
     ]);
   }
-}
-
-/** Public alias so error formatting from debug.ts is available in this module. */
-function formatErrorPublic(e: unknown): string[] {
-  return formatError(e);
 }
 
 /**
@@ -1555,7 +1705,7 @@ function openaiStreamEncoder(data: string, _event?: string): string {
   return `data: ${data}\n\n`;
 }
 
-function anthropicStreamEncoder(data: string, _event?: string): string {
+function anthropicStreamEncoder(data: string, event?: string): string {
   if (data === '[DONE]') return 'data: [DONE]\n\n';
-  return `data: ${data}\n\n`;
+  return `${event && /^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/.test(event) && event !== 'message' ? `event: ${event}\n` : ''}data: ${data}\n\n`;
 }

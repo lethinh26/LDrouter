@@ -100,6 +100,8 @@ Do not create hidden lossy behavior. If a field cannot be represented safely, re
 
 Streaming must be end-to-end with backpressure. Do not concatenate the full upstream body first.
 
+The upstream SSE parser preserves UTF-8 across network chunks and joins multiline `data:` fields. An individual pending frame is bounded at 1 MiB. A compatible OpenAI upstream that ignores `stream: true` and returns a complete JSON chat completion may be normalized to a same-family chat delta; only that JSON body is buffered, with a 1 MiB limit. Other unsupported content types or shapes fail explicitly.
+
 Track these phases:
 
 ```text
@@ -172,6 +174,8 @@ through normalization and forwarded unchanged to OpenAI-compatible
 upstreams. The selected upstream model must support the requested effort.
 
 Reasoning/thinking fields vary across vendors. Treat them as provider capabilities/extensions. Map only when semantics are understood and safe. Unknown fields may be forwarded only when the upstream protocol and provider are the same compatible family and forwarding does not violate validation/security rules.
+
+Same-family nonempty reasoning/thinking is generated content and satisfies TTFT, but is kept separate from final answer text. Once forwarded, fallback is forbidden. A reasoning-only completion with a reported length limit preserves that finish reason; a normal stop without an answer or tool call is incomplete. Cross-family reasoning translation and Responses stream event translation require separate compatibility work.
 
 ## Token usage
 

@@ -33,13 +33,15 @@ export interface OpenAIChatResponse {
     index: number;
     message: {
       role: 'assistant';
-      content: string | null;
+      content: string | null | Array<{ type: string; text?: string }>;
       refusal?: string | null;
+      reasoning_content?: string | null;
+      function_call?: { name: string; arguments: string };
       tool_calls?: Array<{ id: string; type: 'function'; function: { name: string; arguments: string } }>;
     };
-    finish_reason: 'stop' | 'length' | 'tool_calls' | 'content_filter' | null;
+    finish_reason: 'stop' | 'length' | 'tool_calls' | 'content_filter' | 'function_call' | null;
   }>;
-  usage: {
+  usage?: {
     prompt_tokens: number;
     completion_tokens: number;
     total_tokens: number;
@@ -185,39 +187,57 @@ export function canonicalToOpenAIRequest(req: CanonicalRequest, targetModel: str
   return out;
 }
 
-export function openAIResponseToCanonical(res: OpenAIChatResponse, requestedModel: string): { model: string; text: string; toolCalls: Array<{ id: string; name: string; input: unknown }>; finishReason: string | null; usage: { input: number; output: number; cacheRead: number; cacheWrite: number; reasoning: number; total: number } } {
-  const choice = res.choices[0];
-  if (!choice || !choice.message) {
-    // Handle empty or malformed response
-    return {
-      model: requestedModel,
-      text: '',
-      toolCalls: [],
-      finishReason: null,
-      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, total: 0 },
-    };
-  }
-
+export function openAIResponseToCanonical(res: OpenAIChatResponse, requestedModel: string) {
+  const choice = res.choices?.[0];
+  const message = choice?.message;
+  const text = extractAssistantText(message?.content);
+  const refusal = typeof message?.refusal === 'string' && message.refusal ? message.refusal : undefined;
+  const reasoning = typeof message?.reasoning_content === 'string' && message.reasoning_content ? message.reasoning_content : undefined;
+  const legacy = message?.function_call;
+  const legacyFunctionCall = legacy && typeof legacy.name === 'string' && legacy.name && typeof legacy.arguments === 'string'
+    ? { name: legacy.name, arguments: legacy.arguments } : undefined;
+  const toolCalls = (Array.isArray(message?.tool_calls) ? message.tool_calls : []).flatMap((tc) => {
+    if (!tc || typeof tc.id !== 'string' || !tc.id || typeof tc.function?.name !== 'string' || !tc.function.name) return [];
+    const args = tc.function.arguments;
+    if (typeof args !== 'string' && !(args && typeof args === 'object')) return [];
+    return [{ id: tc.id, name: tc.function.name, input: typeof args === 'string' ? safeJson(args) : args }];
+  });
+  const input = tokenCount(res.usage?.prompt_tokens);
+  const output = tokenCount(res.usage?.completion_tokens);
   return {
     model: requestedModel,
-    text: typeof choice.message.content === 'string'
-      ? choice.message.content
-      : typeof choice.message.refusal === 'string' ? choice.message.refusal : '',
-    toolCalls: ((choice.message.tool_calls ?? []) as Array<{ id?: string; type?: string; function?: { name?: string; arguments?: string } }>).map((tc) => ({
-      id: typeof tc.id === 'string' ? tc.id : `toolu-${Math.random().toString(36).slice(2)}`,
-      name: typeof tc.function?.name === 'string' ? tc.function.name : 'unknown',
-      input: safeJson(typeof tc.function?.arguments === 'string' ? tc.function.arguments : '{}'),
-    })),
+    // Keep historical refusal-only text compatibility while preserving refusal
+    // separately for clients that understand the native field.
+    text: text || refusal || '',
+    toolCalls,
+    reasoning,
+    refusal,
+    legacyFunctionCall,
     finishReason: choice?.finish_reason ?? null,
     usage: {
-      input: typeof res.usage?.prompt_tokens === 'number' ? res.usage.prompt_tokens : 0,
-      output: typeof res.usage?.completion_tokens === 'number' ? res.usage.completion_tokens : 0,
-      cacheRead: typeof res.usage?.prompt_tokens_details?.cached_tokens === 'number' ? res.usage.prompt_tokens_details.cached_tokens : 0,
+      input,
+      output,
+      cacheRead: tokenCount(res.usage?.prompt_tokens_details?.cached_tokens),
       cacheWrite: 0,
-      reasoning: typeof res.usage?.completion_tokens_details?.reasoning_tokens === 'number' ? res.usage.completion_tokens_details.reasoning_tokens : 0,
-      total: typeof res.usage?.total_tokens === 'number' ? res.usage.total_tokens : 0,
+      reasoning: tokenCount(res.usage?.completion_tokens_details?.reasoning_tokens),
+      total: typeof res.usage?.total_tokens === 'number' ? tokenCount(res.usage.total_tokens) : input + output,
     },
   };
+}
+
+export function tokenCount(value: unknown, fallback = 0): number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : fallback;
+}
+
+/** Supported text parts only; never stringify arbitrary output blocks. */
+export function extractAssistantText(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content.map((part: unknown) => {
+    if (!part || typeof part !== 'object') return '';
+    const { type, text } = part as { type?: unknown; text?: unknown };
+    return (type === 'text' || type === 'output_text') && typeof text === 'string' ? text : '';
+  }).join('');
 }
 
 function extractText(content: unknown): string {

@@ -152,7 +152,13 @@ Expected:
 - deadline exhaustion, caller disconnect, fallback trigger off, cache hits, and synthetic admin requests obey their distinct rules
 - for streaming, metadata-only SSE events do not count as TTFT and no content from the slow member
   reaches the client before fallback
-- once real text/tool output is sent, later stream errors still never fallback
+- once real text, refusal, tool output or same-family reasoning is sent, later stream errors still never fallback
+- more than 128 reasoning events or 64 KiB before the answer still returns the full answer exactly once;
+  reasoning satisfies TTFT, role/usage/ping alone do not
+- genuine empty generations still retry/fallback within configured limits; malformed/oversized SSE
+  and premature EOF are distinguished from empty generations and never produce fabricated success
+- split UTF-8 and multiline SSE preserve exact content, and DONE/message_stop ends reading without
+  waiting for the upstream socket to close
 
 ## Security acceptance
 

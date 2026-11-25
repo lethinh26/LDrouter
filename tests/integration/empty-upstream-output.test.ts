@@ -346,6 +346,175 @@ describe('upstream 200 without semantic output', () => {
     expect(stream).toContain('data: [DONE]');
   });
 
+  it.each(['direct', 'combo'] as const)('streams long reasoning then a complete answer exactly once (%s)', async (target) => {
+    const before = requestCount();
+    const id = 'long-reasoning';
+    const events = openaiEvents('text', id);
+    events.splice(1, 0, ...Array.from({ length: 140 }, () => ({
+      payload: { id, choices: [{ index: 0, delta: { reasoning_content: 'thinking '.repeat(80), content: null }, finish_reason: null }] },
+    })));
+    pushHandler((_req, res) => sse(res, events));
+    const response = await request('openai', target === 'direct' ? models.openai.first.publicModelId : comboIds.openai, true);
+    expect(response.status).toBe(200);
+    const body = await response.text();
+    expect(body.match(/"reasoning_content"/g)).toHaveLength(140);
+    expect(body.match(/Recovered answer/g)).toHaveLength(1);
+    expect(body.match(/data: \[DONE\]/g)).toHaveLength(1);
+    expect(callCount()).toBe(1);
+    const row = await recordedRequestSince(before);
+    expect(row).toMatchObject({ success: true, finalModelId: models.openai.first.id, outputTokens: 3 });
+    expect(attemptRows(row.id)).toMatchObject([{ success: true, streamStarted: true, partialResponse: false }]);
+  });
+
+  it('commits real reasoning before a later stream error and never falls back', async () => {
+    const before = requestCount();
+    pushHandler((_req, res) => sse(res, [
+      { payload: { choices: [{ delta: { reasoning_content: 'thinking' } }] } },
+      { payload: { error: { message: 'fixture upstream failed' } } },
+    ]));
+    const response = await request('openai', comboIds.openai, true);
+    expect(response.status).toBe(200);
+    const body = await response.text();
+    expect(body).toContain('reasoning_content');
+    expect(body).not.toContain('data: [DONE]');
+    expect(callCount()).toBe(1);
+    const row = await recordedRequestSince(before);
+    expect(row.success).toBe(false);
+    expect(attemptRows(row.id)).toMatchObject([{ success: false, streamStarted: true, partialResponse: true }]);
+  });
+
+  it('reasoning satisfies the first-token and combo slow watchdogs before the final answer', async () => {
+    const before = requestCount();
+    const providerId = models.openai.first.providerId;
+    const combo = db.select().from(sch.combos).where(eq(sch.combos.publicModelId, comboIds.openai)).get()!;
+    const provider = db.select().from(sch.providers).where(eq(sch.providers.id, providerId)).get()!;
+    db.update(sch.providers).set({ firstTokenTimeoutMs: 800 }).where(eq(sch.providers.id, providerId)).run();
+    db.update(sch.combos).set({ slowResponseFallbackEnabled: true, slowResponseThresholdSeconds: 1 }).where(eq(sch.combos.id, combo.id)).run();
+    try {
+      pushHandler((_req, res) => {
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.write('data: {"choices":[{"delta":{"reasoning_content":"thinking"}}]}\n\n');
+        const timer = setTimeout(() => res.end('data: {"choices":[{"delta":{"content":"Recovered answer"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'), 1400);
+        res.on('close', () => clearTimeout(timer));
+      });
+      const response = await request('openai', comboIds.openai, true);
+      expect(response.status).toBe(200);
+      expect(await response.text()).toContain('Recovered answer');
+      expect(callCount()).toBe(1);
+      const row = await recordedRequestSince(before);
+      expect(row).toMatchObject({ success: true, finalModelId: models.openai.first.id });
+      expect(attemptRows(row.id)).toMatchObject([{ success: true, streamStarted: true }]);
+      expect(row.ttftMs).toBeLessThan(800);
+    } finally {
+      db.update(sch.providers).set({ firstTokenTimeoutMs: provider.firstTokenTimeoutMs }).where(eq(sch.providers.id, providerId)).run();
+      db.update(sch.combos).set({ slowResponseFallbackEnabled: combo.slowResponseFallbackEnabled, slowResponseThresholdSeconds: combo.slowResponseThresholdSeconds }).where(eq(sch.combos.id, combo.id)).run();
+    }
+  });
+
+  it('does not mistake repeated empty metadata for generation or exhaust the prelude before real text', async () => {
+    const events = openaiEvents('text', 'metadata-then-text');
+    events.splice(1, 0, ...Array.from({ length: 140 }, () => ({ payload: { choices: [{ index: 0, delta: { content: '' }, finish_reason: null }] } })));
+    pushHandler((_req, res) => sse(res, events));
+    const response = await request('openai', models.openai.first.publicModelId, true);
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain('Recovered answer');
+    expect(callCount()).toBe(1);
+  });
+
+  it('keeps reasoning-only normal termination distinct from true empty output', async () => {
+    const before = requestCount();
+    pushHandler((_req, res) => sse(res, [
+      { payload: { choices: [{ delta: { reasoning_content: 'thinking' } }] } },
+      { payload: { choices: [{ delta: {}, finish_reason: 'stop' }] } },
+    ]));
+    const response = await request('openai', comboIds.openai, true);
+    expect(response.status).toBe(200);
+    const body = await response.text();
+    expect(body).toContain('reasoning_content');
+    expect(body).not.toContain('[DONE]');
+    expect(callCount()).toBe(1);
+    const row = await recordedRequestSince(before);
+    expect(row.success).toBe(false);
+    expect(attemptRows(row.id)).toMatchObject([{ failureReason: 'bad_response', partialResponse: true }]);
+  });
+
+  it('preserves a reasoning-only length termination without inventing an answer', async () => {
+    const before = requestCount();
+    pushHandler((_req, res) => sse(res, [
+      { payload: { choices: [{ delta: { reasoning_content: 'thinking' } }] } },
+      { payload: { choices: [{ delta: {}, finish_reason: 'length' }], usage: { completion_tokens: 20 } } },
+    ]));
+    const response = await request('openai', comboIds.openai, true);
+    expect(response.status).toBe(200);
+    const body = await response.text();
+    expect(body).toContain('"reasoning_content":"thinking"');
+    expect(body).toContain('"finish_reason":"length"');
+    expect(body).toContain('data: [DONE]');
+    expect(callCount()).toBe(1);
+    expect(await recordedRequestSince(before)).toMatchObject({ success: true, outputTokens: 20 });
+  });
+
+  it('marks clean EOF without finish or sentinel as partial, with no fabricated DONE', async () => {
+    const before = requestCount();
+    pushHandler((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end('data: {"choices":[{"delta":{"content":"partial"}}]}\n\n');
+    });
+    const response = await request('openai', comboIds.openai, true);
+    expect(response.status).toBe(200);
+    const body = await response.text();
+    expect(body).toContain('partial');
+    expect(body).not.toContain('data: [DONE]');
+    expect(callCount()).toBe(1);
+    const row = await recordedRequestSince(before);
+    expect(row.success).toBe(false);
+    expect(attemptRows(row.id)).toMatchObject([{ success: false, streamStarted: true, partialResponse: true }]);
+  });
+
+  it('streams a full-message SSE snapshot as a compatible delta', async () => {
+    pushHandler((_req, res) => sse(res, [{ payload: openaiText }]));
+    const response = await request('openai', models.openai.first.publicModelId, true);
+    expect(response.status).toBe(200);
+    const body = await response.text();
+    const events = body.split('\n\n').filter((event) => event.startsWith('data: {')).map((event) => JSON.parse(event.slice(6)));
+    expect(events.map((event) => event.choices?.[0]?.delta?.content ?? '').join('')).toBe('Recovered answer');
+    expect(body).toContain('data: [DONE]');
+    expect(callCount()).toBe(1);
+  });
+
+  it('recovers a complete JSON response when an OpenAI upstream ignores stream=true', async () => {
+    const before = requestCount();
+    pushHandler((_req, res) => json(res, openaiText));
+    const response = await request('openai', comboIds.openai, true);
+    expect(response.status).toBe(200);
+    const body = await response.text();
+    expect(body.match(/Recovered answer/g)).toHaveLength(1);
+    expect(body).toContain('"delta"');
+    expect(body).toContain('data: [DONE]');
+    expect(callCount()).toBe(1);
+    expect(await recordedRequestSince(before)).toMatchObject({ success: true, finalModelId: models.openai.first.id });
+  });
+
+  it('accepts non-streaming text parts and empty-content refusal', async () => {
+    for (const message of [
+      { role: 'assistant', content: [{ type: 'text', text: 'Recovered ' }, { type: 'output_text', text: 'answer' }] },
+      { role: 'assistant', content: '', refusal: 'Recovered answer' },
+    ]) {
+      pushHandler((_req, res) => json(res, { ...openaiText, choices: [{ index: 0, message, finish_reason: 'stop' }] }));
+      const response = await request('openai', models.openai.first.publicModelId);
+      expect(response.status).toBe(200);
+      expect((await response.json() as { choices: Array<{ message: { content: string } }> }).choices[0]!.message.content).toBe('Recovered answer');
+    }
+  });
+
+  it('returns non-streaming reasoning separately and preserves length termination', async () => {
+    pushHandler((_req, res) => json(res, { ...openaiText, choices: [{ index: 0, message: { role: 'assistant', content: null, reasoning_content: 'thinking' }, finish_reason: 'length' }] }));
+    const response = await request('openai', models.openai.first.publicModelId);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ choices: [{ message: { content: '', reasoning_content: 'thinking' }, finish_reason: 'length' }] });
+    expect(callCount()).toBe(1);
+  });
+
   it('rejects empty Anthropic message 200 while preserving Anthropic error envelope', async () => {
     pushHandler((_req, res) => json(res, anthropicEmpty));
     const response = await request('anthropic', models.anthropic.first.publicModelId);
@@ -399,5 +568,27 @@ describe('upstream 200 without semantic output', () => {
     expect(response.status).toBe(200);
     expect(await response.text()).toContain('tool_lookup');
     expect(callCount()).toBe(1);
+  });
+
+  it('streams Anthropic thinking and nonempty text block starts, preserving named events', async () => {
+    const before = requestCount();
+    const events = anthropicEvents('none', 'thinking-and-answer');
+    events.splice(1, 0,
+      { event: 'content_block_start', payload: { type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '' } } },
+      ...Array.from({ length: 140 }, () => ({ event: 'content_block_delta', payload: { type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: 'thinking' } } })),
+      { event: 'content_block_stop', payload: { type: 'content_block_stop', index: 0 } },
+      { event: 'content_block_start', payload: { type: 'content_block_start', index: 1, content_block: { type: 'text', text: 'Recovered answer' } } },
+      { event: 'content_block_stop', payload: { type: 'content_block_stop', index: 1 } },
+    );
+    pushHandler((_req, res) => sse(res, events));
+    const response = await request('anthropic', comboIds.anthropic, true);
+    expect(response.status).toBe(200);
+    const body = await response.text();
+    expect(body).toContain('event: content_block_delta');
+    expect(body).toContain('Recovered answer');
+    expect(body.match(/event: message_stop/g)).toHaveLength(1);
+    expect(body).not.toContain('data: [DONE]');
+    expect(callCount()).toBe(1);
+    expect(await recordedRequestSince(before)).toMatchObject({ success: true, finalModelId: models.anthropic.first.id });
   });
 });

@@ -731,13 +731,16 @@ firstChunkTime
 lastChunkTime
 ```
 
-Với DEBUG cực sâu, có thể log first 3-5 chunks.
+Với DEBUG_STREAM, log cấu trúc của 3 chunks đầu (không log raw content hoặc reasoning).
 
 Ví dụ:
 
 ```text
 [req_xxx] [STREAM FIRST CHUNK]
-data: {...}
+bytes=256
+text=false
+tool=false
+reasoning=true
 ```
 
 Sau đó:
@@ -758,11 +761,17 @@ Nếu lỗi giữa stream:
 
 chunksBeforeError=21
 bytesBeforeError=14219
-
-name=...
-message=...
-cause=...
-stack=...
+stage=truncated_stream
+providerProtocol=openai
+clientEndpoint=chat/completions
+upstreamStatus=200
+upstreamRequestId=...
+terminalSeen=false
+committed=true
+textEvents=2
+reasoningEvents=19
+firstGeneratedMs=120
+firstAnswerMs=350
 ```
 
 Phải phân biệt:
@@ -774,6 +783,11 @@ AbortController abort
 parser error
 response transformer error
 ```
+
+`prelude_limit`, `no_generation_at_eof`, `unsupported_shape`, `unexpected_content_type`,
+`incomplete_generation` và `truncated_stream` là các stage riêng. HTTP status upstream khác
+với status gateway. Các diagnostic chỉ chứa metadata/counters và usage đã báo cáo,
+không chứa prompt, output, reasoning hay secret headers.
 
 ---
 

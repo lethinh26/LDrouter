@@ -86,6 +86,7 @@ export async function registerAnthropicRoutes(app: FastifyInstance): Promise<voi
         role: 'assistant',
         model: body.model,
         content: [
+          ...(outcome.thinkingBlocks ?? []),
           ...(outcome.text ? [{ type: 'text', text: outcome.text }] : []),
           ...(outcome.toolCalls ?? []).map((tc) => ({ type: 'tool_use', id: tc.id, name: tc.name, input: tc.input })),
         ],

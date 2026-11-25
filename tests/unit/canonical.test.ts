@@ -72,6 +72,26 @@ describe('OpenAI <-> canonical', () => {
     expect(r.usage.total).toBe(20);
     expect(r.finishReason).toBe('stop');
   });
+
+  it('normalizes text parts, refusal, and reasoning without mixing thinking into the answer', () => {
+    const r = openAIResponseToCanonical({ choices: [{ message: {
+      content: [{ type: 'text', text: 'Hello ' }, { type: 'output_text', text: 'world' }, { type: 'image', text: 'ignored' }],
+      refusal: 'refusal', reasoning_content: 'thinking',
+    }, finish_reason: 'stop' }] } as never, 'm');
+    expect(r).toMatchObject({ text: 'Hello world', refusal: 'refusal', reasoning: 'thinking', usage: { input: 0, output: 0 } });
+    expect(openAIResponseToCanonical({ choices: [{ message: { content: '', refusal: 'no' } }] } as never, 'm')).toMatchObject({ text: 'no', refusal: 'no' });
+  });
+
+  it('preserves usage even without a choice and ignores empty tool placeholders', () => {
+    expect(openAIResponseToCanonical({ choices: [], usage: { prompt_tokens: 7, completion_tokens: 4 } } as never, 'm'))
+      .toMatchObject({ text: '', toolCalls: [], usage: { input: 7, output: 4, total: 11 } });
+    expect(openAIResponseToCanonical({ choices: [{ message: { content: null, tool_calls: [{}, { id: 'only-id' }] } }] } as never, 'm').toolCalls).toEqual([]);
+  });
+
+  it('preserves legacy function_call without fabricating a tool ID', () => {
+    const r = openAIResponseToCanonical({ choices: [{ message: { content: null, function_call: { name: 'lookup', arguments: '{"x":1}' } }, finish_reason: 'function_call' }] } as never, 'm');
+    expect(r).toMatchObject({ text: '', toolCalls: [], legacyFunctionCall: { name: 'lookup', arguments: '{"x":1}' }, finishReason: 'function_call' });
+  });
 });
 
 describe('Anthropic <-> canonical', () => {
@@ -152,5 +172,14 @@ describe('Anthropic <-> canonical', () => {
     expect(r.usage.cacheRead).toBe(2);
     expect(r.usage.cacheWrite).toBe(4);
     expect(r.finishReason).toBe('end_turn');
+  });
+
+  it('preserves thinking blocks separately and accepts omitted usage', () => {
+    const r = anthropicResponseToCanonical({ content: [
+      { type: 'thinking', thinking: 'reasoning', signature: 'sig' },
+      { type: 'text', text: 'answer' },
+      { type: 'tool_use', id: '', name: '' },
+    ], stop_reason: 'end_turn' } as never, 'm');
+    expect(r).toMatchObject({ text: 'answer', thinkingBlocks: [{ type: 'thinking', thinking: 'reasoning', signature: 'sig' }], toolCalls: [], usage: { input: 0, output: 0 } });
   });
 });

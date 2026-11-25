@@ -40,7 +40,7 @@ async function silentServer(sendHeaders: boolean): Promise<string> {
 
 async function stalledErrorBody(status: number): Promise<string> {
   server = http.createServer((_req, res) => {
-    res.writeHead(status, { 'content-type': 'application/json' });
+    res.writeHead(status, { 'content-type': 'application/json', 'x-request-id': 'stalled-error' });
     res.flushHeaders();
     // Deliberately leave the error body open; the provider total deadline must
     // bound the read without replacing the already-known HTTP status.
@@ -52,7 +52,7 @@ async function stalledErrorBody(status: number): Promise<string> {
 
 async function metadataThenHang(): Promise<string> {
   server = http.createServer((_req, res) => {
-    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'x-request-id': 'metadata-only' });
     res.flushHeaders();
     res.write('data: {"choices":[{"index":0,"delta":{}}],"usage":{"prompt_tokens":1}}\n\n');
   });
@@ -127,7 +127,9 @@ describe('callUpstreamStreaming watchdogs', () => {
       url,
       { model: 'm', stream: true },
       () => false,
-    )).rejects.toMatchObject({ code: 'combo_slow_response_timeout' });
+    )).rejects.toMatchObject({ code: 'combo_slow_response_timeout', cause: {
+      upstreamStatus: 200, upstreamRequestId: 'metadata-only', contentType: 'text/event-stream', stage: 'slow_response', terminalSeen: false,
+    } });
   });
 
   it('measures combo TTFT from request start, including time spent waiting for response headers', async () => {
@@ -156,7 +158,9 @@ describe('callUpstreamStreaming watchdogs', () => {
       cfg({ connectTimeoutMs: 2000, totalTimeoutMs: 650, slowResponseTimeoutMs: 250 }),
       url,
       { model: 'm', stream: false },
-    )).rejects.toMatchObject({ code: 'upstream_http_408', cause: { status: 408 } });
+    )).rejects.toMatchObject({ code: 'upstream_http_408', cause: {
+      status: 408, upstreamStatus: 408, upstreamRequestId: 'stalled-error', contentType: 'application/json', stage: 'http_status',
+    } });
     expect(Date.now() - startedAt).toBeGreaterThanOrEqual(550);
   });
 
@@ -168,7 +172,9 @@ describe('callUpstreamStreaming watchdogs', () => {
       url,
       { model: 'm', stream: true },
       () => false,
-    )).rejects.toMatchObject({ code: 'upstream_http_408', cause: { status: 408 } });
+    )).rejects.toMatchObject({ code: 'upstream_http_408', cause: {
+      status: 408, upstreamStatus: 408, upstreamRequestId: 'stalled-error', contentType: 'application/json', stage: 'http_status', terminalSeen: false,
+    } });
     expect(Date.now() - startedAt).toBeGreaterThanOrEqual(550);
   });
 

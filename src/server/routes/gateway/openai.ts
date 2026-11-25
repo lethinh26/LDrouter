@@ -120,8 +120,11 @@ export async function registerOpenAIRoutes(app: FastifyInstance): Promise<void> 
             message: {
               role: 'assistant',
               content: outcome.text,
+              ...(outcome.reasoning ? { reasoning_content: outcome.reasoning } : {}),
+              ...(outcome.refusal ? { refusal: outcome.refusal } : {}),
+              ...(outcome.legacyFunctionCall ? { function_call: outcome.legacyFunctionCall } : {}),
               ...(outcome.toolCalls && outcome.toolCalls.length
-                ? { tool_calls: outcome.toolCalls.map((tc) => ({ id: tc.id, type: 'function', function: { name: tc.name, arguments: JSON.stringify(tc.input) } })) }
+                ? { tool_calls: outcome.toolCalls.map((tc) => ({ id: tc.id, type: 'function', function: { name: tc.name, arguments: typeof tc.input === 'string' ? tc.input : JSON.stringify(tc.input) } })) }
                 : {}),
             },
             finish_reason: outcome.finishReason,
