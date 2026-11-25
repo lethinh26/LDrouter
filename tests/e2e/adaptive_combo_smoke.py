@@ -130,7 +130,7 @@ def main():
         base = f"http://127.0.0.1:{port}"
         env = {**os.environ, "LATEDEV_HOST": "127.0.0.1", "LATEDEV_PORT": str(port),
                "LATEDEV_DATA_DIR": str(data), "LATEDEV_DB_URL": str(data / "data.sqlite"),
-               "LATEDEV_MASTER_KEY": "ci-only-fixture-key-1234567890123456", "LATEDEV_LOG_LEVEL": "error"}
+               "LATEDEV_MASTER_KEY": "0123456789abcdef0123456789abcdef", "LATEDEV_LOG_LEVEL": "error"}
         with (data / "gateway.log").open("w+") as log:
             proc = subprocess.Popen(["node", "dist/cli.js", "--no-tui"], env=env, stdout=log, stderr=subprocess.STDOUT)
             try:
