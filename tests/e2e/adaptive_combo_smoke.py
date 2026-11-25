@@ -54,8 +54,7 @@ class MockUpstream(BaseHTTPRequestHandler):
 def smoke(base, upstream):
     with sync_playwright() as p:
         browser = p.chromium.launch()
-        # Keep both sortable rows visible and avoid animation-dependent keyboard
-        # collision measurements inside the scrollable edit dialog.
+        # Keep both sortable rows visible inside the scrollable edit dialog.
         page = browser.new_page(base_url=base, viewport={"width": 1440, "height": 1200}, reduced_motion="reduce")
         page.set_default_timeout(15000)
 
@@ -96,20 +95,18 @@ def smoke(base, upstream):
         dialog = page.get_by_role("dialog")
         expect(dialog.get_by_text("Adaptive routing by workload")).to_be_visible()
         expect(dialog.get_by_text("Degraded · reserve", exact=True)).to_be_visible()
-        handle = dialog.get_by_role("button", name="Reorder ci/b")
-        handle.scroll_into_view_if_needed()
-        handle.focus()
-        handle.press("Space")
-        expect(handle).to_have_attribute("aria-pressed", "true")
-        # The keyboard sensor installs its keydown listener asynchronously.
-        # Wait for the drag state and collision target before dropping.
-        expect(page.get_by_text("Draggable item 1 was moved over droppable area 1.", exact=True)).to_be_attached()
-        handle.press("ArrowUp")
-        expect(page.get_by_text("Draggable item 1 was moved over droppable area 0.", exact=True)).to_be_attached()
-        handle.press("Space")
-        expect(dialog.get_by_role("button", name="Reorder ci/b")).not_to_have_attribute("aria-pressed", "true")
-        expect(dialog.get_by_role("button", name="Reorder ci/b")).to_be_visible()
         handles = dialog.locator('button[aria-label^="Reorder "]')
+        expect(handles.first).to_have_attribute("aria-label", "Reorder ci/a")
+        expect(dialog.get_by_role("button", name="Move ci/a up", exact=True)).to_be_disabled()
+        expect(dialog.get_by_role("button", name="Move ci/b down", exact=True)).to_be_disabled()
+        # Exercise the accessible keyboard reorder control. It uses the same
+        # priority update as drag-and-drop without relying on drag geometry.
+        move_up = dialog.get_by_role("button", name="Move ci/b up", exact=True)
+        move_up.press("Enter")
+        expect(handles.first).to_have_attribute("aria-label", "Reorder ci/b")
+        dialog.get_by_role("button", name="Move ci/b down", exact=True).press("Enter")
+        expect(handles.first).to_have_attribute("aria-label", "Reorder ci/a")
+        move_up.press("Enter")
         expect(handles.first).to_have_attribute("aria-label", "Reorder ci/b")
         dialog.get_by_role("button", name="Save", exact=True).click()
         expect(dialog).not_to_be_visible()

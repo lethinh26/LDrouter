@@ -12,7 +12,7 @@ import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, 
 import { Switch } from '../../components/ui/switch';
 import { api } from '../../lib/api';
 import { toast } from 'sonner';
-import { Plus, Edit, Trash2, Search, X, GripVertical, Play, Loader2, CheckCircle2, AlertTriangle } from 'lucide-react';
+import { Plus, Edit, Trash2, Search, X, GripVertical, ChevronUp, ChevronDown, Play, Loader2, CheckCircle2, AlertTriangle } from 'lucide-react';
 import { DndContext, KeyboardSensor, PointerSensor, closestCenter, useSensor, useSensors, type DragEndEvent } from '@dnd-kit/core';
 import { restrictToParentElement, restrictToVerticalAxis } from '@dnd-kit/modifiers';
 import { SortableContext, arrayMove, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable';
@@ -403,21 +403,28 @@ function MemberList({ members, label, modelFor, onChange, className }: {
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
   );
   if (members.length === 0) return <p className={cn('text-xs text-muted-foreground', className)}>No members yet — add at least one.</p>;
+  const move = (from: number, to: number) => {
+    if (from < 0 || to < 0 || from >= members.length || to >= members.length || from === to) return;
+    onChange(reindex(arrayMove(members, from, to)));
+  };
   const onDragEnd = ({ active, over }: DragEndEvent) => {
     if (!over || active.id === over.id) return;
-    onChange(reindex(arrayMove(members, Number(active.id), Number(over.id))));
+    move(members.findIndex((m) => m.modelId === active.id), members.findIndex((m) => m.modelId === over.id));
   };
   return (
     <DndContext sensors={sensors} collisionDetection={closestCenter} modifiers={[restrictToVerticalAxis, restrictToParentElement]} onDragEnd={onDragEnd}>
-      <SortableContext items={members.map((_, i) => i)} strategy={verticalListSortingStrategy}>
+      <SortableContext items={members.map((m) => m.modelId)} strategy={verticalListSortingStrategy}>
         <div className={cn('space-y-1', className)}>
           {members.map((m, i) => (
             <MemberRow
-              key={m.id ?? m.modelId}
+              key={m.modelId}
+              modelId={m.modelId}
               index={i}
               label={label(m)}
               model={modelFor(m)}
               enabled={m.enabled}
+              onMoveUp={i > 0 ? () => move(i, i - 1) : undefined}
+              onMoveDown={i < members.length - 1 ? () => move(i, i + 1) : undefined}
               onToggle={(enabled) => onChange(members.map((member, j) => j === i ? { ...member, enabled } : member))}
               onRemove={() => onChange(reindex(members.filter((_, j) => j !== i)))}
             />
@@ -429,15 +436,18 @@ function MemberList({ members, label, modelFor, onChange, className }: {
 }
 
 /** One member row. Separate because useSortable is a hook and must run per row. */
-function MemberRow({ index, label, model, enabled, onToggle, onRemove }: {
+function MemberRow({ modelId, index, label, model, enabled, onMoveUp, onMoveDown, onToggle, onRemove }: {
+  modelId: string;
   index: number;
   label: string;
   model: ModelRow | null;
   enabled: boolean;
+  onMoveUp?: () => void;
+  onMoveDown?: () => void;
   onToggle: (enabled: boolean) => void;
   onRemove: () => void;
 }) {
-  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: index });
+  const { attributes, listeners, setNodeRef, setActivatorNodeRef, transform, transition, isDragging } = useSortable({ id: modelId });
   const available = enabled && !!model && model.enabled && model.providerEnabled && !model.circuitOpen && model.upstreamAvailable && model.capabilities.chat !== false;
   return (
     <div
@@ -446,6 +456,7 @@ function MemberRow({ index, label, model, enabled, onToggle, onRemove }: {
       className={cn('flex items-center gap-2 rounded border p-2 text-sm', isDragging && 'relative z-10 bg-muted/60 shadow-sm')}
     >
       <button
+        ref={setActivatorNodeRef}
         type="button"
         {...attributes}
         {...listeners}
@@ -461,6 +472,10 @@ function MemberRow({ index, label, model, enabled, onToggle, onRemove }: {
         <div className="truncate text-[11px] text-muted-foreground">{model?.providerSlug || "provider"} · upstream: {model?.upstreamModelId ?? "unknown"}</div>
       </div>
       <Badge variant={available ? 'success' : 'secondary'}>{!enabled ? 'Disabled' : available ? (model?.providerHealth === 'down' || model?.providerHealth === 'degraded' ? 'Ready · degraded provider' : 'Ready') : 'Unavailable'}</Badge>
+      <div className="flex shrink-0 flex-col gap-0.5">
+        <Button type="button" size="icon" variant="ghost" className="size-6" aria-label={`Move ${label} up`} title="Move up" disabled={!onMoveUp} onClick={onMoveUp}><ChevronUp /></Button>
+        <Button type="button" size="icon" variant="ghost" className="size-6" aria-label={`Move ${label} down`} title="Move down" disabled={!onMoveDown} onClick={onMoveDown}><ChevronDown /></Button>
+      </div>
       <Switch aria-label={`Enable ${label}`} checked={enabled} onCheckedChange={onToggle} />
       <Button size="sm" variant="outline" onClick={onRemove}>Remove</Button>
     </div>
