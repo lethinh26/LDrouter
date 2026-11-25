@@ -375,7 +375,12 @@ export class GatewayRunner {
         let baseCfg: ReturnType<typeof providerToUpstreamConfig>;
         try { baseCfg = providerToUpstreamConfig(provider); }
         catch (e) {
-          lastError = e instanceof GatewayError ? e : new GatewayError('upstream_error', (e as Error).message, { cause: e });
+          const error = e instanceof GatewayError ? e : new GatewayError('upstream_error', (e as Error).message, { cause: e });
+          // Credential/configuration failures before any upstream dispatch are
+          // preflight errors. Admin test endpoints must return the actionable
+          // HTTP error, rather than a successful envelope with zero attempts.
+          if (attemptNumber === 0) throw error;
+          lastError = error;
           break;
         }
         const circuitPermit = claimCircuitAttempt(provider.id, provider.cbCooldownSeconds);

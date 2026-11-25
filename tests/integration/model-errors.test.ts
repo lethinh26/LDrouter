@@ -150,17 +150,23 @@ describe('combo rejections', () => {
     expect(e.message).not.toContain('vl/');
   });
 
-  it('reports availability reasons as availability, not capability', async () => {
+  it('reports availability reasons with 503 for adaptive and 502 for ordered fallback', async () => {
     const a = mkModel('down-a', ALL_TRUE, { upstreamAvailable: false });
     const b = mkModel('down-b', ALL_TRUE, { upstreamAvailable: false });
-    mkCombo('down-combo', [a, b]);
+    const comboId = mkCombo('down-combo', [a, b]);
     const r = await chat('down-combo', TEXT_CONTENT);
     const e = await err(r);
     expect(e.type).toBe('upstream_unavailable');
     expect(e.message).toContain('down-a');
     expect(e.message).toContain('down-b');
     expect(e.message).not.toContain('capabilities');
-    expect(r.status).toBe(502);
+    expect(r.status).toBe(503);
+    // The adaptive policy reports temporary exhaustion as 503. Switching
+    // it off retains the established ordered-fallback error contract.
+    db.update(sch.combos).set({ slowResponseFallbackEnabled: false }).where(eq(sch.combos.id, comboId)).run();
+    const ordered = await chat('down-combo', TEXT_CONTENT);
+    expect(ordered.status).toBe(502);
+    expect(await err(ordered)).toMatchObject({ type: e.type, message: e.message });
   });
 
   it('reports a mix of capability and availability reasons together', async () => {

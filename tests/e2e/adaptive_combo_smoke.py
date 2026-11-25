@@ -54,7 +54,8 @@ class MockUpstream(BaseHTTPRequestHandler):
 def smoke(base, upstream):
     with sync_playwright() as p:
         browser = p.chromium.launch()
-        page = browser.new_page(base_url=base)
+        # Keep both sortable rows visible inside the scrollable edit dialog.
+        page = browser.new_page(base_url=base, viewport={"width": 1440, "height": 1200}, reduced_motion="reduce")
         page.set_default_timeout(15000)
 
         def post(path, data, headers=None):
@@ -94,11 +95,19 @@ def smoke(base, upstream):
         dialog = page.get_by_role("dialog")
         expect(dialog.get_by_text("Adaptive routing by workload")).to_be_visible()
         expect(dialog.get_by_text("Degraded · reserve", exact=True)).to_be_visible()
-        handle = dialog.get_by_role("button", name="Reorder ci/b")
-        handle.focus()
-        handle.press("Space")
-        handle.press("ArrowUp")
-        handle.press("Space")
+        handles = dialog.locator('button[aria-label^="Reorder "]')
+        expect(handles.first).to_have_attribute("aria-label", "Reorder ci/a")
+        expect(dialog.get_by_role("button", name="Move ci/a up", exact=True)).to_be_disabled()
+        expect(dialog.get_by_role("button", name="Move ci/b down", exact=True)).to_be_disabled()
+        # Exercise the accessible keyboard reorder control. It uses the same
+        # priority update as drag-and-drop without relying on drag geometry.
+        move_up = dialog.get_by_role("button", name="Move ci/b up", exact=True)
+        move_up.press("Enter")
+        expect(handles.first).to_have_attribute("aria-label", "Reorder ci/b")
+        dialog.get_by_role("button", name="Move ci/b down", exact=True).press("Enter")
+        expect(handles.first).to_have_attribute("aria-label", "Reorder ci/a")
+        move_up.press("Enter")
+        expect(handles.first).to_have_attribute("aria-label", "Reorder ci/b")
         dialog.get_by_role("button", name="Save", exact=True).click()
         expect(dialog).not_to_be_visible()
 
@@ -130,7 +139,7 @@ def main():
         base = f"http://127.0.0.1:{port}"
         env = {**os.environ, "LATEDEV_HOST": "127.0.0.1", "LATEDEV_PORT": str(port),
                "LATEDEV_DATA_DIR": str(data), "LATEDEV_DB_URL": str(data / "data.sqlite"),
-               "LATEDEV_MASTER_KEY": "ci-only-fixture-key-1234567890123456", "LATEDEV_LOG_LEVEL": "error"}
+               "LATEDEV_MASTER_KEY": "0123456789abcdef0123456789abcdef", "LATEDEV_LOG_LEVEL": "error"}
         with (data / "gateway.log").open("w+") as log:
             proc = subprocess.Popen(["node", "dist/cli.js", "--no-tui"], env=env, stdout=log, stderr=subprocess.STDOUT)
             try:

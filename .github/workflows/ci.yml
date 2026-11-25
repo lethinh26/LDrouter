@@ -14,7 +14,8 @@ permissions:
 
 jobs:
   gates:
-    runs-on: ubuntu-latest
+    # Playwright 1.55 supports Ubuntu 24.04, not Ubuntu 26.04 (ubuntu-latest).
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: pnpm/action-setup@v6 # version from packageManager field
@@ -54,7 +55,8 @@ jobs:
     env:
       COMPOSE_PROJECT_NAME: ldrouter-ci-${{ github.run_id }}-${{ github.run_attempt }}
       LATEDEV_IMAGE: local/ldrouter:ci-${{ github.run_id }}
-      LATEDEV_MASTER_KEY: 'ci-only-not-a-production-secret-123456'
+      # Public test-only key, exactly 32 ASCII bytes. Never use it in production.
+      LATEDEV_MASTER_KEY: '0123456789abcdef0123456789abcdef'
     steps:
       - uses: actions/checkout@v7
       - name: Build and start isolated service

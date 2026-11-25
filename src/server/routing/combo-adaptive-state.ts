@@ -2,7 +2,7 @@
 // spans an upstream call; outcomes are fenced against member/config/DB changes.
 import crypto from 'node:crypto';
 import { and, eq } from 'drizzle-orm';
-import { getDatabaseEpoch, getDb, getRawDb, schema } from '../db';
+import { getDatabaseEpoch, getDb, getRawDb, schema } from '../db/index';
 import type { CandidateModel, ComboPlan } from './combo';
 import {
   type AdaptiveState, type AdaptiveSample, type AdaptiveOutcomeKind, type AdaptiveRole,
