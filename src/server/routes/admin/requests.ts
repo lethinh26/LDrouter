@@ -88,11 +88,24 @@ export function loadSummaryMaps(): SummaryMaps {
 }
 
 // Shared row → API summary mapping (used by the list endpoint, the SSE stream, and stats).
-export function toSummary(r: RequestRow, maps: SummaryMaps): RequestLogSummary {
+export function toSummary(r: RequestRow, maps: SummaryMaps, attempts?: ReadonlyArray<Pick<typeof schema.requestAttempts.$inferSelect, 'modelId' | 'providerId' | 'attemptNumber'>>): RequestLogSummary {
   const { keyMap, modelMap, providerMap } = maps;
   const key = r.apiKeyId ? keyMap.get(r.apiKeyId) : null;
   const finalModel = r.finalModelId ? modelMap.get(r.finalModelId) : null;
-  const provider = finalModel?.providerId ? providerMap.get(finalModel.providerId) : null;
+  // Historical attempts retain IDs even after the model and provider rows are removed.
+  // Use the matching final model's latest attempt; never guess from an unrelated fallback.
+  let providerId = finalModel?.providerId ?? null;
+  if (!providerId && r.finalModelId) {
+    providerId = (attempts
+      ? attempts.filter((a) => a.modelId === r.finalModelId).reduce<typeof attempts[number] | undefined>(
+          (latest, a) => !latest || a.attemptNumber > latest.attemptNumber ? a : latest, undefined)
+      : getDb().select({ providerId: schema.requestAttempts.providerId })
+          .from(schema.requestAttempts)
+          .where(and(eq(schema.requestAttempts.requestId, r.id), eq(schema.requestAttempts.modelId, r.finalModelId)))
+          .orderBy(desc(schema.requestAttempts.attemptNumber))
+          .limit(1).get())?.providerId ?? null;
+  }
+  const provider = providerId ? providerMap.get(providerId) : null;
   return {
     id: r.id,
     createdAt: r.createdAt,
@@ -105,11 +118,13 @@ export function toSummary(r: RequestRow, maps: SummaryMaps): RequestLogSummary {
     requestedModel: r.requestedModel,
     resolvedTargetKind: r.resolvedTargetKind,
     resolvedTargetId: r.resolvedTargetId,
-    finalModelPublicId: finalModel?.publicModelId ?? null,
+    finalModelPublicId: finalModel?.publicModelId ?? (r.finalModelId ? `Deleted model (${r.finalModelId})` : null),
     finalModelUpstreamId: finalModel?.upstreamModelId ?? null,
-    providerId: provider ? finalModel!.providerId : null,
-    providerName: provider?.name ?? null,
+    finalModelDeleted: Boolean(r.finalModelId && !finalModel),
+    providerId,
+    providerName: provider?.name ?? (providerId ? `Deleted provider (${providerId})` : null),
     providerSlug: provider?.slug ?? null,
+    providerDeleted: Boolean(providerId && !provider),
     providerType: provider?.type ?? null,
     streaming: Boolean(r.streaming),
     httpStatus: r.httpStatus,
@@ -452,61 +467,24 @@ export async function registerRequestRoutes(app: FastifyInstance): Promise<void>
       return;
     }
     const attempts = db.select().from(schema.requestAttempts).where(eq(schema.requestAttempts.requestId, id)).orderBy(schema.requestAttempts.attemptNumber).all();
-    const providers = db.select().from(schema.providers).all();
-    const providerMap = new Map(providers.map((p) => [p.id, p]));
-    const models = db.select().from(schema.models).all();
-    const modelMap = new Map(models.map((m) => [m.id, m]));
-    const keys = db.select().from(schema.apiKeys).all();
-    const keyMap = new Map(keys.map((k) => [k.id, k]));
-    const key = r.apiKeyId ? keyMap.get(r.apiKeyId) : null;
-    const finalModel = r.finalModelId ? modelMap.get(r.finalModelId) : null;
+    const maps = loadSummaryMaps();
+    const { providerMap, modelMap } = maps;
     return {
       request: {
-        id: r.id,
-        createdAt: r.createdAt,
-        completedAt: r.completedAt,
-        apiKeyName: key?.name ?? null,
-        keyPrefix: r.keyPrefixSnapshot,
-        clientIp: r.clientIp,
-        protocol: r.protocol,
-        endpoint: r.endpoint,
-        requestedModel: r.requestedModel,
-        resolvedTargetKind: r.resolvedTargetKind,
-        resolvedTargetId: r.resolvedTargetId,
-        finalModelPublicId: finalModel?.publicModelId ?? null,
-        finalModelUpstreamId: finalModel?.upstreamModelId ?? null,
-        providerId: finalModel?.providerId ?? null,
-        providerName: providerMap.get(finalModel?.providerId ?? '')?.name ?? null,
-        providerSlug: providerMap.get(finalModel?.providerId ?? '')?.slug ?? null,
-        streaming: Boolean(r.streaming),
-        httpStatus: r.httpStatus,
-        success: Boolean(r.success),
-        totalLatencyMs: r.totalLatencyMs,
-        ttftMs: r.ttftMs,
-        inputTokens: r.inputTokens,
-        outputTokens: r.outputTokens,
-        cacheReadTokens: r.cacheReadTokens,
-        cacheWriteTokens: r.cacheWriteTokens,
-        reasoningTokens: r.reasoningTokens,
-        totalTokens: r.totalTokens,
-        attemptsCount: r.attemptsCount,
-        errorType: r.errorType,
-        errorMessage: r.errorMessage,
+        ...toSummary(r, maps, attempts),
         requestPayload: redactJsonString(r.requestPayloadJson),
         responsePayload: redactJsonString(r.responsePayloadJson),
         reproductionCurl: buildReproductionCurl(r, redactJsonString(r.requestPayloadJson)),
         fallbackReasons: [...new Set(attempts.map((a) => a.failureReason).filter((reason): reason is string => Boolean(reason)))],
-        gatewayCacheHit: Boolean(r.gatewayCacheHit),
       },
       attempts: attempts.map<AttemptLog>((a) => ({
         id: a.id,
         attemptNumber: a.attemptNumber,
         providerId: a.providerId,
-        providerName: providerMap.get(a.providerId)?.name ?? '',
+        providerName: providerMap.get(a.providerId)?.name ?? `Deleted provider (${a.providerId})`,
         modelId: a.modelId,
-        modelPublicId: modelMap.get(a.modelId)?.publicModelId ?? '',
-          upstreamModelId: modelMap.get(a.modelId)?.upstreamModelId ?? '',
-        codexAccountId: a.codexAccountId,
+        modelPublicId: modelMap.get(a.modelId)?.publicModelId ?? `Deleted model (${a.modelId})`,
+        upstreamModelId: modelMap.get(a.modelId)?.upstreamModelId ?? '',
         startedAt: a.startedAt,
         completedAt: a.completedAt,
         statusCode: a.statusCode,

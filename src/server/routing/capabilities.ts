@@ -102,8 +102,6 @@ export type RejectionReason =
   | 'member_disabled'
   | 'slow_response_cooldown'
   | 'slow_response_probe_active'
-  | 'codex_account_unavailable'
-  | 'qoder_account_unavailable'
   | 'streaming'
   | 'tools'
   | 'structured_output'
@@ -142,8 +140,6 @@ const NON_CAPABILITY_TEXT: Partial<Record<RejectionReason, string>> = {
   member_disabled: 'disabled in this combo',
   slow_response_cooldown: 'slow-response cooldown',
   slow_response_probe_active: 'slow-response recovery probe is already running',
-  codex_account_unavailable: 'no available Codex account',
-  qoder_account_unavailable: 'no enabled Qoder account is available — check the account group',
 };
 
 const REASON_TEXT: Record<RejectionReason, string> = {

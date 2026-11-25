@@ -42,11 +42,13 @@ The package build runs `build:web` before `build:server`; `dist/cli.js`, the ser
 
 ## Retired provider integrations
 
-Codex and Qoder provider integrations are no longer available in the admin UI or gateway. Existing provider/account tables and migrations remain only so upgrades preserve historical data; legacy providers are hidden from provider management and routed requests fail closed.
+Only OpenAI-compatible and Anthropic-compatible provider configurations are supported. Migration `0014_remove_legacy_providers.sql` removes the retired Codex and Qoder integrations, their account/credential tables, provider/model configuration, and invalid references. It retains request/attempt/audit history and daily aggregates; combos keep surviving members in their original priority order, and combos with no members left are disabled. Restricted API keys remain restricted even if their allowlist becomes empty. Historical migration files are retained solely for upgrading older databases.
+
+Before upgrading from a database with retired providers, take a **full** backup and keep its passphrase/master-key material safe. The removed provider credentials and configuration cannot be recovered from the upgraded database. Restore an earlier backup with the corresponding earlier application version if a downgrade is required; restoring it into the current application applies migration 0014 on staging and removes the retired configuration again.
 
 ### Backup and restore
 
-Back up the active SQLite data directory using the admin backup flow or a consistent SQLite snapshot. Keep the matching master key separately; a database backup does not contain it. Validate checksum/schema before restore and keep the original database until the restored copy passes integrity checks. A restore from another instance with a different master key leaves encrypted credentials undecryptable; re-save or re-import them rather than exposing token material.
+Back up the active SQLite data directory using the admin backup flow or a consistent SQLite snapshot. The `.ldb` backup includes a passphrase-protected key envelope; a raw SQLite snapshot requires the matching master key separately. Validate checksum/schema before restore, migrate older backups on staging, and keep the original database until the restored copy passes integrity checks. Never expose credential material.
 
 CLI flags may override environment variables.
 

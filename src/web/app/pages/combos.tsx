@@ -377,7 +377,7 @@ function ComboTestResultView({ result }: { result: ComboTestResult }) {
 }
 
 // Drag-sortable member rows: the row order IS the routing priority that gets saved
-// as member.position (0 = highest priority), like the Codex account pool.
+// as member.position (0 = highest priority).
 function MemberList({ members, label, modelFor, onChange, className }: {
   members: MemberForm[];
   label: (member: MemberForm) => string;

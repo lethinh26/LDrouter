@@ -8,7 +8,7 @@ import { redactString } from '../security/redact';
 import { debugUpstream, errorLine, formatError, truncate } from '../logging/debug';
 
 export interface UpstreamConfig {
-  type: 'openai' | 'anthropic' | 'codex' | 'qoder';
+  type: 'openai' | 'anthropic';
   baseUrl: string;
   apiKey?: string;
   customHeaders: Record<string, string>;
@@ -18,10 +18,6 @@ export interface UpstreamConfig {
   totalTimeoutMs: number;
   /** Combo-only deadline: TTFT for streaming, full response time otherwise. */
   slowResponseTimeoutMs?: number;
-  codexAccountId?: string;
-  qoderUserId?: string;
-  qoderAccountRecordId?: string;
-  accountRecordId?: string;
 }
 
 export interface UpstreamResult {
@@ -31,11 +27,11 @@ export interface UpstreamResult {
   upstreamRequestId: string | null;
 }
 
-export function providerToUpstreamConfig(p: Provider, _codexAccountId?: string): UpstreamConfig {
+export function providerToUpstreamConfig(p: Provider): UpstreamConfig {
   let apiKey: string;
   let customHeaders: Record<string, string>;
-  if (p.type === 'codex' || p.type === 'qoder') {
-    throw new GatewayError('invalid_request_error', `${p.type} providers are no longer supported`, { status: 410 });
+  if (p.type !== 'openai' && p.type !== 'anthropic') {
+    throw new GatewayError('invalid_request_error', 'Unsupported provider type', { status: 410 });
   }
   if (!p.encryptedApiKey || !p.apiKeyNonce) {
     throw new GatewayError('invalid_request_error', 'Provider credentials are missing', { status: 501 });
@@ -93,8 +89,7 @@ export interface StreamChunk {
  */
 export function upstreamHttpError(status: number, bodyExcerpt: string, cause?: unknown): GatewayError {
   if (status >= 500) return new GatewayError('upstream_error', `Upstream HTTP ${status}`, { status: 502, cause, code: `upstream_http_${status}` });
-  // Keep the body on a 429: it is the only place a provider says *why*, and the wording decides
-  // whether this is a transient throttle (retry) or an exhausted account (disable it and move on).
+  // Keep the body on a 429: it distinguishes a transient throttle from exhausted upstream quota.
   // `isQuotaFailure` matches on that wording. Callers pass an already-redacted excerpt.
   if (status === 429) return new GatewayError('upstream_rate_limit', `Upstream rate limited (HTTP ${status})${bodyExcerpt ? `: ${bodyExcerpt}` : ''}`, { status: 429, cause, code: 'upstream_http_429' });
   if (status === 401 || status === 403) return new GatewayError('upstream_auth_error', `Upstream authentication failed (HTTP ${status})`, { status: 502, cause, code: `upstream_http_${status}` });

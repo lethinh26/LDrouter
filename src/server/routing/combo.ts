@@ -71,57 +71,8 @@ export interface CandidateModel {
   /** undefined = unknown (treated as usable); only an explicit false rejects. */
   providerEnabled?: boolean;
   capabilities: ModelCapabilitiesInput;
-  codexAccountId?: string;
-  codexChatgptAccountId?: string;
-  qoderAccountId?: string;
-  qoderUserId?: string;
-  providerType?: string;
-  selectionReason?: string;
   /** Set after a member's slow-response cooldown expires; runner must claim its probe lease. */
   slowResponseProbe?: boolean;
-}
-
-export interface CodexAccountCandidate {
-  id: string;
-  chatgptAccountId: string;
-  enabled: boolean;
-  healthState: 'healthy' | 'degraded' | 'down' | 'unknown';
-  tokenExpiresAt: string;
-  priority: number;
-}
-
-export interface QoderAccountCandidate {
-  id: string;
-  qoderUserId: string;
-  enabled: boolean;
-  healthState: string;
-  priority: number;
-}
-
-/**
- * One Qoder candidate per eligible account so account-level fallback works without touching the
- * combo plan. Keyed off the resolved provider type, never a hardcoded slug prefix.
- *
- * A `degraded` account stays eligible: it is a warning (last migration of a billing/quota block),
- * not a verdict — the runner retries it and the upstream answers honestly. Only `down` and
- * `disabled` are excluded.
- */
-export function expandQoderAccountCandidates(candidate: CandidateModel, accounts: QoderAccountCandidate[]): CandidateModel[] {
-  if (candidate.providerType !== 'qoder') return [candidate];
-  const usable = accounts
-    .filter((account) => account.enabled && account.healthState !== 'down')
-    .sort((a, b) => a.priority - b.priority || a.id.localeCompare(b.id));
-  return usable.map((account) => ({ ...candidate, qoderAccountId: account.id, qoderUserId: account.qoderUserId, selectionReason: 'qoder_account' }));
-}
-
-export function expandCodexAccountCandidates(candidate: CandidateModel, accounts: CodexAccountCandidate[]): CandidateModel[] {
-  if (candidate.providerType !== 'codex') return [candidate];
-  // No token-expiry filter here: `withCodexCredentials` refreshes before the upstream call, so an
-  // expired token is still routable. Gating on it rejected exactly the accounts most in need of a
-  // refresh, turning a recoverable state into "no available Codex account".
-  const usable = accounts.filter((a) => a.enabled && a.healthState !== 'down')
-    .sort((a, b) => a.priority - b.priority || a.id.localeCompare(b.id));
-  return usable.map((a) => ({ ...candidate, codexAccountId: a.id, codexChatgptAccountId: a.chatgptAccountId, selectionReason: 'codex_account' }));
 }
 
 export function selectCandidates(
@@ -168,11 +119,7 @@ export function shouldFallback(combo: ComboPlan, reason: { type: string; status?
     case 'total_timeout':
       return combo.trigger.totalTimeout;
     case 'quota':
-      // An exhausted account is the clearest case for trying the next candidate: retrying the same
-      // one cannot succeed until its window resets. Unconditional because a dead account is not a
-      // provider problem the admin's 429/5xx toggles were meant to gate — the account is already
-      // disabled by the runner, and stopping here would answer "usage limited" instead of routing
-      // to a healthy account.
+      // Preserve quota exhaustion fallback independently of transient HTTP 429/5xx triggers.
       return true;
     case 'http_status':
       if (reason.status === 408) return combo.trigger.on408;

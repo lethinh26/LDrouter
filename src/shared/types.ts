@@ -135,10 +135,14 @@ export interface RequestLogSummary {
   resolvedTargetId: string | null;
   finalModelPublicId: string | null;
   finalModelUpstreamId?: string | null;
-  // Added v1.9.0: provider id/name derived from finalModelId (for routing aggregation).
+  /** Historical identifier exists, but its model configuration was deleted. */
+  finalModelDeleted?: boolean;
+  // Provider identity derives from the final model or the matching historical attempt.
   providerId: string | null;
   providerName: string | null;
   providerSlug?: string | null;
+  /** Historical identifier exists, but its provider configuration was deleted. */
+  providerDeleted?: boolean;
   // Provider kind, so the client can apply that provider's own cache-token
   // semantics (Anthropic reports `input_tokens` WITHOUT the cached prefix).
   providerType: string | null;
@@ -166,7 +170,7 @@ export interface AttemptLog {
   providerName: string;
   modelId: string;
   modelPublicId: string;
-  codexAccountId?: string | null;
+  upstreamModelId?: string;
   startedAt: string;
   completedAt: string | null;
   statusCode: number | null;
@@ -220,6 +224,15 @@ export interface RoutingProvider {
   health: 'healthy' | 'degraded' | 'down' | 'circuit_open' | 'unknown';
   enabled: boolean;
   modelCount: number;
+  requests: number;
+  errorRate: number;
+  avgLatencyMs: number;
+}
+
+/** Attempt statistics for a provider whose configuration is no longer present. */
+export interface HistoricalProviderStats {
+  id: string;
+  name: string;
   requests: number;
   errorRate: number;
   avgLatencyMs: number;

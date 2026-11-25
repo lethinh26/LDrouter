@@ -7,7 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as schema from './schema';
 import { getLogger } from '../logging/logger';
-import { runMigrations } from './migrate';
+import { CURRENT_SCHEMA_VERSION, runMigrations } from './migrate';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -21,7 +21,12 @@ function resolveMigrationsDir(): string {
   const rootDir = path.resolve(__dirname, '../../../migrations');
   if (fs.existsSync(distDir)) return distDir;
   if (fs.existsSync(rootDir)) return rootDir;
-  return distDir; // let runMigrations log the missing-dir fallback
+  return distDir; // runMigrations reports missing migration assets
+}
+
+/** Apply the current schema to an independent connection (startup or a staged restore). */
+export function migrateDatabase(raw: Database.Database): void {
+  runMigrations(raw, getLogger(), resolveMigrationsDir(), CURRENT_SCHEMA_VERSION);
 }
 
 let _db: BetterSQLite3Database<typeof schema> | null = null;
@@ -38,20 +43,24 @@ export function openDb(dbFile: string): DbHandle {
   if (dir && !fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
   const raw = new Database(dbFile);
-  // Pragmas for WAL + safety
-  raw.pragma('journal_mode = WAL');
-  raw.pragma('synchronous = NORMAL');
-  raw.pragma('foreign_keys = ON');
-  raw.pragma('busy_timeout = 5000');
-  raw.pragma('temp_store = MEMORY');
-  raw.pragma('cache_size = -20000');
+  try {
+    // Pragmas for WAL + safety
+    raw.pragma('journal_mode = WAL');
+    raw.pragma('synchronous = NORMAL');
+    raw.pragma('foreign_keys = ON');
+    raw.pragma('busy_timeout = 5000');
+    raw.pragma('temp_store = MEMORY');
+    raw.pragma('cache_size = -20000');
 
-  const db = drizzle(raw, { schema });
-  _raw = raw;
-  _db = db;
-
-  runMigrations(raw, getLogger(), resolveMigrationsDir());
-  return { db, raw };
+    migrateDatabase(raw);
+    const db = drizzle(raw, { schema });
+    _raw = raw;
+    _db = db;
+    return { db, raw };
+  } catch (error) {
+    raw.close();
+    throw error;
+  }
 }
 
 export function closeDb(): void {

@@ -51,7 +51,7 @@ Use secure, HttpOnly, SameSite cookies for the browser admin UI. Set Secure when
 - `id`
 - `name`
 - `slug` unique
-- `type`: `openai | anthropic` (Codex/Qoder values are legacy rows retained for migration compatibility and are not routable)
+- `type`: `openai | anthropic` (enforced by TypeScript and the SQLite CHECK constraint)
 - `base_url`
 - `encrypted_api_key`
 - `encrypted_api_key_nonce` / required AEAD metadata
@@ -130,33 +130,6 @@ Combo deletion cascades state deletion. Removing a member cascades its state; re
 model creates a new `combo_members.id` and starts with fresh history. In-flight state/probe writes
 must match the membership row ID captured by the request, so an old request cannot mutate the new
 membership. Changing slow-response settings clears the combo's affected history transactionally.
-
-### `qoder_accounts`
-
-One row per Qoder personal access token. Added by migration `0007_qoder_accounts.sql`, which also
-widens the `providers.type` CHECK constraint (a table rebuild, so the type union is enforced in SQL
-as well as TypeScript).
-
-- `id`
-- `provider_id` → `providers.id`
-- `label`, `email` nullable
-- `qoder_user_id`, `machine_id` (stable per-account fingerprint)
-- `encrypted_pat` / `pat_nonce` / `pat_version` — the durable credential
-- `encrypted_job_token` / `job_token_nonce` / `job_token_version` — derived, short-lived
-- `job_token_expires_at`
-- `catalog_json`, `catalog_fetched_at` — the live model list last fetched for this account
-- `credits_json`, `credits_updated_at`, `credits_error` — last Credits snapshot (added by
-  `0008_qoder_credits.sql`). Qoder meters usage in Credits and its chat stream reports no token
-  usage at all, so this quota snapshot is the account's only real usage figure.
-- `enabled`
-- `health_state`: `healthy | degraded | down | unknown`
-- `last_error` nullable — sanitized; never contains a credential
-- `consecutive_failures`, `priority`
-- `created_at`, `updated_at`
-
-Identity for import deduplication is `(provider_id, qoder_user_id)`. No plaintext token or token
-digest is stored: the importer identifies an existing row by decrypting the stored PATs and
-comparing digests in memory, so the token is not recoverable from the database.
 
 ### `model_aliases`
 
@@ -273,10 +246,8 @@ One row per upstream attempt:
 - `partial_response`
 - sanitized upstream error type/message/body excerpt
 - upstream request ID if returned
-- `codex_account_id` nullable → `codex_accounts.id`, `ON DELETE SET NULL`
-- `qoder_account_id` nullable → `qoder_accounts.id`, `ON DELETE SET NULL`
 
-Both account references are `ON DELETE SET NULL`: deleting an account keeps its attempt history.
+Provider/model IDs in request and attempt history are historical identifiers, deliberately not foreign keys to active provider/model configuration. Historical requests and daily aggregates survive provider removal; display uses the retained ID if an active label no longer exists.
 
 A request may succeed while one or more earlier attempts failed.
 
@@ -323,5 +294,6 @@ When an API key is revoked/deleted, retain request history and the key prefix/na
 - Startup may apply pending migrations automatically if safe, or fail with a clear migration error; choose one documented strategy and test it.
 - Backups record schema version.
 - Restore refuses an incompatible future schema version rather than attempting unsafe downgrade.
+- Migration 0014 removes retired provider configurations, account credentials and account-specific attempt columns, cleans their dependent configuration, disables combos that lose all members, and preserves all generic request/attempt/audit rows and daily aggregates. Existing migration files remain immutable.
 
 Read next: `03-PROTOCOL-COMPATIBILITY.md`.

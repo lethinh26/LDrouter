@@ -22,13 +22,17 @@ describe('timeout default migration', () => {
   it('upgrades providers still on the old defaults and keeps tuned values', () => {
     const { db, dir } = freshDb();
     try {
-      runMigrations(db, logger, migrationsDir);
+      const oldMigrations = path.join(dir, 'migrations-before-9');
+      fs.mkdirSync(oldMigrations);
+      for (const file of fs.readdirSync(migrationsDir).filter(f => /^\d{4}_.+\.sql$/.test(f) && Number(f.slice(0, 4)) <= 8)) {
+        fs.copyFileSync(path.join(migrationsDir, file), path.join(oldMigrations, file));
+      }
+      runMigrations(db, logger, oldMigrations, 8);
       const insert = 'INSERT INTO providers (id,name,slug,type,base_url,connect_timeout_ms,first_token_timeout_ms,stream_idle_timeout_ms,total_timeout_ms) VALUES (?,?,?,?,?,?,?,?,?)';
       db.prepare(insert).run('old', 'Old', 'old', 'openai', 'https://x.test', 10000, 30000, 60000, 180000);
       db.prepare(insert).run('tuned', 'Tuned', 'tuned', 'openai', 'https://x.test', 5000, 45000, 900000, 1500000);
 
-      // Re-apply 0009 and 0013 the way an upgrade from a pre-0009 instance would.
-      db.prepare('DELETE FROM schema_migrations WHERE version IN (9, 13)').run();
+      // Apply 0009–0014 to a genuine pre-0009 database.
       runMigrations(db, logger, migrationsDir);
 
       expect(timeouts(db, 'old')).toEqual({ c: 60000, f: 60000, i: 300000, t: 600000 });

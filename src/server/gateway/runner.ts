@@ -2,23 +2,16 @@
 
 import { getDb, getRawDb, schema } from '../db/index';
 import { desc, eq } from 'drizzle-orm';
-import { GatewayError, preserveClientDisconnect } from '../errors';
+import { GatewayError } from '../errors';
 import { resolveRequestedModel, unwrapAlias } from '../routing/resolver';
 import { bareModelName, deriveRequiredCapabilities, describeRejections, firstMissingCapability, type CanonicalRequest, type RejectedMember, type RejectionReason, type RequiredCapabilities } from '../routing/capabilities';
-import { loadCombo, selectCandidates, orderCandidates, shouldFallback, expandCodexAccountCandidates, expandQoderAccountCandidates, type ComboPlan, type CandidateModel } from '../routing/combo';
+import { loadCombo, selectCandidates, orderCandidates, shouldFallback, type ComboPlan, type CandidateModel } from '../routing/combo';
 import { claimComboSlowProbe, getComboSlowState, listComboSlowStates, recordComboSlowOutcome, releaseComboSlowProbe } from '../routing/combo-slow-fallback';
-import { listCodexAccountsForProvider, setCodexAccountHealth } from '../db/repositories/codex-accounts';
-import { listQoderAccountsForProvider, setQoderAccountHealth } from '../db/repositories/qoder-accounts';
-import { qoderAttemptFailure, qoderCredentialsFor } from '../providers/qoder/credentials';
-import { refreshQoderCreditsIfStale } from '../providers/qoder/credits';
-import { callQoderNonStreaming, callQoderStreaming } from '../providers/qoder/client';
-import { refreshCodexUsageIfStale } from '../providers/codex-autostart';
 import { getEffectiveState, recordSuccess, recordFailure, halfOpenProbeAllowed, circuitBlocks } from '../routing/circuit';
 import { checkRpm, checkTpm, acquireConcurrent, releaseConcurrent } from '../routing/ratelimit';
 import { checkDailyMonthly, consumeUsage } from '../routing/quota';
 import { keyAllowedFor, type AuthenticatedKey } from '../auth/api-key';
 import { providerToUpstreamConfig, callUpstreamNonStreaming, callUpstreamStreaming, upstreamUrl, upstreamHttpError, type UpstreamCall } from '../upstream/client';
-import { callCodexNonStreaming, callCodexStreaming } from '../providers/codex';
 import { canonicalToOpenAIRequest, openAIResponseToCanonical } from '../protocols/canonical';
 import { canonicalToAnthropicRequest, anthropicResponseToCanonical } from '../protocols/anthropic';
 import { uuid } from '../auth/ids';
@@ -73,8 +66,6 @@ export interface AttemptOutcome {
   streamStarted: boolean;
   partialResponse: boolean;
   selectionReason: string;
-  codexAccountId?: string;
-  qoderAccountId?: string;
   failureReason: string | null;
   sanitizedError: string | null;
   upstreamRequestId: string | null;
@@ -230,12 +221,7 @@ export class GatewayRunner {
           const s = describeRejections({ kind: 'combo', publicModelId: resolved.publicModelId }, rejected);
           throw new GatewayError(s.type, s.message, { status: s.status, code: s.type });
         }
-        candidates = orderCandidates(comboPlan, eligibleFiltered).flatMap((candidate) => {
-          const provider = getDb().select().from(schema.providers).where(eq(schema.providers.id, candidate.providerId)).get();
-          if (provider?.type === 'codex') return expandCodexAccountCandidates(candidate, listCodexAccountsForProvider(provider.id));
-          if (provider?.type === 'qoder') return expandQoderAccountCandidates(candidate, listQoderAccountsForProvider(provider.id));
-          return [candidate];
-        });
+        candidates = orderCandidates(comboPlan, eligibleFiltered);
         debugHttp(ctx.requestId, 'CANDIDATES ORDERED', [
           `mode=${comboPlan.mode}`,
           ...candidates.map((c, i) => `candidate[${i}]: providerModelId=${c.modelId} publicModelId=${c.publicModelId}`),
@@ -287,8 +273,7 @@ export class GatewayRunner {
 
       // --- Attempt loop with fallback ---
       const firstProvider = getDb().select().from(schema.providers).where(eq(schema.providers.id, candidates[0]!.providerId)).get();
-      const maxAttempts = comboPlan?.maxTotalAttempts
-        ?? (candidates.length > 1 ? candidates.length : 1 + (firstProvider?.maxRetries ?? 0));
+      const maxAttempts = comboPlan?.maxTotalAttempts ?? (1 + (firstProvider?.maxRetries ?? 0));
       let lastError: GatewayError | null = null;
       let sentToClient = false; // semantically committed output sent
       let resultText = '';
@@ -324,7 +309,7 @@ export class GatewayRunner {
           break;
         }
 
-        const baseCfg = providerToUpstreamConfig(provider, candidate.codexAccountId);
+        const baseCfg = providerToUpstreamConfig(provider);
         const cfg = comboPlan?.slowResponseFallbackEnabled && comboPlan.slowResponseThresholdMs
           ? { ...baseCfg, slowResponseTimeoutMs: comboPlan.slowResponseThresholdMs }
           : baseCfg;
@@ -342,7 +327,7 @@ export class GatewayRunner {
         }
         attemptNumber++;
         const attemptStart = Date.now();
-        // docs/13 §11–§12: provider/account + upstream request summary
+        // docs/13 §11–§12: provider + upstream request summary
         const upstreamModel = candidate.publicModelId.split('/').slice(1).join('/');
         debugHttp(ctx.requestId, 'ATTEMPT', [
           `attempt=${attemptNumber}/${maxAttempts}`,
@@ -370,9 +355,7 @@ export class GatewayRunner {
           usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, total: 0 },
           streamStarted: false,
           partialResponse: false,
-          selectionReason: candidate.selectionReason ?? selectionReasons[0] ?? 'direct',
-          codexAccountId: candidate.codexAccountId,
-          qoderAccountId: candidate.qoderAccountId,
+          selectionReason: selectionReasons[0] ?? 'direct',
           failureReason: null,
           sanitizedError: null,
           upstreamRequestId: null,
@@ -443,13 +426,6 @@ export class GatewayRunner {
             }
           }
           recordSuccess(provider.id);
-          if (candidate.codexAccountId) setCodexAccountHealth(candidate.codexAccountId, 'healthy');
-          if (candidate.qoderAccountId) setQoderAccountHealth(candidate.qoderAccountId, 'healthy');
-          // Refresh the quota snapshot in the background so the dashboard reflects real usage.
-          // Never awaited: it is a second upstream call, and the response is already complete.
-          // Throttled inside each helper, so a burst of requests costs at most one refresh.
-          if (candidate.codexAccountId) void refreshCodexUsageIfStale(candidate.codexAccountId).catch(() => {});
-          if (candidate.qoderAccountId) void refreshQoderCreditsIfStale(candidate.qoderAccountId).catch(() => {});
           getDb().update(schema.providers).set({ healthState: 'healthy', updatedAt: new Date().toISOString() }).where(eq(schema.providers.id, provider.id)).run();
           attempts.push(attempt);
           sentToClient = (out as { streamStarted?: boolean }).streamStarted ?? false;
@@ -472,10 +448,6 @@ export class GatewayRunner {
               releaseComboSlowProbe(comboPlan.comboId, candidate.modelId, candidate.comboMemberId ?? '', err.code !== 'client_disconnected', Date.now(), comboPlan.slowResponseGeneration);
             }
           }
-          const quotaFailure = isQuotaFailure(err);
-          // Only a final verdict retires the account (below); a transient refresh failure still moves
-          // the request to a sibling account but must leave this one enabled.
-          const credentialFailure = isPermanentCredentialFailure(err);
           debugUpstream(ctx.requestId, 'ATTEMPT ERROR', [
             `attempt=${attemptNumber}`,
             `provider=${provider.name}`,
@@ -484,9 +456,6 @@ export class GatewayRunner {
             `status=${err.status}`,
             `willFallback=${shouldRetryAttempt(comboPlan, err)}`,
           ]);
-          // Quota failures always advance (see shouldRetryAttempt): the next candidate for a pool
-          // provider is the next account, and the exhausted one was just disabled so the retry cannot
-          // land on it again.
           const shouldRetry = shouldRetryAttempt(comboPlan, err);
           attempt.statusCode = err.status;
           attempt.success = false;
@@ -512,8 +481,6 @@ export class GatewayRunner {
           }
           if (isUpstreamHealthFailure(err)) {
             recordFailure(provider.id, provider.cbFailureThreshold, provider.cbCooldownSeconds);
-            if (candidate.codexAccountId) setCodexAccountHealth(candidate.codexAccountId, 'down', redactString(err.message));
-            if (candidate.qoderAccountId) setQoderAccountHealth(candidate.qoderAccountId, 'down', redactString(err.message));
             getDb().update(schema.providers).set({ healthState: 'down', updatedAt: new Date().toISOString() }).where(eq(schema.providers.id, provider.id)).run();
           }
           // The caller is gone; stop the combo rather than spending attempts on
@@ -536,13 +503,6 @@ export class GatewayRunner {
           }
           attempts.push(attempt);
           lastError = err;
-          // An exhausted account leaves the pool outright: without this the combo retried the same
-          // dead account on every request for hours (verified live) and answered "usage limited".
-          if (quotaFailure) markQuotaExhausted(candidate, err.message);
-          // A dead refresh token also leaves the pool outright: the account cannot serve anything
-          // again until it is re-imported, so a retry may only be spent on a sibling account. Without
-          // this the retry landed on the same dead account and the request answered 502.
-          if (credentialFailure) markCredentialsDead(candidate, err.message);
           // Retry an empty 200 on the same model using its provider retry settings.
           // Reserve one attempt for a combo's next member whenever possible.
           const reserveFallback = comboPlan && i + 1 < candidates.length ? 1 : 0;
@@ -656,7 +616,6 @@ export class GatewayRunner {
       // until a restart.
       circuitOpen: circuitBlocks(m.providerId, p.cbCooldownSeconds),
       capabilities: caps as never,
-      providerType: p.type,
     };
     if (!m.enabled) return { candidates: [], rejected: reject(m.publicModelId, 'model_disabled') };
     if (!m.upstreamAvailable) return { candidates: [], rejected: reject(m.publicModelId, 'upstream_unavailable') };
@@ -671,18 +630,6 @@ export class GatewayRunner {
       `caps.image_input=${(caps as { image_input?: boolean }).image_input}`,
       `caps.structured_output=${(caps as { structured_output?: boolean }).structured_output}`,
     ]);
-    // Codex providers route through their account pool: one candidate per
-    // eligible account, so fallback can move between accounts of the same model.
-    if (p.type === 'codex') {
-      const expanded = expandCodexAccountCandidates(candidate, listCodexAccountsForProvider(p.id));
-      if (expanded.length === 0) return { candidates: [], rejected: reject(m.publicModelId, 'codex_account_unavailable') };
-      return { candidates: expanded, rejected: [] };
-    }
-    if (p.type === 'qoder') {
-      const expanded = expandQoderAccountCandidates(candidate, listQoderAccountsForProvider(p.id));
-      if (expanded.length === 0) return { candidates: [], rejected: reject(m.publicModelId, 'qoder_account_unavailable') };
-      return { candidates: expanded, rejected: [] };
-    }
     return { candidates: [candidate], rejected: [] };
   }
 
@@ -691,7 +638,6 @@ export class GatewayRunner {
     const models = db.select().from(schema.models).all();
     const providers = db.select().from(schema.providers).all();
     const providerEnabled = new Map(providers.map((p) => [p.id, p.enabled]));
-    const providerType = new Map(providers.map((p) => [p.id, p.type as string]));
     const providerCooldown = new Map(providers.map((p) => [p.id, p.cbCooldownSeconds]));
     // Deliberately unfiltered: every combo member must reach selectCandidates so
     // it can report WHY it was skipped. Pre-filtering here erased the model rows
@@ -709,7 +655,6 @@ export class GatewayRunner {
       // until some request decays it — which this filter prevented from ever happening.
       circuitOpen: circuitBlocks(m.providerId, providerCooldown.get(m.providerId) ?? 0),
       capabilities: safeJson(m.capabilitiesJson) as never,
-      providerType: providerType.get(m.providerId),
     }));
   }
 
@@ -740,24 +685,6 @@ export class GatewayRunner {
     ctx: GatewayContext
   ): Promise<{ statusCode: number; ttftMs: number | null; upstreamRequestId: string | null; usage: UsageSummary; result: { text: string; toolCalls: Array<{ id: string; name: string; input: unknown }>; finishReason: string | null } }> {
     const upstreamModel = candidate.upstreamModelId;
-    if (cfg.type === 'codex') {
-      const out = await callCodexNonStreaming({ baseUrl: cfg.baseUrl, accountId: cfg.codexAccountId ?? '', accountRecordId: cfg.accountRecordId, customHeaders: cfg.customHeaders, totalTimeoutMs: cfg.totalTimeoutMs }, { ...req.canonical, model: upstreamModel });
-      return { statusCode: out.status, ttftMs: null, upstreamRequestId: out.upstreamRequestId, usage: out.usage, result: { text: out.text, toolCalls: out.toolCalls, finishReason: out.finishReason } };
-    }
-    if (cfg.type === 'qoder') {
-      const accountRecordId = candidate.qoderAccountId ?? cfg.qoderAccountRecordId;
-      if (!accountRecordId) throw new GatewayError('upstream_unavailable', 'No Qoder account is available for this request', { status: 503, code: 'qoder_account_unavailable' });
-      try {
-        const { config } = await qoderCredentialsFor(accountRecordId);
-        const out = await callQoderNonStreaming(
-          { ...config, accountRecordId, name: config.label ?? undefined, email: config.email, totalTimeoutMs: cfg.totalTimeoutMs },
-          { ...req.canonical, model: upstreamModel },
-        );
-        return { statusCode: out.status, ttftMs: null, upstreamRequestId: out.upstreamRequestId, usage: out.usage, result: { text: out.text, toolCalls: out.toolCalls, finishReason: out.finishReason } };
-      } catch (error) {
-        return qoderAttemptFailure(accountRecordId, error) as never;
-      }
-    }
     let call: UpstreamCall;
     if (cfg.type === 'openai') {
       const payload = canonicalToOpenAIRequest(req.canonical, upstreamModel);
@@ -879,9 +806,7 @@ export class GatewayRunner {
       }
       try {
         const obj = JSON.parse(chunk.data);
-        // Qoder emits OpenAI-shaped chunks and pipes them through this same handler
-        // (see the qoder branch below), so its usage block is parsed here too.
-        if (cfg.type === 'openai' || cfg.type === 'qoder') {
+        if (cfg.type === 'openai') {
           const choice = obj.choices?.[0];
           if (choice?.delta?.content) {
             textBuf += choice.delta.content;
@@ -982,50 +907,6 @@ export class GatewayRunner {
     };
 
     try {
-      if (cfg.type === 'codex') {
-        const events: Array<ReturnType<typeof import('../providers/codex').codexStreamEventToCanonical>> = [];
-        let firstCodexEvent = true;
-        const meta = await callCodexStreaming({ baseUrl: cfg.baseUrl, accountId: cfg.codexAccountId ?? '', accountRecordId: cfg.accountRecordId, customHeaders: cfg.customHeaders, totalTimeoutMs: cfg.totalTimeoutMs }, { ...req.canonical, model: upstreamModel }, (event) => {
-          if (event.text || event.isLast || event.toolCall) {
-            events.push(event);
-            if (event.usage) Object.assign(usage, event.usage);
-            chunkHandler({ data: codexStreamEventToClient(req.protocol, event, upstreamModel, ctx.requestId) }, firstCodexEvent);
-            firstCodexEvent = false;
-          }
-        }, downstreamAbort.signal);
-        if (!streamStarted) throw emptyGenerationError(candidate, usage);
-        pipe.write('data: [DONE]\n\n');
-        pipe.end();
-        if (!usage.total) usage.total = usage.input + usage.output;
-        return { statusCode: meta.status, ttftMs: meaningfulTtftMs, upstreamRequestId: meta.upstreamRequestId, usage, result: { text: textBuf, toolCalls: toolBuf, finishReason } };
-      }
-      if (cfg.type === 'qoder') {
-        const accountRecordId = candidate.qoderAccountId ?? cfg.qoderAccountRecordId;
-        if (!accountRecordId) throw new GatewayError('upstream_unavailable', 'No Qoder account is available for this request', { status: 503, code: 'qoder_account_unavailable' });
-        let firstQoderChunk = true;
-        let qoderTtftMs: number | null = null;
-        try {
-          const { config } = await qoderCredentialsFor(accountRecordId);
-          const out = await callQoderStreaming(
-            { ...config, accountRecordId, name: config.label ?? undefined, email: config.email, totalTimeoutMs: cfg.totalTimeoutMs },
-            { ...req.canonical, model: upstreamModel },
-            // Qoder already emits OpenAI-shaped chunks, so they pipe through unchanged.
-            (chunk) => {
-              if (firstQoderChunk) { qoderTtftMs = Date.now() - streamStartTs; firstQoderChunk = false; }
-              chunkHandler({ data: chunk.data }, false);
-            },
-            { signal: downstreamAbort.signal },
-          );
-          if (!streamStarted) throw emptyGenerationError(candidate, usage);
-          pipe.write('data: [DONE]\n\n');
-          pipe.end();
-          if (!usage.total) usage.total = usage.input + usage.output;
-          return { statusCode: out.status, ttftMs: meaningfulTtftMs ?? qoderTtftMs, upstreamRequestId: out.upstreamRequestId, usage, result: { text: out.text, toolCalls: out.toolCalls, finishReason: out.finishReason } };
-        } catch (error) {
-          if (error instanceof GatewayError && error.code === 'client_disconnected') throw error;
-          return preserveClientDisconnect(downstreamAbort.signal, () => qoderAttemptFailure(accountRecordId, error)) as never;
-        }
-      }
       const url = cfg.type === 'openai' ? upstreamUrl(cfg, '/v1/chat/completions') : upstreamUrl(cfg, '/v1/messages');
       const payload = cfg.type === 'openai' ? canonicalToOpenAIRequest(req.canonical, upstreamModel) : canonicalToAnthropicRequest(req.canonical, upstreamModel);
       logUpstreamRequest(ctx.requestId, cfg, url, payload, true);
@@ -1288,8 +1169,6 @@ export class GatewayRunner {
       attemptNumber: a.attemptNumber,
       providerId: a.providerId,
       modelId: a.modelId,
-      codexAccountId: a.codexAccountId ?? null,
-      qoderAccountId: a.qoderAccountId ?? null,
       startedAt: a.startedAt,
       completedAt: a.completedAt,
       statusCode: a.statusCode,
@@ -1372,108 +1251,16 @@ export function isUpstreamHealthFailure(err: GatewayError): boolean {
   return ['connection_error', 'connect_timeout', 'first_token_timeout', 'stream_idle_timeout', 'total_timeout', 'http_status', 'upstream_rate_limit', 'empty_response'].includes(classifyFailure(err));
 }
 
-/**
- * An exhausted quota is a durable, per-account verdict — the account cannot serve anything again
- * until its window resets, so it must leave the pool instead of being retried.
- *
- * Deliberately NOT part of `isUpstreamHealthFailure`: that path opens the provider's circuit
- * breaker, which here would take down every sibling account of a healthy pool because one member
- * ran dry. The exhaustion is applied account-by-account by `markQuotaExhausted` instead.
- *
- * Detection needs both signals because the two upstreams refuse differently, and neither reports a
- * status the router can trust alone:
- *  - Codex answers 429 but the credential layer re-wraps it (status 502, cause 429), and a plain
- *    rate limit is also a 429 — the "usage limit"/"quota" wording is what distinguishes "come back
- *    in an hour" from "this account is spent".
- *  - Qoder refuses with a billing envelope carrying status 403/code 112, surfaced as the
- *    `qoder_billing_block` code.
- * Wording is only consulted when the status is quota-shaped, so a 400 that merely mentions the word
- * "quota" cannot disable a working account.
- */
+/** Distinguish exhausted upstream quota from transient throttling using status and message. */
 export function isQuotaFailure(err: GatewayError): boolean {
-  if (err.code === 'qoder_billing_block') return true;
   const cause = err.cause as { status?: unknown } | undefined;
   const upstreamStatus = typeof cause?.status === 'number' ? cause.status : err.status;
   if (upstreamStatus !== 429 && upstreamStatus !== 403) return false;
   return /usage[_ -]?limit|quota|out of credits|insufficient[_ -]?(credit|balance)|exceeded your current quota|billing/i.test(err.message);
 }
 
-/**
- * Take an exhausted account out of the pool: mark it down and disable it.
- *
- * `enabled=0` (not just `health_state='down'`) is what the operator asked for and what actually
- * stops the churn: every selection path — `expandCodexAccountCandidates`,
- * `expandQoderAccountCandidates`, `getCodexAccountForProvider`, `findEligibleQoderAccount` — filters
- * on `enabled`, so disabling is the one write that makes the next request pick a different account.
- * The account stays visible in the admin UI, where re-enabling it after the window resets is a
- * one-click action.
- */
-export function markQuotaExhausted(candidate: CandidateModel, message: string): void {
-  const reason = redactString(message);
-  if (candidate.codexAccountId) setCodexAccountHealth(candidate.codexAccountId, 'down', reason, false);
-  if (candidate.qoderAccountId) setQoderAccountHealth(candidate.qoderAccountId, 'down', reason, false);
-}
-
-/**
- * A credential failure is a durable, per-account verdict — the same class as quota exhaustion.
- *
- * `withCodexCredentials` throws these as bare codes when the account's refresh token is dead
- * (Auth0 answers `refresh_token_invalidated`, "Your session has ended. Please log in again.").
- * The account cannot serve anything again until it is re-imported, so retrying it is pure waste
- * and leaving it in the pool answers 502 to every client.
- *
- * Live evidence (production, 2026-09-19): two accounts holding invalidated refresh tokens sat at
- * the head of the pool, so every request landed on one of them — `oauth_refresh_failed`,
- * classified `unknown`, `attempts_count=1`, 502 straight to the client (226 of 241 failed
- * requests had exactly one attempt while healthy accounts sat idle behind them).
- *
- * Deliberately NOT part of `isUpstreamHealthFailure`: one re-imported account must not open the
- * provider circuit breaker for its healthy siblings. The verdict is applied per account by
- * `markCredentialsDead` instead.
- *
- * Both spellings are checked because the code travels either raw (from `withCodexCredentials`
- * inside the gateway) or wrapped by `codexCredentialError`, which now keeps it as `cause`.
- */
-export function isCredentialFailure(err: GatewayError): boolean {
-  const codes = /^(oauth_refresh_failed|oauth_refresh_unavailable|invalid_refresh_response|credential_unavailable|account_not_found)$/;
-  const cause = err.cause as { message?: unknown } | undefined;
-  return codes.test(err.message) || (typeof cause?.message === 'string' && codes.test(cause.message));
-}
-
-/**
- * Whether the verdict is final, i.e. the account cannot serve again until an operator re-imports it.
- *
- * A transient refresh failure (timeout, network error, token-endpoint 5xx, rolled-back write) is
- * still a credential failure for routing — the request should move to a sibling account — but it
- * must NOT retire this one. Treating both classes as final is what degraded healthy accounts and
- * disabled them (`enabled=0`) on a single flaky moment; every live account carried
- * `consecutive_failures = 0`, so no pattern was ever required before the verdict.
- */
-export function isPermanentCredentialFailure(err: GatewayError): boolean {
-  const codes = /^(oauth_refresh_failed|credential_unavailable|account_not_found)$/;
-  const cause = err.cause as { message?: unknown } | undefined;
-  return codes.test(err.message) || (typeof cause?.message === 'string' && codes.test(cause.message));
-}
-
-/** Takes an account with a dead refresh token out of the pool. `enabled=0` is what stops the churn. */
-export function markCredentialsDead(candidate: CandidateModel, message: string): void {
-  const reason = redactString(message);
-  if (candidate.codexAccountId) setCodexAccountHealth(candidate.codexAccountId, 'down', reason, false);
-  if (candidate.qoderAccountId) setQoderAccountHealth(candidate.qoderAccountId, 'down', reason, false);
-}
-
-/**
- * Whether a failed attempt should advance to the next candidate.
- *
- * A quota failure always advances, with or without a combo plan. For a pool provider the next
- * candidate is the next *account*, so requiring a combo plan left a direct `codex/…` or `qoder/…`
- * request pinned to the exhausted account — the reported bug ("does not switch to a new account,
- * just answers usage limited"). Safe because the exhausted account was just disabled: the retry
- * cannot land on it again. Everything else keeps the combo's configured triggers, where no combo
- * plan means no fallback.
- */
+/** Whether a failed attempt should advance to the next configured candidate. */
 export function shouldRetryAttempt(comboPlan: ComboPlan | null, err: GatewayError): boolean {
-  if (isCredentialFailure(err)) return true;
   if (isQuotaFailure(err)) return true;
   if (err.code === 'upstream_empty_response') return comboPlan?.trigger.on5xx ?? false;
   if (err.code === 'combo_slow_response_timeout') return comboPlan?.slowResponseFallbackEnabled ?? false;
@@ -1490,12 +1277,7 @@ export function classifyFailure(err: GatewayError): string {
   if (err.code === 'upstream_first_token_timeout') return 'first_token_timeout';
   if (err.code === 'upstream_stream_idle_timeout') return 'stream_idle_timeout';
   if (err.code === 'upstream_total_timeout') return 'total_timeout';
-  // Checked before the type switch for the same reason as quota: a dead account is not a routing
-  // decision the combo's triggers were meant to gate, and `unknown` is not a routing decision at all.
-  if (isCredentialFailure(err)) return 'credential';
-  // Checked first, before the type switch: a quota refusal arrives as `upstream_rate_limit` (a
-  // 429) or `upstream_error` (Codex rewraps it as a 502 with a 429 cause; Qoder uses code 112) and
-  // must not fall through to `http_status`/`unknown`, neither of which is a routing decision.
+  // Preserve quota exhaustion as a distinct upstream failure category.
   if (isQuotaFailure(err)) return 'quota';
   switch (err.type) {
     case 'timeout_error':
@@ -1629,31 +1411,6 @@ function safeJsonParse(s: string): unknown {
 
 function usageFromCache(u: { input: number; output: number; cacheRead: number; cacheWrite: number; reasoning: number } | null): UsageSummary {
   return u ? { ...u, total: u.input + u.output } : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, total: 0 };
-}
-
-// Map Codex's native response events to the public protocol stream shape.
-export function codexStreamEventToClient(
-  protocol: 'openai' | 'anthropic',
-  event: { text: string; isLast: boolean; toolCall?: { id: string; name: string; input: unknown } },
-  model: string,
-  requestId: string,
-): string {
-  if (protocol === 'openai') {
-    const delta = event.toolCall
-      ? { tool_calls: [{ index: 0, id: event.toolCall.id, type: 'function', function: { name: event.toolCall.name, arguments: JSON.stringify(event.toolCall.input) } }] }
-      : event.isLast ? {} : { content: event.text };
-    return JSON.stringify({
-      id: `chatcmpl-${requestId}`,
-      object: 'chat.completion.chunk',
-      created: Math.floor(Date.now() / 1000),
-      model,
-      choices: [{ index: 0, delta, finish_reason: event.isLast ? 'stop' : null }],
-    });
-  }
-  if (event.toolCall) return JSON.stringify({ type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: event.toolCall.id, name: event.toolCall.name, input: event.toolCall.input } });
-  return JSON.stringify(event.isLast
-    ? { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: 0 } }
-    : { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: event.text } });
 }
 
 // SSE encoders: canonical stream chunk -> client protocol event

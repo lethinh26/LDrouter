@@ -218,7 +218,7 @@ Proven by `tests/integration/statistics-fix.test.ts`; the one-time backfill by `
 
 ## Packaging acceptance
 
-Codex OAuth acceptance includes redacted JSON/JSONL import, provider-scoped identity deduplication, encrypted token storage, refresh/rotation, account-aware routing, CSRF-protected admin mutations, and safe error/log redaction. ZIP import and Codex CLI config-file generation/mutation are explicitly unsupported. The account test endpoint is intentionally HTTP 501 (`not_implemented`) until a real upstream account-test contract is available; it must not mutate account state or expose credentials.
+Provider removal acceptance includes: fresh schema accepts only OpenAI/Anthropic provider types, unsupported create/update requests return HTTP 400, retired account/import API routes are absent, and npm build output cannot retain deleted modules. Upgrading an older database removes unsupported provider/model/credential configuration, preserves valid combo priority, restricted ACLs, request/attempt/audit history and daily aggregates, and rejects future or invalid backups before live replacement.
 
 The following must succeed from a clean checkout:
 

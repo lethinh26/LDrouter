@@ -144,12 +144,13 @@ The restore endpoint accepts a streamed `multipart/form-data` body with exactly 
 5. validate SQLite integrity (`PRAGMA integrity_check` on a read-only connection);
 6. read schema/application metadata and reject unsupported future schema versions;
 7. validate the passphrase-protected master-key envelope;
-8. create a snapshot of the currently live DB;
-9. enter a controlled maintenance/restore section where writes are blocked;
-10. atomically replace/restore;
-11. reopen database and verify migrations/integrity;
-12. if any post-swap validation fails, roll back to the pre-restore copy and restore the previous master-key override;
-13. audit attempt and result.
+8. apply pending migrations on the isolated staging database and validate its resulting schema and foreign keys;
+9. create a snapshot of the currently live DB;
+10. enter a controlled maintenance/restore section where writes are blocked;
+11. atomically replace/restore;
+12. reopen database and verify migrations/integrity;
+13. if any post-swap validation fails, roll back to the pre-restore copy and restore the previous master-key override;
+14. audit attempt and result.
 
 **Operator rollback guarantee:** the pre-restore snapshot is kept, and any failure after the swap rolls the live database back to it. A rollback failure is reported explicitly and requires a gateway restart; the gateway never stays on a broken database silently.
 
@@ -160,6 +161,8 @@ For passphrase-protected backups, the master key is restored from the encrypted 
 ### Compatibility window
 
 Legacy **v1 JSON** backups (`.ldb.json`, format `latedev-backup`, `version: 1`) remain restoreable during a compatibility window; their `payload` is checksum-validated before decompression. New exports never create v1 files. The restore endpoint does not accept SQL dumps or arbitrary archive formats.
+
+Older backups are upgraded on staging before activation. Retired provider configuration and credentials are removed by migration 0014; supported providers, surviving combo members, access restrictions, historical request/attempt data (for full backups) and daily aggregates are retained. A failure during staged migration leaves the active database untouched.
 
 ### Upload limits and UI
 
