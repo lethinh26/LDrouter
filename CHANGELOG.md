@@ -6,10 +6,13 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-11-25
+
 ### Added
 
 - Adaptive ordered combo routing: compare recent workload-specific latency, preserve configured priority when speeds are similar, demote persistently slow members to reserves, recover automatically, and allow a bounded rescue replay within the attempt/deadline budget. Migration 0015 resets old unsegmented cooldown history while retaining configuration and historical requests/statistics.
 - Per-workload adaptive status and history reset in the combo editor, an optional combo-wide deadline, and bounded routing decision/outcome metrics.
+- Accessible move-up and move-down controls for combo members, with stable model identifiers for drag-and-drop reordering.
 
 ### Removed
 
@@ -20,6 +23,9 @@ All notable changes to this project are documented here. The format follows
 
 - Validate and migrate older backup databases on staging before replacing the live database. Reject incomplete migration assets and newer schemas.
 - Clean generated server files before building so deleted adapters cannot remain in the npm package.
+- Preserve actionable HTTP errors for credential preflight failures and distinguish adaptive unavailability (503) from ordered fallback unavailability (502).
+- Fix the adaptive state database import in compiled Node.js ESM and stabilize combo priority reordering.
+- Run browser smoke tests on a supported Ubuntu version with valid test-only master keys; verify the production build and Docker startup/restart in CI.
 
 ## [1.22.0] - 2026-11-22
 
