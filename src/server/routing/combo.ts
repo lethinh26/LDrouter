@@ -19,6 +19,8 @@ export interface ComboPlan {
   slowResponseThresholdMs?: number;
   slowResponseMaxCount?: number;
   slowResponseGeneration?: number;
+  maxRequestDurationSeconds?: number | null;
+  enabled?: boolean;
   members: ComboMember[];
   trigger: {
     connection: boolean;
@@ -44,6 +46,8 @@ export function loadCombo(comboId: string): ComboPlan | null {
     slowResponseThresholdMs: c.slowResponseThresholdSeconds * 1000,
     slowResponseMaxCount: c.slowResponseMaxCount,
     slowResponseGeneration: c.slowResponseGeneration,
+    maxRequestDurationSeconds: c.maxRequestDurationSeconds,
+    enabled: c.enabled,
     members: members.map((m) => ({ id: m.id, modelId: m.modelId, position: m.position, enabled: m.enabled })),
     trigger: {
       connection: c.fallbackOnConnection,
@@ -71,8 +75,6 @@ export interface CandidateModel {
   /** undefined = unknown (treated as usable); only an explicit false rejects. */
   providerEnabled?: boolean;
   capabilities: ModelCapabilitiesInput;
-  /** Set after a member's slow-response cooldown expires; runner must claim its probe lease. */
-  slowResponseProbe?: boolean;
 }
 
 export function selectCandidates(
@@ -104,7 +106,7 @@ export function orderCandidates(combo: ComboPlan, candidates: CandidateModel[]):
   return [...candidates].sort((a, b) => {
     const am = combo.members.find((m) => m.modelId === a.modelId);
     const bm = combo.members.find((m) => m.modelId === b.modelId);
-    return (am?.position ?? 0) - (bm?.position ?? 0);
+    return (am?.position ?? 0) - (bm?.position ?? 0) || (am?.id ?? a.modelId).localeCompare(bm?.id ?? b.modelId);
   });
 }
 

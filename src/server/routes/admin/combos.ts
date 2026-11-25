@@ -10,8 +10,9 @@ import { uuid } from '../../auth/ids';
 import { GatewayError } from '../../errors';
 import type { GatewayContext, GatewayRequest } from '../../gateway/runner';
 import type { CanonicalRequest } from '../../routing/capabilities';
-import { circuitBlocks } from '../../routing/circuit';
-import { listComboSlowStates } from '../../routing/combo-slow-fallback';
+import { circuitBlocks, modelThrottleBlocks } from '../../routing/circuit';
+import { listAdaptiveStates } from '../../routing/combo-adaptive-state';
+import { freshSamples, median, SAMPLE_TTL_MS } from '../../routing/combo-policy';
 
 const MemberSpec = z.object({ modelId: z.string(), position: z.number().int().min(0), enabled: z.boolean().default(true) });
 
@@ -25,6 +26,7 @@ const ComboCreate = z.object({
   slug: OptionalSlug,
   mode: z.literal('fallback').default('fallback'),
   maxTotalAttempts: z.number().int().min(1).max(8).optional(),
+  maxRequestDurationSeconds: z.number().int().min(1).max(3600).nullable().optional(),
   enabled: z.boolean().optional(),
   fallbackOnConnection: z.boolean().optional(),
   fallbackOnConnectTimeout: z.boolean().optional(),
@@ -121,13 +123,40 @@ function memberStatus(model: typeof schema.models.$inferSelect | undefined, prov
   if (!enabled) return { state: 'unavailable', reason: 'member_disabled' };
   if (!model) return { state: 'unavailable', reason: 'model_missing' };
   if (!provider?.enabled) return { state: 'unavailable', reason: 'provider_disabled' };
-  if (provider.healthState === 'down') return { state: 'unavailable', reason: 'provider_down' };
-  if (provider.healthState === 'circuit_open') return { state: 'unavailable', reason: 'circuit_open' };
   if (!model.enabled) return { state: 'unavailable', reason: 'model_disabled' };
   if (!model.upstreamAvailable) return { state: 'unavailable', reason: 'upstream_unavailable' };
-  if (circuitBlocks(model.providerId, provider.cbCooldownSeconds)) return { state: 'unavailable', reason: 'circuit_open' };
+  if (circuitBlocks(model.providerId, provider.cbCooldownSeconds) || modelThrottleBlocks(model.id)) return { state: 'unavailable', reason: 'circuit_open' };
   if (modelCapabilities(model).chat === false) return { state: 'unavailable', reason: 'chat_capability_unavailable' };
-  return { state: 'ready', reason: provider.healthState === 'degraded' ? 'provider_degraded' : 'ready' };
+  return { state: 'ready', reason: provider.healthState === 'degraded' || provider.healthState === 'down' ? 'provider_degraded' : 'ready' };
+}
+
+// A model has independent latency histories for each workload. Never expose
+// lease owner tokens or imply that one member is preferred for all requests.
+function adaptiveStateView(state: ReturnType<typeof listAdaptiveStates>[number], now: number) {
+  const values = freshSamples(state.samples, now).map((s) => s.latencyMs);
+  const probing = state.probeLeaseUntilMs !== null && state.probeLeaseUntilMs > now;
+  const observedAt = state.lastObservationMs ?? state.updatedAtMs;
+  const fresh = observedAt <= now && observedAt >= now - SAMPLE_TTL_MS;
+  const degraded = fresh || probing ? state.degraded : null;
+  return {
+    modelId: state.modelId,
+    workload: state.workload,
+    latencyKind: state.workload.startsWith('stream') ? 'ttft' : 'completion',
+    medianLatencyMs: median(values),
+    sampleCount: values.length,
+    consecutiveSlowCount: state.consecutiveSlowCount,
+    relativeSlowCount: state.relativeSlowCount,
+    degraded,
+    fresh,
+    comparatorModelId: state.comparatorModelId,
+    probeDueMs: state.probeDueMs,
+    probeLeaseUntilMs: state.probeLeaseUntilMs,
+    recoverySuccesses: state.recoverySuccesses,
+    lastLatencyMs: state.lastLatencyMs,
+    lastOutcome: state.lastOutcome,
+    updatedAtMs: state.updatedAtMs,
+    state: probing ? 'probing' : !fresh ? 'unknown' : degraded ? ((state.probeDueMs ?? 0) <= now ? 'probe_due' : `degraded_${degraded}`) : values.length < 3 ? 'unknown' : state.consecutiveSlowCount || state.relativeSlowCount ? 'suspect' : 'ready',
+  };
 }
 
 function capabilityWarnings(models: Array<typeof schema.models.$inferSelect>): string[] {
@@ -157,10 +186,10 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
         const readyCount = statuses.filter((status) => status.state === 'ready').length;
         const reasons = [...new Set(statuses.filter((status) => status.state === 'unavailable').map((status) => status.reason))];
         const comboModels = members.map((m) => modelMap.get(m.modelId)).filter((m): m is typeof models[number] => Boolean(m));
-        const slowStates = listComboSlowStates(c.id);
         const now = Date.now();
-        const slowCooldownCount = slowStates.filter((state) => state.cooldownUntilMs !== null && state.cooldownUntilMs > now).length;
-        const slowProbeCount = slowStates.filter((state) => state.probeLeaseUntilMs !== null && state.probeLeaseUntilMs > now).length;
+        const slowStates = c.slowResponseFallbackEnabled ? listAdaptiveStates(c.id).map((state) => adaptiveStateView(state, now)) : [];
+        const slowCooldownCount = new Set(slowStates.filter((state) => state.degraded && !(state.probeLeaseUntilMs !== null && state.probeLeaseUntilMs > now)).map((state) => state.modelId)).size;
+        const slowProbeCount = new Set(slowStates.filter((state) => state.probeLeaseUntilMs !== null && state.probeLeaseUntilMs > now).map((state) => state.modelId)).size;
         return {
           id: c.id,
           name: c.name,
@@ -188,17 +217,21 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
     // The admin UI shows (and drag-reorders) members by priority, so return them
     // in position order rather than relying on SQLite row order.
     const members = db.select().from(schema.comboMembers).where(eq(schema.comboMembers.comboId, id)).all()
-      .sort((a, b) => a.position - b.position);
+      .sort((a, b) => a.position - b.position || a.id.localeCompare(b.id));
     const models = db.select().from(schema.models).all();
     const modelMap = new Map(models.map((m) => [m.id, m]));
     const providers = db.select().from(schema.providers).all();
     const providerMap = new Map(providers.map((p) => [p.id, p]));
-    const slowStateMap = new Map(listComboSlowStates(id).map((state) => [state.modelId, state]));
+    const now = Date.now();
+    const slowStates = c.slowResponseFallbackEnabled ? listAdaptiveStates(id).map((state) => adaptiveStateView(state, now)) : [];
      const comboModels = members.map((m) => modelMap.get(m.modelId));
      return {
       combo: {
         ...c,
-        members: members.map((m) => ({
+        members: members.map((m) => {
+          const adaptiveStates = slowStates.filter((state) => state.modelId === m.modelId);
+          const latest = [...adaptiveStates].sort((a, b) => b.updatedAtMs - a.updatedAtMs)[0];
+          return ({
           id: m.id,
           modelId: m.modelId,
           publicModelId: modelMap.get(m.modelId)?.publicModelId ?? '',
@@ -210,11 +243,19 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
            upstreamAvailable: modelMap.get(m.modelId)?.upstreamAvailable ?? false,
            providerEnabled: providerMap.get(modelMap.get(m.modelId)?.providerId ?? '')?.enabled ?? false,
            providerHealth: providerMap.get(modelMap.get(m.modelId)?.providerId ?? '')?.healthState ?? 'unknown',
-           circuitOpen: circuitBlocks(modelMap.get(m.modelId)?.providerId ?? '', providerMap.get(modelMap.get(m.modelId)?.providerId ?? '')?.cbCooldownSeconds ?? 0),
+           circuitOpen: circuitBlocks(modelMap.get(m.modelId)?.providerId ?? '', providerMap.get(modelMap.get(m.modelId)?.providerId ?? '')?.cbCooldownSeconds ?? 0) || modelThrottleBlocks(m.modelId),
            capabilities: modelMap.get(m.modelId) ? modelCapabilities(modelMap.get(m.modelId)!) : {},
            status: memberStatus(modelMap.get(m.modelId), providerMap.get(modelMap.get(m.modelId)?.providerId ?? ''), m.enabled),
-          slowState: slowStateMap.get(m.modelId) ?? null,
-        })),
+          adaptiveStates,
+          // Compatibility snapshot for older admin clients. Decisions are scoped
+          // to adaptiveStates; this is merely the most recently updated bucket.
+          slowState: latest ? {
+            modelId: m.modelId, consecutiveSlowCount: latest.consecutiveSlowCount,
+            cooldownUntilMs: latest.probeDueMs, probeLeaseUntilMs: latest.probeLeaseUntilMs,
+            lastLatencyMs: latest.lastLatencyMs, updatedAtMs: latest.updatedAtMs,
+            lastOutcome: latest.lastOutcome === 'success' ? (latest.lastLatencyMs !== null && latest.lastLatencyMs >= c.slowResponseThresholdSeconds * 1000 ? 'slow' : 'fast') : latest.lastOutcome === 'soft_timeout' ? 'slow' : latest.lastOutcome === 'error' ? 'error' : 'unknown',
+          } : null,
+        }); }),
          capabilityWarnings: capabilityWarnings(comboModels.filter((m): m is typeof models[number] => Boolean(m))),
       },
     };
@@ -242,6 +283,7 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
       endpoint: 'chat/completions',
       requestedModel: combo.publicModelId,
       key: null,
+      synthetic: true,
       reply: { raw: {} } as never,
     };
     const gatewayReq: GatewayRequest = { canonical: canonicalReq, protocol: 'openai', endpoint: 'chat/completions' };
@@ -277,6 +319,7 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
           providerName: attempt.providerName,
           latencyMs: attempt.latencyMs,
           success: attempt.success,
+          selectionReason: attempt.selectionReason,
           failureReason: attempt.failureReason,
         };
       }),
@@ -305,6 +348,7 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
         mode: body.mode,
         enabled: body.enabled ?? true,
         maxTotalAttempts: body.maxTotalAttempts ?? 3,
+        maxRequestDurationSeconds: body.maxRequestDurationSeconds ?? null,
         fallbackOnConnection: body.fallbackOnConnection ?? true,
         fallbackOnConnectTimeout: body.fallbackOnConnectTimeout ?? true,
         fallbackOnFirstTokenTimeout: body.fallbackOnFirstTokenTimeout ?? true,
@@ -347,6 +391,7 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
     if (body.mode) update.mode = body.mode;
     if (body.enabled !== undefined) update.enabled = body.enabled;
     if (body.maxTotalAttempts !== undefined) update.maxTotalAttempts = body.maxTotalAttempts;
+    if (body.maxRequestDurationSeconds !== undefined) update.maxRequestDurationSeconds = body.maxRequestDurationSeconds;
     if (body.fallbackOnConnection !== undefined) update.fallbackOnConnection = body.fallbackOnConnection;
     if (body.fallbackOnConnectTimeout !== undefined) update.fallbackOnConnectTimeout = body.fallbackOnConnectTimeout;
     if (body.fallbackOnFirstTokenTimeout !== undefined) update.fallbackOnFirstTokenTimeout = body.fallbackOnFirstTokenTimeout;
@@ -359,27 +404,30 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
     if (body.slowResponseMaxCount !== undefined) update.slowResponseMaxCount = body.slowResponseMaxCount;
     const slowSettingsChanged = (body.slowResponseFallbackEnabled !== undefined && body.slowResponseFallbackEnabled !== c.slowResponseFallbackEnabled)
       || (body.slowResponseThresholdSeconds !== undefined && body.slowResponseThresholdSeconds !== c.slowResponseThresholdSeconds)
-      || (body.slowResponseMaxCount !== undefined && body.slowResponseMaxCount !== c.slowResponseMaxCount);
+      || (body.slowResponseMaxCount !== undefined && body.slowResponseMaxCount !== c.slowResponseMaxCount)
+      || (body.enabled !== undefined && body.enabled !== c.enabled);
     let membersChanged = false;
+    let reorderOnly = false;
     let currentMembers: Array<typeof schema.comboMembers.$inferSelect> = [];
     if (body.members) {
       assertMembersUsable(db, body.members);
       currentMembers = db.select().from(schema.comboMembers).where(eq(schema.comboMembers.comboId, body.id)).all()
         .sort((a, b) => a.position - b.position);
-      const requestedMembers = [...body.members].sort((a, b) => a.position - b.position);
-      membersChanged = currentMembers.length !== requestedMembers.length
-        || currentMembers.some((member, index) => {
-          const requested = requestedMembers[index];
+      const requestedByModel = new Map(body.members.map((m) => [m.modelId, m]));
+      membersChanged = currentMembers.length !== body.members.length
+        || currentMembers.some((member) => {
+          const requested = requestedByModel.get(member.modelId);
           return !requested || member.modelId !== requested.modelId || member.position !== requested.position || member.enabled !== requested.enabled;
         });
+      reorderOnly = membersChanged && !slowSettingsChanged && currentMembers.length === body.members.length
+        && currentMembers.every((member) => requestedByModel.get(member.modelId)?.enabled === member.enabled);
     }
-    // Slow-state generation changes only when the slow-response policy changes.
-    // Member removals cascade their own state; retained members keep an in-flight probe lease.
-    if (slowSettingsChanged) update.slowResponseGeneration = c.slowResponseGeneration + 1;
+    // Any priority/eligibility change fences in-flight outcomes and leases.
+    if (slowSettingsChanged || membersChanged) update.slowResponseGeneration = c.slowResponseGeneration + 1;
 
     if (membersChanged && body.members) {
-      // Diff members transactionally. Retained member rows keep their slow history;
-      // deleting a member cascades only that member's persisted state.
+      // Retain member IDs. A pure reorder preserves measurements but invalidates
+      // decisions, leases and pending outcomes; other changes start fresh.
       db.transaction((tx) => {
         tx.update(schema.combos).set(update).where(eq(schema.combos.id, body.id)).run();
         const requestedById = new Map(body.members!.map((member) => [member.modelId, member]));
@@ -400,14 +448,20 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
             tx.insert(schema.comboMembers).values({ id: uuid(), comboId: body.id, modelId: m.modelId, position: m.position, enabled: m.enabled ?? true }).run();
           }
         }
-        if (slowSettingsChanged) {
-          tx.delete(schema.comboMemberSlowStates).where(eq(schema.comboMemberSlowStates.comboId, body.id)).run();
-        }
+        if (reorderOnly) {
+          tx.update(schema.comboAdaptiveStates).set({ generation: c.slowResponseGeneration + 1,
+            degraded: null, comparatorModelId: null, probeDueMs: null, probeLeaseUntilMs: null, probeToken: null,
+            consecutiveSlowCount: 0, relativeSlowCount: 0, recoverySuccesses: 0, probeFailures: 0, suspectCount: 0,
+            lastStartMs: null, lastStartSequence: 0,
+          }).where(eq(schema.comboAdaptiveStates.comboId, body.id)).run();
+        } else tx.delete(schema.comboAdaptiveStates).where(eq(schema.comboAdaptiveStates.comboId, body.id)).run();
+        tx.delete(schema.comboAdaptiveExploration).where(eq(schema.comboAdaptiveExploration.comboId, body.id)).run();
       });
     } else if (slowSettingsChanged) {
       db.transaction((tx) => {
         tx.update(schema.combos).set(update).where(eq(schema.combos.id, body.id)).run();
-        tx.delete(schema.comboMemberSlowStates).where(eq(schema.comboMemberSlowStates.comboId, body.id)).run();
+        tx.delete(schema.comboAdaptiveStates).where(eq(schema.comboAdaptiveStates.comboId, body.id)).run();
+        tx.delete(schema.comboAdaptiveExploration).where(eq(schema.comboAdaptiveExploration.comboId, body.id)).run();
       });
     } else {
       db.update(schema.combos).set(update).where(eq(schema.combos.id, body.id)).run();
@@ -416,6 +470,20 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
     const { invalidateCacheFor } = await import('../../caching/store');
     invalidateCacheFor('combo', body.id);
     recordAudit({ action: 'combo.update', success: true, targetType: 'combo', targetId: body.id, targetName: c.name, ip: req.ip });
+    return { ok: true };
+  });
+
+  app.post('/api/admin/combos/:id/reset-adaptive-state', async (req) => {
+    const { id } = req.params as { id: string };
+    const db = getDb();
+    const c = db.select().from(schema.combos).where(eq(schema.combos.id, id)).get();
+    if (!c) throw new GatewayError('invalid_request_error', 'Combo not found', { status: 404 });
+    db.transaction((tx) => {
+      tx.update(schema.combos).set({ slowResponseGeneration: c.slowResponseGeneration + 1 }).where(eq(schema.combos.id, id)).run();
+      tx.delete(schema.comboAdaptiveStates).where(eq(schema.comboAdaptiveStates.comboId, id)).run();
+      tx.delete(schema.comboAdaptiveExploration).where(eq(schema.comboAdaptiveExploration.comboId, id)).run();
+    });
+    recordAudit({ action: 'combo.adaptive.reset', success: true, targetType: 'combo', targetId: id, targetName: c.name, ip: req.ip });
     return { ok: true };
   });
 

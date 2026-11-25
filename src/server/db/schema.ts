@@ -190,6 +190,7 @@ export const combos = sqliteTable(
     slowResponseThresholdSeconds: integer('slow_response_threshold_seconds').notNull().default(60),
     slowResponseMaxCount: integer('slow_response_max_count').notNull().default(3),
     slowResponseGeneration: integer('slow_response_generation').notNull().default(1),
+    maxRequestDurationSeconds: integer('max_request_duration_seconds'),
     cacheOverrideEnabled: integer('cache_override_enabled', { mode: 'boolean' }),
     configVersion: integer('config_version').notNull().default(1),
     createdAt: text('created_at').notNull().default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ','now'))`),
@@ -216,32 +217,56 @@ export const comboMembers = sqliteTable(
   },
   (t) => ({
     uniqMember: uniqueIndex('uniq_combo_model').on(t.comboId, t.modelId),
+    identityIdx: uniqueIndex('uniq_combo_member_identity').on(t.id, t.comboId, t.modelId),
     posIdx: index('idx_combo_pos').on(t.comboId, t.position),
   })
 );
 
-export const comboMemberSlowStates = sqliteTable(
-  'combo_member_slow_states',
+export const comboAdaptiveStates = sqliteTable(
+  'combo_adaptive_states',
   {
     comboId: text('combo_id').notNull(),
+    memberId: text('member_id').notNull(),
     modelId: text('model_id').notNull(),
+    workload: text('workload').notNull(),
+    generation: integer('generation').notNull(),
+    samplesJson: text('samples_json').notNull().default('[]'),
     consecutiveSlowCount: integer('consecutive_slow_count').notNull().default(0),
-    cooldownUntilMs: integer('cooldown_until_ms'),
+    relativeSlowCount: integer('relative_slow_count').notNull().default(0),
+    degraded: text('degraded', { enum: ['absolute','relative'] }),
+    comparatorModelId: text('comparator_model_id'),
+    probeDueMs: integer('probe_due_ms'),
     probeLeaseUntilMs: integer('probe_lease_until_ms'),
+    probeToken: text('probe_token'),
+    recoverySuccesses: integer('recovery_successes').notNull().default(0),
+    probeFailures: integer('probe_failures').notNull().default(0),
     lastLatencyMs: integer('last_latency_ms'),
-    lastOutcome: text('last_outcome', { enum: ['slow', 'fast', 'error', 'unknown'] }).notNull().default('unknown'),
+    lastOutcome: text('last_outcome', { enum: ['success','soft_timeout','error','cancel','unknown'] }).notNull().default('unknown'),
     updatedAtMs: integer('updated_at_ms').notNull().default(0),
+    lastObservationMs: integer('last_observation_ms'),
+    lastStartMs: integer('last_start_ms'),
+    lastStartSequence: integer('last_start_sequence').notNull().default(0),
+    baselineLatencyMs: integer('baseline_latency_ms'),
+    suspectCount: integer('suspect_count').notNull().default(0),
   },
   (t) => ({
-    pk: primaryKey({ columns: [t.comboId, t.modelId] }),
-    cooldownIdx: index('idx_combo_slow_cooldown').on(t.cooldownUntilMs),
+    pk: primaryKey({ columns: [t.memberId, t.workload] }),
+    comboIdx: index('idx_adaptive_combo_workload').on(t.comboId, t.workload),
+    updatedIdx: index('idx_adaptive_updated').on(t.updatedAtMs),
     memberFk: foreignKey({
-      columns: [t.comboId, t.modelId],
-      foreignColumns: [comboMembers.comboId, comboMembers.modelId],
-      name: 'fk_combo_slow_state_member',
+      columns: [t.memberId, t.comboId, t.modelId],
+      foreignColumns: [comboMembers.id, comboMembers.comboId, comboMembers.modelId],
+      name: 'fk_combo_adaptive_state_member',
     }).onDelete('cascade'),
   })
 );
+
+export const comboAdaptiveExploration = sqliteTable('combo_adaptive_exploration', {
+  comboId: text('combo_id').notNull().references(() => combos.id, { onDelete: 'cascade' }),
+  workload: text('workload').notNull(),
+  generation: integer('generation').notNull(),
+  nextDueMs: integer('next_due_ms').notNull(),
+}, (t) => ({ pk: primaryKey({ columns: [t.comboId, t.workload] }) }));
 
 // ============================================================================
 // Aliases

@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
-export const CURRENT_SCHEMA_VERSION = 14;
+export const CURRENT_SCHEMA_VERSION = 15;
 
 interface MigrationFile {
   version: number;
@@ -44,6 +44,9 @@ export function runMigrations(raw: Database.Database, log: Logger, migrationsDir
   if (applied.some((version, index) => version !== index + 1 || version > latest)) {
     throw new Error('Database migration history is incomplete or newer than this application');
   }
+  // Verify a claimed 0014 before any subsequent migration can change its DB.
+  if (latest >= 14 && applied.includes(14)) assertRetiredProvidersRemoved(raw, parsed[13]!);
+  if (latest >= 15 && applied.includes(15)) assertAdaptiveSchema(raw);
 
   for (const migration of parsed.slice(applied.length)) {
     log.info({ version: migration.version, name: migration.name }, 'applying migration');
@@ -56,20 +59,40 @@ export function runMigrations(raw: Database.Database, log: Logger, migrationsDir
           throw new Error('Database migration produced invalid foreign keys');
         }
       }
+      if (migration.version === 15) {
+        assertAdaptiveSchema(raw);
+        if (raw.prepare('PRAGMA foreign_key_check').all().length > 0) {
+          throw new Error('Database migration produced invalid adaptive foreign keys');
+        }
+      }
       raw.prepare('INSERT INTO schema_migrations (version, name) VALUES (?, ?)').run(migration.version, migration.name);
     });
     tx.immediate();
   }
 
   raw.transaction(() => {
-    // A restored SQLite file can claim 0014 in its migration ledger without
-    // ever running the migration. Verify the actual schema even on a no-op open.
-    if (latest === 14 && applied.includes(14)) {
-      assertRetiredProvidersRemoved(raw, parsed[13]!);
-    }
     ensureSettingsRow(raw, log);
     raw.prepare('UPDATE app_settings SET schema_version = ? WHERE id = 1').run(latest);
   })();
+}
+
+function assertAdaptiveSchema(raw: Database.Database): void {
+  const names = new Set((raw.prepare("SELECT name FROM sqlite_schema WHERE type='table'").all() as { name: string }[]).map(row => row.name.toLowerCase()));
+  const columns = (table: string) => new Set((raw.prepare('SELECT name FROM pragma_table_xinfo(?)').all(table) as { name: string }[]).map(row => row.name));
+  const requiredState = [
+    'combo_id','member_id','model_id','workload','generation','samples_json','consecutive_slow_count',
+    'relative_slow_count','degraded','comparator_model_id','probe_due_ms','probe_lease_until_ms',
+    'probe_token','recovery_successes','probe_failures','last_latency_ms','last_outcome','updated_at_ms',
+    'last_observation_ms','last_start_ms','last_start_sequence','baseline_latency_ms','suspect_count',
+  ];
+  const state = columns('combo_adaptive_states');
+  const exploration = columns('combo_adaptive_exploration');
+  if (names.has('combo_member_slow_states') || !names.has('combo_adaptive_states') ||
+      !names.has('combo_adaptive_exploration') || !columns('combos').has('max_request_duration_seconds') ||
+      requiredState.some(name => !state.has(name)) ||
+      ['combo_id','workload','generation','next_due_ms'].some(name => !exploration.has(name))) {
+    throw new Error('Database schema is inconsistent with adaptive combo migration (0015)');
+  }
 }
 
 function assertRetiredProvidersRemoved(raw: Database.Database, migration: MigrationFile): void {

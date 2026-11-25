@@ -7,7 +7,7 @@ Lightweight self-hosted LLM gateway with a polished admin UI. Presents stable Op
 - OpenAI-compatible and Anthropic-compatible gateways (`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`, `/v1/models`)
 - Selective model discovery (Fetch → select → import) with **Select All**
 - Ordered **combos** with fallback routing and one-hop **aliases**
-- Per-combo slow-response fallback with TTFT-aware streaming, cooldown, and recovery probes
+- Adaptive ordered combos with workload-aware latency, soft reserves, automatic failback, exclusive recovery probes, and optional overall deadlines
 - Provider API keys encrypted at rest with AES-256-GCM
 - Per-key `ld-` bearer tokens (SHA-256 digest storage, displayed once)
 - IP allow/deny (IPv4 + IPv6 CIDR), trusted-proxy configuration

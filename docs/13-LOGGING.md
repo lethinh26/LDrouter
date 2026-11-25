@@ -528,11 +528,12 @@ reason=rate_limit
 
 Từng candidate phải có rejection reason cụ thể.
 
-Slow-response fallback uses the same candidate rejection records. A member skipped during its
-five-minute cooldown is logged with `reason=slow_response_cooldown`; a member whose recovery probe
-is already leased is logged with `reason=slow_response_probe_active`. The upstream attempt record
-includes `slowResponseTimeoutMs`, and a threshold abort is classified as
-`failureReason=slow_response_timeout`.
+Adaptive fallback records actual upstream dispatches with `selectionReason` (priority, recovery,
+exploration, relative preference, reserve, or rescue) and `slowResponseTimeoutMs` when enabled.
+A soft threshold abort is classified as `failureReason=slow_response_timeout`. Degraded reserves
+remain candidates; hard skips are logged separately and do not consume attempts. Metrics
+`latedev_adaptive_combo_decisions_total` and `latedev_adaptive_combo_outcomes_total` use bounded
+reason/result labels, without credentials, model names or prompts.
 Total request timeouts are classified as `total_timeout`; stream-idle timeouts before content are
 classified as `first_token_timeout` so the corresponding combo trigger remains effective.
 

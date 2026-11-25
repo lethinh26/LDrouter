@@ -148,7 +148,7 @@ List:
 - public ID
 - enabled
 - member count
-- healthy-member count, with active slow-response cooldown and recovery-probe counts shown separately
+- available-member count, with degraded-workload reserves and recovery-probe counts shown separately
 
 Create/edit form:
 
@@ -156,11 +156,12 @@ Create/edit form:
 - slug
 - mode
 - max total attempts
+- optional overall combo deadline in seconds (blank means no additional limit)
 - fallback trigger policy
 - total-timeout fallback toggle
-- slow-response fallback toggle
+- adaptive fallback and recovery toggle
 - slow-response threshold in seconds (default 60)
-- consecutive slow-response count before cooldown (default 3)
+- consecutive slow-response count before demotion (default 3)
 - member picker
 
 Member editor:
@@ -168,8 +169,10 @@ Member editor:
 - drag/drop or explicit up/down ordering
 - numbered priority
 
-Show each member's recent slow-response count, last latency, cooldown, and recovery-probe state
-when editing a combo.
+Show each member's per-workload latency kind, median, fresh sample count, absolute/relative slow
+counts, comparator, degradation, and recovery state when editing a combo. Distinguish degraded
+reserves from hard unavailability and never imply one globally preferred model. Provide an audited
+reset of adaptive history. Warn when the attempt cap or overall deadline limits fallback/rescue.
 
 Warn when member capability sets differ.
 

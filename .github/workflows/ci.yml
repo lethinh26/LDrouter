@@ -1,11 +1,16 @@
 # Acceptance gates (docs/10): install → lint → typecheck → test → build →
-# npm pack dry-run (tarball must contain CLI, web assets and migrations).
+# npm pack dry-run (tarball must contain CLI, web assets and migrations),
+# plus an isolated Docker Compose smoke test. Never publishes/deploys.
 name: CI
 
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   gates:
@@ -26,11 +31,45 @@ jobs:
           # Run explicit build (no need for prepack hook since we removed it)
           pnpm run build
           # Capture npm pack output to verify all required files are included
-          OUTPUT=$(npm pack --dry-run 2>&1 || true)
+          OUTPUT=$(npm pack --dry-run 2>&1)
           echo "Tarball contents:"
           echo "$OUTPUT"
           echo "$OUTPUT" | grep -q "dist/cli.js" || { echo "FAIL: dist/cli.js not in tarball"; exit 1; }
           echo "$OUTPUT" | grep -q "dist/web/index.html" || { echo "FAIL: dist/web/index.html not in tarball"; exit 1; }
           echo "$OUTPUT" | grep -q "migrations/0001_initial_schema.sql" || { echo "FAIL: migrations not in tarball"; exit 1; }
+          echo "$OUTPUT" | grep -q "migrations/0015_adaptive_combo_state.sql" || { echo "FAIL: adaptive migration not in tarball"; exit 1; }
           echo "$OUTPUT" | grep -q "CHANGELOG.md" || { echo "FAIL: CHANGELOG.md not in tarball"; exit 1; }
           echo "✓ tarball OK"
+      - name: Browser smoke (isolated mock upstream)
+        run: |
+          python3 -m venv "$RUNNER_TEMP/ldrouter-e2e"
+          "$RUNNER_TEMP/ldrouter-e2e/bin/python" -m pip install playwright==1.55.0
+          "$RUNNER_TEMP/ldrouter-e2e/bin/python" -m playwright install --with-deps chromium
+          "$RUNNER_TEMP/ldrouter-e2e/bin/python" tests/e2e/adaptive_combo_smoke.py
+
+  docker-smoke:
+    runs-on: ubuntu-latest
+    needs: gates
+    timeout-minutes: 20
+    env:
+      COMPOSE_PROJECT_NAME: ldrouter-ci-${{ github.run_id }}-${{ github.run_attempt }}
+      LATEDEV_IMAGE: local/ldrouter:ci-${{ github.run_id }}
+      LATEDEV_MASTER_KEY: 'ci-only-not-a-production-secret-123456'
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build and start isolated service
+        run: |
+          docker compose build latedev-router
+          docker compose up -d --no-build --pull never --wait --wait-timeout 120 latedev-router
+          curl --fail --silent --show-error http://127.0.0.1:8787/ready
+      - name: Restart with existing data volume
+        run: |
+          docker compose restart latedev-router
+          docker compose up -d --no-build --pull never --wait --wait-timeout 120 latedev-router
+          curl --fail --silent --show-error http://127.0.0.1:8787/ready
+      - name: Collect diagnostics on failure
+        if: failure()
+        run: docker compose logs --no-color latedev-router
+      - name: Clean up isolated service
+        if: always()
+        run: docker compose down --volumes --remove-orphans

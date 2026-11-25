@@ -352,6 +352,49 @@ describe('streamed multipart restore', () => {
     }
   });
 
+  it('invalidates restored probe owners and old attempt fences while preserving fresh latency samples', async () => {
+    const {getRawDb} = await import('../../src/server/db/index');
+    const {loadCombo} = await import('../../src/server/routing/combo');
+    const {beginAdaptiveAttempt,listAdaptiveStates,recordAdaptiveOutcome,claimAdaptiveProbe} = await import('../../src/server/routing/combo-adaptive-state');
+    const db = getRawDb();
+    const modelId = await ensureModel('a','p/a');
+    const now = Date.now();
+    const workload = 'stream:plain:short';
+    db.prepare("INSERT INTO combos(id,name,slug,public_model_id,mode) VALUES ('restore-adaptive','Adaptive restore','restore-adaptive','combo/restore-adaptive','fallback')").run();
+    db.prepare("INSERT INTO combo_members(id,combo_id,model_id,position) VALUES ('restore-member','restore-adaptive',?,0)").run(modelId);
+    const generation = loadCombo('restore-adaptive')!.slowResponseGeneration!;
+    const samples = [{latencyMs:70_000,atMs:now-1000}];
+    db.prepare(`INSERT INTO combo_adaptive_states(
+      combo_id,member_id,model_id,workload,generation,samples_json,consecutive_slow_count,degraded,
+      probe_due_ms,probe_lease_until_ms,probe_token,recovery_successes,last_observation_ms,last_start_ms,last_start_sequence,updated_at_ms
+    ) VALUES ('restore-adaptive','restore-member',?,?,?,?,3,'absolute',?,?,'old-backup-owner',1,?,?,42,?)`)
+      .run(modelId,workload,generation,JSON.stringify(samples),now-100,now+120_000,now-1000,now-2000,now-1000);
+    db.prepare(`INSERT INTO combo_adaptive_states(combo_id,member_id,model_id,workload,generation,updated_at_ms)
+      VALUES ('restore-adaptive','restore-member',?,'complete:plain:short:short',?,?)`)
+      .run(modelId,generation,now-16*60_000);
+    const oldFence=beginAdaptiveAttempt();
+    const file=await exportToFile('full');
+    try {
+      db.prepare("UPDATE combo_adaptive_states SET probe_token='newer-live-owner' WHERE combo_id='restore-adaptive' AND workload=?").run(workload);
+      const result=await uploadFile(file);
+      expect(result.status,JSON.stringify(result.json)).toBe(200);
+      const restoredPlan=loadCombo('restore-adaptive')!;
+      expect(restoredPlan.slowResponseGeneration).toBe(generation+1);
+      const restored=listAdaptiveStates('restore-adaptive');
+      expect(restored).toHaveLength(1);
+      expect(restored[0]).toMatchObject({samples,degraded:'absolute',probeToken:null,probeLeaseUntilMs:null,recoverySuccesses:0,lastStartSequence:0});
+      const candidate={modelId,comboMemberId:'restore-member',publicModelId:'p/a',upstreamModelId:'a',providerId,enabled:true,upstreamAvailable:true,circuitOpen:false,providerEnabled:true,capabilities:{streaming:true}};
+      recordAdaptiveOutcome({plan:restoredPlan,candidate,workload,startedAtMs:now,now:Date.now(),kind:'success',
+        latencyMs:8000,role:'normal',comparableCandidates:[candidate],learn:true,attemptFence:oldFence});
+      expect(listAdaptiveStates('restore-adaptive',workload)[0]?.samples).toEqual(samples);
+      const token=claimAdaptiveProbe(restoredPlan,candidate,workload,Date.now(),120_000);
+      expect(token).toBeTruthy();
+      expect(token).not.toBe('old-backup-owner');
+      expect(token).not.toBe('newer-live-owner');
+      expect(await waitForEmptyTmp()).toEqual([]);
+    } finally {fs.rmSync(file,{force:true});}
+  });
+
   it.each(['v1','v2'] as const)('rejects a falsely stamped schema-14 %s backup before swapping the live database', async (format) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'latedev-forged-restore-'));
     try {
@@ -428,7 +471,9 @@ describe('streamed multipart restore', () => {
       expect(result.status, JSON.stringify(result.json)).toBe(200);
       const db = getRawDb();
       expect(db).not.toBe(before);
-      expect(db.prepare('SELECT schema_version FROM app_settings').get()).toEqual({schema_version:14});
+      expect(db.prepare('SELECT schema_version FROM app_settings').get()).toEqual({schema_version:15});
+      expect(db.prepare("SELECT name FROM sqlite_schema WHERE name='combo_member_slow_states'").get()).toBeUndefined();
+      expect(db.prepare('SELECT * FROM combo_adaptive_states').all()).toEqual([]);
       expect(db.prepare('SELECT type FROM providers ORDER BY type').all()).toEqual([{type:'anthropic'},{type:'openai'}]);
       expect(db.prepare("SELECT id FROM models ORDER BY id").all()).toEqual([{id:'m-anthropic'},{id:'m-openai'}]);
       expect(db.prepare("SELECT name FROM sqlite_master WHERE name IN ('codex_accounts','qoder_accounts')").all()).toEqual([]);

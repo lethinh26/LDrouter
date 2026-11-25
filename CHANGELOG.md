@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Adaptive ordered combo routing: compare recent workload-specific latency, preserve configured priority when speeds are similar, demote persistently slow members to reserves, recover automatically, and allow a bounded rescue replay within the attempt/deadline budget. Migration 0015 resets old unsegmented cooldown history while retaining configuration and historical requests/statistics.
+- Per-workload adaptive status and history reset in the combo editor, an optional combo-wide deadline, and bounded routing decision/outcome metrics.
+
 ### Removed
 
 - Remove native Codex and Qoder integrations, including their adapters, credential/account pools, OAuth and quota-refresh flows, administration routes and components. OpenAI-compatible and Anthropic-compatible endpoints remain supported.

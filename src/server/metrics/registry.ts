@@ -35,7 +35,7 @@ class CounterImpl implements Counter {
     const found = this.series.find((s) => sameLabels(s.labels, labels));
     if (found) found.value += n;
     else this.series.push({ labels, value: n });
-    registryMetrics.push(this);
+    registryMetrics.add(this);
   }
   value(labels: Record<string, string> = {}) {
     const found = this.series.find((s) => sameLabels(s.labels, labels));
@@ -65,7 +65,7 @@ class HistogramImpl implements Histogram {
     for (let i = 0; i < this.buckets.length; i++) {
       if (valueMs <= this.buckets[i]!) s.counts[i]! += 1;
     }
-    registryMetrics.push(this);
+    registryMetrics.add(this);
   }
   snapshot() {
     return this.series.map((s) => ({
@@ -98,7 +98,7 @@ class GaugeImpl implements Gauge {
     const f = this.series.find((s) => sameLabels(s.labels, labels));
     if (f) f.value = v;
     else this.series.push({ labels, value: v });
-    registryMetrics.push(this);
+    registryMetrics.add(this);
   }
   inc(labels: Record<string, string> = {}, n = 1) { this.set(this.value(labels) + n, labels); }
   dec(labels: Record<string, string> = {}, n = 1) { this.set(this.value(labels) - n, labels); }
@@ -127,7 +127,9 @@ function labelString(labels: Record<string, string>, skipEmpty = false): string 
   return `{${filtered.map((k) => `${k}="${(labels[k] ?? '').replace(/"/g, '\\"')}"`).join(',')}}`;
 }
 
-const registryMetrics: Array<CounterImpl | HistogramImpl | GaugeImpl> = [];
+// Register each metric once, not once per observation. Adaptive routing adds
+// per-attempt observations, so retaining duplicate references would grow memory.
+const registryMetrics = new Set<CounterImpl | HistogramImpl | GaugeImpl>();
 
 export const metricsRegistry = {
   _logger: null as Logger | null,
@@ -144,12 +146,9 @@ export const metricsRegistry = {
     return new GaugeImpl(name, help);
   },
   render(): string {
-    const seen = new Set<unknown>();
     let out = '';
     for (const m of registryMetrics) {
-      if (seen.has(m)) continue;
-      seen.add(m);
-      out += (m as { render: () => string }).render();
+      out += m.render();
     }
     return out;
   },
@@ -168,6 +167,8 @@ export const metrics = {
   tokensCacheWrite: metricsRegistry.counter('latedev_tokens_cache_write_total', 'Provider cache write tokens'),
   tokensReasoning: metricsRegistry.counter('latedev_tokens_reasoning_total', 'Reasoning tokens processed'),
   fallbackCount: metricsRegistry.counter('latedev_fallback_total', 'Number of fallback transitions'),
+  adaptiveDecisions: metricsRegistry.counter('latedev_adaptive_combo_decisions_total', 'Adaptive combo routing decisions by bounded reason'),
+  adaptiveOutcomes: metricsRegistry.counter('latedev_adaptive_combo_outcomes_total', 'Adaptive combo attempt outcomes by role and result'),
   activeRequests: metricsRegistry.gauge('latedev_active_requests', 'Number of in-flight gateway requests'),
   circuitState: metricsRegistry.gauge('latedev_provider_circuit_state', 'Provider circuit state (0=closed, 1=open)'),
   rateLimited: metricsRegistry.counter('latedev_rate_limited_total', 'Number of rate-limit denials'),

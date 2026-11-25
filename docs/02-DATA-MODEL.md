@@ -91,12 +91,13 @@ Unique constraint on `(provider_id, upstream_model_id)`.
 - `mode`: `fallback`
 - `enabled`
 - `max_total_attempts`
+- `max_request_duration_seconds` (nullable; additional overall combo deadline)
 - fallback-trigger policy
 - `fallback_on_total_timeout` (default true for new combos; migration 0012 copies the previous `fallback_on_connect_timeout` value for existing combos)
 - `slow_response_fallback_enabled` (default true)
 - `slow_response_threshold_seconds` (default 60)
 - `slow_response_max_count` (default 3)
-- `slow_response_generation` (increments when slow-response settings change, invalidating stale in-flight outcomes)
+- `slow_response_generation` (increments on routing/latency-affecting configuration changes, fencing stale outcomes)
 - `created_at`
 - `updated_at`
 
@@ -114,22 +115,17 @@ Constraints:
 - no duplicate model in a combo
 - position controls fallback ordering; the lowest position is tried first
 
-### `combo_member_slow_states`
+### Adaptive combo runtime state (migration 0015)
 
-Persistent slow-response health for one physical model inside one combo. The composite primary key
-is `(combo_id, model_id)` so a model can have different slow-response history in different combos.
+Bounded state per membership and workload stores up to five timestamped successful latency samples,
+consecutive absolute/relative slow counts, degradation/comparator, next recovery time, recovery
+success count, owner token and expiry for recovery leases, and attempt ordering/generation fences.
+Streaming TTFT and non-streaming completion latency are never compared across workloads.
 
-- `consecutive_slow_count`
-- `cooldown_until_ms` (nullable Unix milliseconds)
-- `probe_lease_until_ms` (nullable Unix milliseconds; atomically reserves one recovery probe)
-- `last_latency_ms`
-- `last_outcome`: `slow`, `fast`, `error`, or `unknown`
-- `updated_at_ms`
-
-Combo deletion cascades state deletion. Removing a member cascades its state; re-adding the same
-model creates a new `combo_members.id` and starts with fresh history. In-flight state/probe writes
-must match the membership row ID captured by the request, so an old request cannot mutate the new
-membership. Changing slow-response settings clears the combo's affected history transactionally.
+Membership deletion cascades state deletion; a re-added model has a new member ID. Configuration
+changes invalidate prior decisions/leases and fence in-flight writes. Migration 0015 resets old
+unsegmented cooldown data while preserving combo configuration and all request/statistics history.
+Active lease ownership does not survive a restart or restore.
 
 ### `model_aliases`
 

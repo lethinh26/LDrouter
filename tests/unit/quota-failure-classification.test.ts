@@ -40,6 +40,7 @@ describe('quota failure classification', () => {
     const throttled = new GatewayError('upstream_rate_limit', 'Upstream rate limited (HTTP 429)', { status: 429 });
     expect(classifyFailure(throttled)).toBe('http_status');
     expect(isQuotaFailure(throttled)).toBe(false);
+    expect(isUpstreamHealthFailure(throttled)).toBe(false);
   });
 
   it('detects quota wording in an upstream message regardless of case', () => {
@@ -136,5 +137,24 @@ describe('quota fallback policy', () => {
     });
     expect(classifyFailure(idle)).toBe('stream_idle_timeout');
     expect(isUpstreamHealthFailure(idle)).toBe(true);
+  });
+
+  it('keeps model-scoped 503, first-token slowness and malformed output out of the provider circuit', () => {
+    const modelUnavailable = upstreamHttpError(503, '{"error":{"code":"model_unavailable"}}');
+    expect(classifyFailure(modelUnavailable)).toBe('http_status');
+    expect(shouldRetryAttempt(combo, modelUnavailable)).toBe(true);
+    expect(isUpstreamHealthFailure(modelUnavailable)).toBe(false);
+    expect(isUpstreamHealthFailure(upstreamHttpError(503, 'Service unavailable'))).toBe(true);
+    expect(isUpstreamHealthFailure(new GatewayError('timeout_error', 'first token timeout', { code: 'upstream_first_token_timeout' }))).toBe(false);
+    const malformed = new GatewayError('upstream_error', 'invalid JSON', { status: 502, code: 'upstream_bad_response' });
+    expect(shouldRetryAttempt(combo, malformed)).toBe(true);
+    expect(isUpstreamHealthFailure(malformed)).toBe(false);
+  });
+
+  it('does not retry or trip provider health on the combo overall deadline', () => {
+    const deadline = new GatewayError('timeout_error', 'overall deadline', { status: 504, code: 'combo_overall_timeout' });
+    expect(classifyFailure(deadline)).toBe('overall_timeout');
+    expect(shouldRetryAttempt(combo, deadline)).toBe(false);
+    expect(isUpstreamHealthFailure(deadline)).toBe(false);
   });
 });

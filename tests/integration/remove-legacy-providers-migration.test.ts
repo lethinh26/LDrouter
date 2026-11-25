@@ -20,7 +20,13 @@ describe('retired provider migration 0014', () => {
       });
       const providers = db.prepare("SELECT * FROM providers WHERE type IN ('openai','anthropic') ORDER BY id").all();
       const models = db.prepare("SELECT * FROM models WHERE provider_id IN ('p-openai','p-anthropic') ORDER BY id").all();
-      runMigrations(db, MIGRATION_LOG, MIGRATIONS_DIR, CURRENT_SCHEMA_VERSION);
+      // Verify 0014's historical slow-state preservation against its own immutable prefix.
+      const through14 = path.join(dir,'migrations-through-14');
+      fs.mkdirSync(through14);
+      for (const file of fs.readdirSync(MIGRATIONS_DIR).filter(f => /^\d{4}_.+\.sql$/.test(f) && Number(f.slice(0,4)) <= 14)) {
+        fs.copyFileSync(path.join(MIGRATIONS_DIR,file),path.join(through14,file));
+      }
+      runMigrations(db, MIGRATION_LOG, through14, 14);
       expect(db.prepare("SELECT * FROM providers ORDER BY id").all()).toEqual(providers);
       expect(db.prepare("SELECT * FROM models ORDER BY id").all()).toEqual(models);
       expect(snapshot()).toEqual(history);
@@ -62,12 +68,16 @@ describe('retired provider migration 0014', () => {
       expect(() => db.exec("INSERT INTO providers (id,name,slug,type,base_url) VALUES ('invalid','invalid','invalid','codex','https://example.test')")).toThrow(/CHECK constraint/);
       expect(() => db.exec("INSERT INTO providers (id,name,slug,type,base_url) VALUES ('invalid','invalid','invalid','qoder','https://example.test')")).toThrow(/CHECK constraint/);
       expect(() => db.exec("INSERT INTO combo_members (id,combo_id,model_id,position) VALUES ('invalid','mixed','m-retired-a',9)")).toThrow(/FOREIGN KEY/);
-      runMigrations(db, MIGRATION_LOG, MIGRATIONS_DIR, CURRENT_SCHEMA_VERSION);
+      runMigrations(db, MIGRATION_LOG, through14, 14);
       expect(snapshot()).toEqual(history);
       expect(db.prepare('SELECT config_version FROM combos WHERE id=?').get('mixed')).toEqual({config_version:5});
       db.exec("DELETE FROM combo_members WHERE id='member-openai'");
       expect(db.prepare("SELECT * FROM combo_member_slow_states WHERE combo_id='mixed' AND model_id='m-openai'").get()).toBeUndefined();
       expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+      runMigrations(db, MIGRATION_LOG, MIGRATIONS_DIR, CURRENT_SCHEMA_VERSION);
+      expect(db.prepare("SELECT name FROM sqlite_schema WHERE name='combo_member_slow_states'").get()).toBeUndefined();
+      expect(db.prepare('SELECT * FROM combo_adaptive_states').all()).toEqual([]);
+      expect(snapshot()).toEqual(history);
     } finally {
       db.close();
       fs.rmSync(dir,{recursive:true,force:true});
@@ -83,7 +93,7 @@ describe('retired provider migration 0014', () => {
       expect(() => runMigrations(db,MIGRATION_LOG,dir,CURRENT_SCHEMA_VERSION)).toThrow(/incomplete/);
       expect(db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all()).toEqual([]);
       runMigrations(db,MIGRATION_LOG,MIGRATIONS_DIR,CURRENT_SCHEMA_VERSION);
-      expect(db.prepare('SELECT schema_version FROM app_settings').get()).toEqual({schema_version:14});
+      expect(db.prepare('SELECT schema_version FROM app_settings').get()).toEqual({schema_version:CURRENT_SCHEMA_VERSION});
       expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
       expect(db.prepare("SELECT name FROM sqlite_master WHERE name IN ('codex_accounts','qoder_accounts')").all()).toEqual([]);
     } finally {
@@ -96,9 +106,9 @@ describe('retired provider migration 0014', () => {
     const db = new Database(':memory:');
     try {
       runMigrations(db,MIGRATION_LOG,MIGRATIONS_DIR,CURRENT_SCHEMA_VERSION);
-      db.exec("INSERT INTO schema_migrations(version,name) VALUES (15,'future'); UPDATE app_settings SET schema_version=15");
+      db.exec("INSERT INTO schema_migrations(version,name) VALUES (16,'future'); UPDATE app_settings SET schema_version=16");
       expect(() => runMigrations(db,MIGRATION_LOG,MIGRATIONS_DIR,CURRENT_SCHEMA_VERSION)).toThrow(/newer/);
-      expect(db.prepare('SELECT schema_version FROM app_settings').get()).toEqual({schema_version:15});
+      expect(db.prepare('SELECT schema_version FROM app_settings').get()).toEqual({schema_version:16});
     } finally { db.close(); }
   });
 

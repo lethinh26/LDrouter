@@ -1,6 +1,6 @@
 # Adaptive ordered fallback
 
-**Ngày:** 2026-11-25 | **Baseline:** branch `chore/remove-legacy-providers-20261125`, trên main `bff2e5f` sau cleanup provider legacy và migration 0014 | **Trạng thái adaptive routing:** đề xuất review, chưa được duyệt triển khai.
+**Ngày:** 2026-11-25 | **Baseline:** commit `d6fe0e1` trên branch `chore/remove-legacy-providers-20261125`, sau cleanup provider legacy và migration 0014 | **Trạng thái adaptive routing:** đã được duyệt; code phase 2–4 và regression phase 5 đã bổ sung trên branch, chưa deploy production.
 
 ## 1. Mục tiêu
 
@@ -229,4 +229,4 @@ Các con số là mặc định ban đầu chưa benchmark thực tế; named co
 - Chọn passive recovery + bounded exploration, không background LLM calls, không hedging. Tốc độ tương đương được định nghĩa bằng 20% hoặc 2 giây; relative demotion cần 30% hoặc 3 giây. Các ngưỡng này cần được kiểm chứng bằng traffic thực sau triển khai.
 - Last viable model/rescue được phép vượt soft threshold nhưng không vượt provider hard timeout; nếu đã soft-abort cùng request, chỉ replay một lần khi còn budget.
 - Không cam kết tất cả models sẽ được thử khi maxTotalAttempts thấp, không đảm bảo failback tức thời khi không có traffic hoặc không có sample đủ tin cậy. Không đo chất lượng output; ưu tiên admin biểu thị lựa chọn chất lượng.
-- Adaptive routing chưa được triển khai production và chưa có adaptive test mới. Đây là kế hoạch review, giữ nguyên mọi yêu cầu về fallback/failback, priority, recovery, concurrency, timeout và edge cases. Không bắt đầu Phase 2–5 khi chưa được duyệt.
+- Adaptive routing đã được triển khai trên branch riêng theo phê duyệt. Migration 0015 giữ nguyên migration cũ, đổi slow history thành workload-aware state, thêm optional overall deadline và reset lease/epoch khi mở database. Test mới ở `tests/unit/combo-policy.test.ts`, `tests/unit/combo-adaptive-state.test.ts` và các integration test tương ứng. Để giảm tải máy phát triển, chỉ chạy tập trung các test thay đổi ở local; CI chịu trách nhiệm lint/typecheck/full suite/build/package, Playwright smoke và Docker Compose smoke trên runner độc lập. Kết quả CI, canary traffic và tuning production vẫn cần xác nhận trước release. Không merge hoặc deploy tự động từ branch phát triển.

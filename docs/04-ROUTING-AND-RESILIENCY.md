@@ -13,8 +13,8 @@ requested model/alias
   -> remove models with open circuit
   -> derive required capabilities from request
   -> remove incompatible candidates
-  -> skip combo members in slow-response cooldown
-  -> apply combo routing algorithm
+  -> order hard-eligible candidates using adaptive latency history when enabled
+  -> revalidate and select before each dispatch
 ```
 
 If no candidates remain, return a clear gateway error explaining the category without leaking sensitive configuration.
@@ -59,12 +59,13 @@ The admin UI must allow toggling retry/fallback error categories per combo/provi
 
 ## Ordered fallback
 
-Combo members are tried in their saved `position` order. The first eligible member is selected;
-later members are attempted only when the configured fallback policy allows it.
+Saved `position` defines priority. With adaptive routing disabled, the first eligible member wins.
+With it enabled, convincing latency evidence may temporarily lower a member's priority; similar
+latency always favors the earlier member. Later attempts still obey the configured failure triggers.
 
 Requirements:
 
-- disabled/unhealthy/incompatible candidates are skipped
+- disabled, circuit-blocked, or incompatible candidates are skipped; slow members are reserves
 - ordering is deterministic and visible in the admin UI
 - a failed first candidate may still enter fallback/retry behavior according to combo policy
 
@@ -81,7 +82,8 @@ Provider-level retry config:
 
 Combo-level safety:
 
-- `max_total_attempts` caps the entire client request across retries and fallbacks
+- `max_total_attempts` caps actual upstream dispatches across retries, fallback and rescue; skips do not consume attempts
+- optional `max_request_duration_seconds` (1–3600; null by default) caps the entire combo execution, including retry delays
 - `fallback_on_total_timeout` is independent from connect and first-token timeout triggers; migration 0012 seeds existing combos from their former `fallback_on_connect_timeout` preference to preserve behavior
 
 Never multiply retries without a global cap.
@@ -97,9 +99,9 @@ fallback is prohibited. A valid tool call or real text still counts as generated
 provider omits usage statistics or reports zero output tokens.
 Legacy cached empty successes are evicted when read, allowing the live upstream to be retried.
 
-## Slow-response fallback
+## Adaptive ordered fallback
 
-Each combo can enable slow-response fallback (enabled by default) with:
+Each combo can enable adaptive ordered fallback (enabled by default, using the existing `slow_response_fallback_enabled` setting) with:
 
 - `slow_response_threshold_seconds`: default 60 seconds, range 1–600
 - `slow_response_max_count`: default 3 consecutive slow outcomes, range 1–20
@@ -115,18 +117,34 @@ at the upstream request. Provider `total_timeout` also starts at the request. Th
 deadline reached applies; a numerically shorter provider first-token timeout can still expire later
 when connection/header latency is high.
 
-When the threshold is reached, the current attempt is aborted before downstream content is
-committed and the combo advances to the next member. A slow outcome increments that member's
-consecutive count. A fast streaming TTFT or completed non-streaming response resets the count.
-After the configured count, the member is skipped for five minutes. When cooldown expires, one
-request obtains an atomic probe lease; concurrent requests skip that member until the probe ends.
-A fast probe clears the state, while a failed or slow probe starts another five-minute cooldown.
-Slow-response timeouts are tracked per combo-member and do not open the provider-wide circuit.
-Slow-state writes and recovery-probe operations are bound to the captured `combo_members.id`, so a
-late request from a removed membership cannot mutate a later re-added membership for the same model.
+Latency history is scoped to a member and a bounded workload (streaming/completion, reasoning,
+input size, and non-stream output budget). Only valid, completed generations contribute successful
+latency samples. Use the median of up to five samples within 15 minutes, requiring three samples
+for relative comparisons. Demote after three consecutive observations exceeding the comparator
+by max(3 seconds, 30%); restore priority within max(2 seconds, 20%). The distinct thresholds
+avoid oscillation. The configured absolute slow count can also trigger degradation. Missing or
+stale evidence cannot permanently favor a lower-priority model.
 
-The normal `max_total_attempts` cap still applies to all attempts in a request, including slow
-response fallbacks. A combo must have enough attempts configured to reach its later members.
+Degradation is a soft reserve, not unavailability. When an alternative could be faster, the
+soft watchdog can abort an attempt before downstream commitment. The last viable model, a
+reserve/rescue, or a group with similarly slow known models can run until its hard timeout.
+If the fallback fails, previously demoted members become available immediately. An attempt
+aborted only by the soft watchdog may be replayed once if all untried candidates are exhausted,
+fallback is allowed, and both the attempt cap and deadline permit it. No parallel inference is sent.
+
+Recovery starts with a real request after 30 seconds; a lease admits one probe per member/workload.
+Two successful comparable probes (second due after 10 seconds) restore normal priority. A failed
+probe backs off up to five minutes. A probe cannot promote a member after partial stream failure.
+Other traffic can use ready members, or serve degraded members if no ready alternative remains.
+Limited exploration can sample an unknown backup when the primary has repeated evidence of slowness.
+Recovery/exploration are passive: no traffic means no background inference. Synthetic admin tests
+do not train the routing state or read/write the response cache.
+
+All state changes are fenced by membership, configuration generation, attempt ordering and lease
+ownership. Config changes, restart and restore cannot leave an old probe in control. Hard eligibility,
+capabilities, API-key policy and provider circuits remain mandatory on every dispatch. Soft timeout
+alone never opens a provider-wide circuit. The configured attempt cap includes rescue replays;
+with a cap of two, an A → B → A sequence cannot complete its third dispatch.
 
 ## Timeouts
 
@@ -136,6 +154,7 @@ Separate at least:
 - time to first meaningful upstream response/token
 - streaming idle timeout
 - total request timeout
+- optional combo-wide overall deadline, including retry delays
 
 Defaults must be conservative and editable.
 
@@ -182,7 +201,9 @@ Configurable fields:
 - cooldown duration
 - half-open probe behavior
 
-Only failure categories indicating upstream health should trip the circuit. Client validation failures must not.
+Only failure categories indicating upstream health should trip the circuit. Client validation and
+model-specific failures must not trip a provider-wide circuit. One half-open probe at a time can
+test recovery; success means a complete valid response, not merely the first streaming token.
 
 ## Capability-aware routing
 

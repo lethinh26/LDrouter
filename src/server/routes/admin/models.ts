@@ -9,7 +9,7 @@ import { uuid } from '../../auth/ids';
 import { GatewayError } from '../../errors';
 import type { GatewayContext, GatewayRequest } from '../../gateway/runner';
 import type { CanonicalRequest } from '../../routing/capabilities';
-import { circuitBlocks } from '../../routing/circuit';
+import { circuitBlocks, modelThrottleBlocks } from '../../routing/circuit';
 
 const ImportModelsBody = z.object({
   providerId: z.string(),
@@ -69,7 +69,8 @@ export async function registerModelRoutes(app: FastifyInstance): Promise<void> {
       upstreamAvailable: m.upstreamAvailable,
       providerEnabled: providerMap.get(m.providerId)?.enabled ?? false,
       providerHealth: providerMap.get(m.providerId)?.healthState ?? 'unknown',
-      circuitOpen: circuitBlocks(m.providerId, providerMap.get(m.providerId)?.cbCooldownSeconds ?? 0),
+      providerTotalTimeoutMs: providerMap.get(m.providerId)?.totalTimeoutMs ?? null,
+      circuitOpen: circuitBlocks(m.providerId, providerMap.get(m.providerId)?.cbCooldownSeconds ?? 0) || modelThrottleBlocks(m.id),
       capabilities: safeJson(m.capabilitiesJson),
       discoveredCapabilities: m.discoveredMetadataJson ? safeJson(m.discoveredMetadataJson) : null,
       maxContextTokens: m.maxContextTokens,
