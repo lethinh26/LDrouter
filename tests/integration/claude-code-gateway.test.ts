@@ -13,6 +13,7 @@ const upstreamKey = 'sk-ant-api-fixture-only';
 const origin = 'https://api.anthropic.com';
 let app: FastifyInstance;
 let cookie = '', csrf = '', providerId = '', modelId = '', secret = '';
+let truncateStream = false;
 const calls: { url: string; headers: Headers; body: Record<string, unknown>; redirect?: RequestRedirect }[] = [];
 function admin(method: 'POST' | 'PATCH', route: string, payload: unknown) {
   return app.inject({ method, url: '/api/admin/' + route, headers: { cookie, 'x-csrf-token': csrf, 'content-type': 'application/json' }, payload: JSON.stringify(payload) });
@@ -37,17 +38,17 @@ beforeAll(async () => {
     const message = { id: 'msg_fixture', type: 'message', role: 'assistant', model: 'fixture-claude', content: [{ type: 'text', text: 'Fixture response' }], stop_reason: 'end_turn', stop_sequence: null, usage: { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 3 } };
     if (!body.stream) return Response.json(message);
     const events = [{ type: 'message_start', message: { ...message, content: [], usage: { input_tokens: 10, output_tokens: 0 } } }, { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }, { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Fixture response' } }, { type: 'content_block_stop', index: 0 }, { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: 5 } }, { type: 'message_stop' }];
-    return new Response(events.map(e => `event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`).join(''), { headers: { 'content-type': 'text/event-stream' } });
+    return new Response((truncateStream ? events.slice(0, -1) : events).map(e => `event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`).join(''), { headers: { 'content-type': 'text/event-stream' } });
   });
   const provider = await admin('POST', 'providers', { name: 'Claude Code', slug: 'claude-code', type: 'anthropic', providerKind: 'claude_code', apiKey: upstreamKey });
   expect(provider.statusCode).toBe(200); providerId = provider.json().id;
   expect((await admin('POST', 'models/import', { providerId, modelIds: ['fixture-claude'] })).statusCode).toBe(200);
   const { getRawDb } = await import('../../src/server/db');
   modelId = (getRawDb().prepare('SELECT id FROM models WHERE provider_id=?').get(providerId) as { id: string }).id;
-  const key = await admin('POST', 'api-keys', { name: 'Claude fixture', allowAllModels: false, permissions: [{ targetKind: 'model', targetId: modelId }], maxOutputTokensPerRequest: 100 });
+  const key = await admin('POST', 'api-keys', { name: 'Claude fixture', allowAllModels: false, permissions: [{ targetKind: 'model', targetId: modelId }], maxOutputTokensPerRequest: 100, maxConcurrent: 1 });
   expect(key.statusCode).toBe(200); secret = key.json().secret;
 });
-beforeEach(() => { calls.length = 0; });
+beforeEach(() => { calls.length = 0; truncateStream = false; });
 afterAll(async () => { vi.restoreAllMocks(); await app?.close(); (await import('../../src/server/db')).closeDb(); fs.rmSync(dataDir, { recursive: true, force: true }); });
 
 describe('Claude Code API-key integration', () => {
@@ -75,6 +76,23 @@ describe('Claude Code API-key integration', () => {
   it('streams native Messages and applies the same cap', async () => {
     const res = await messages(true); expect(res.statusCode).toBe(200); expect(res.body).toContain('message_stop'); expect(res.body).toContain('Fixture response');
     expect(calls[0]?.body).toMatchObject({ max_tokens: 100, stream: true });
+  });
+  it('does not synthesize a successful terminal after message_delta when the native stream is truncated', async () => {
+    truncateStream = true;
+    const res = await messages(true);
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toContain('Fixture response');
+    expect(res.body).toContain('message_delta');
+    expect(res.body).not.toContain('message_stop');
+    expect(calls).toHaveLength(1);
+    const { getRawDb } = await import('../../src/server/db');
+    const requestId = res.headers['x-request-id'];
+    expect(getRawDb().prepare('SELECT success, partial_stream, input_tokens, output_tokens, attempts_count FROM requests WHERE id=?').get(requestId)).toEqual({ success: 0, partial_stream: 1, input_tokens: 10, output_tokens: 5, attempts_count: 1 });
+    expect(getRawDb().prepare('SELECT success, partial_response FROM request_attempts WHERE request_id=?').get(requestId)).toEqual({ success: 0, partial_response: 1 });
+    truncateStream = false;
+    const recovered = await messages(true);
+    expect(recovered.statusCode).toBe(200);
+    expect(recovered.body).toContain('message_stop');
   });
   it('uses upstream count_tokens rather than a local estimate for this integration', async () => {
     const res = await app.inject({ method: 'POST', url: '/v1/messages/count_tokens', headers: { 'x-api-key': secret }, payload: { model: 'claude-code/fixture-claude', messages: [{ role: 'user', content: 'Hello' }] } });

@@ -1301,7 +1301,9 @@ export class GatewayRunner {
         if (unknownEvents > 0) throw badGenerationError('Upstream stream contained unrecognized output events', 'unsupported_shape', detail);
         throw emptyGenerationError(candidate, usage, detail);
       }
-      if (!meta.terminalSeen && !finishReason) {
+      // Native Anthropic requires the actual message_stop. A stop_reason in
+      // message_delta is not a terminal frame and cannot certify completion.
+      if (!meta.terminalSeen && (cfg.nativeClaude || !finishReason)) {
         throw badGenerationError('Upstream stream ended before a completion marker', 'truncated_stream', detail);
       }
       if (reasoningEvents > 0 && textEvents === 0 && toolEvents === 0 && !isLengthFinish(finishReason)) {
@@ -1577,6 +1579,7 @@ export class GatewayRunner {
       requestPayloadJson: requestPayload,
       responsePayloadJson: responsePayload,
       gatewayCacheHit: cacheHit ? true : false,
+      partialStream: attempts.some((attempt) => attempt.partialResponse),
     } as never).run();
 
     for (const attempt of persistedAttempts) db.insert(schema.requestAttempts).values(attempt as never).run();
