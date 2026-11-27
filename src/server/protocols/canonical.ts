@@ -19,6 +19,7 @@ export interface OpenAIChatRequest {
   temperature?: number;
   top_p?: number;
   max_tokens?: number;
+  max_completion_tokens?: number;
   stop?: string[] | string;
   response_format?: { type: 'text' | 'json_object' | 'json_schema'; json_schema?: { name?: string; schema: Record<string, unknown> } };
   reasoning_effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
@@ -119,7 +120,8 @@ export function openAIToCanonical(req: OpenAIChatRequest): CanonicalRequest {
     tools,
     temperature: req.temperature,
     topP: req.top_p,
-    maxOutputTokens: req.max_tokens,
+    maxOutputTokens: req.max_completion_tokens ?? req.max_tokens,
+    outputTokenParameter: req.max_completion_tokens !== undefined ? 'max_completion_tokens' : undefined,
     stop: Array.isArray(req.stop) ? req.stop : req.stop ? [req.stop] : undefined,
     stream: Boolean(req.stream),
     streamIncludeUsage: Boolean(req.stream_options?.include_usage),
@@ -172,7 +174,10 @@ export function canonicalToOpenAIRequest(req: CanonicalRequest, targetModel: str
   if (req.tools) out.tools = req.tools.map((t) => ({ type: 'function', function: { name: t.name, description: t.description, parameters: t.inputSchema } }));
   if (req.temperature !== undefined) out.temperature = req.temperature;
   if (req.topP !== undefined) out.top_p = req.topP;
-  if (req.maxOutputTokens !== undefined) out.max_tokens = req.maxOutputTokens;
+  if (req.maxOutputTokens !== undefined) {
+    if (req.outputTokenParameter === 'max_completion_tokens') out.max_completion_tokens = req.maxOutputTokens;
+    else out.max_tokens = req.maxOutputTokens;
+  }
   if (req.stop) out.stop = req.stop;
   if (req.responseFormat) {
     if (req.responseFormat.type === 'json_schema' && req.responseFormat.jsonSchema) {

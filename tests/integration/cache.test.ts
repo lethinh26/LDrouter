@@ -85,6 +85,18 @@ describe('cache behavior', () => {
     const r2 = await fetch(`${baseUrl}/v1/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${secret}` }, body: JSON.stringify(body) });
     await r2.json();
     expect(upstreamCalls.length).toBe(1); // no additional upstream call
+    const key = db.select().from(schema.apiKeys).all().find((row) => row.name === 'k')!;
+    const detail = await fetch(`${baseUrl}/api/admin/api-keys/${key.id}`, { headers: { cookie: cookies } });
+    expect((await detail.json()).apiKey.totalTokensUsed).toBe(4);
+    const disabled = await fetch(`${baseUrl}/api/admin/api-keys`, {
+      method: 'PATCH', headers: { 'content-type': 'application/json', cookie: cookies },
+      body: JSON.stringify({ id: key.id, cacheOverrideEnabled: false }),
+    });
+    expect(disabled.status).toBe(200);
+    const r3 = await fetch(`${baseUrl}/v1/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${secret}` }, body: JSON.stringify(body) });
+    expect(r3.status).toBe(200);
+    await r3.json();
+    expect(upstreamCalls.length).toBe(2);
     await new Promise<void>((r) => srv.close(() => r()));
   });
 

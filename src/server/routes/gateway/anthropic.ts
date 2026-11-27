@@ -2,7 +2,8 @@
 
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { authenticateGatewayKey, type AuthenticatedKey } from '../../auth/api-key';
+import { requireGatewayKey, keyAllowedForTarget } from '../../auth/api-key';
+import { resolveRequestedModel } from '../../routing/resolver';
 import { resolveClientIp } from '../../util/client-ip';
 import { anthropicToCanonical, type AnthropicRequest } from '../../protocols/anthropic';
 import { GatewayError, toAnthropicError, outcomeError } from '../../errors';
@@ -40,7 +41,7 @@ export async function registerAnthropicRoutes(app: FastifyInstance): Promise<voi
       `POST ${req.url}`,
       ...summarizeHeaders(req.headers as Record<string, unknown>),
     ]);
-    const key = authenticateGatewayHeaders(req);
+    const key = requireGatewayKey(req);
     const body = MessagesBody.parse(req.body);
     logIncomingMessagesBody(requestId, body);
     const ar: AnthropicRequest = body as never;
@@ -108,7 +109,9 @@ export async function registerAnthropicRoutes(app: FastifyInstance): Promise<voi
   });
 
   app.post('/v1/messages/count_tokens', async (req, reply) => {
+    const key = requireGatewayKey(req);
     const body = CountTokensBody.parse(req.body);
+    if (!keyAllowedForTarget(key, resolveRequestedModel(body.model))) throw new GatewayError('permission_error', 'Model not permitted for this API key', { status: 403 });
     const ar: AnthropicRequest = body as never;
     const canonical = anthropicToCanonical(ar);
     // Estimate: 1 token per 4 chars, conservative for v1 without provider call.
@@ -118,7 +121,6 @@ export async function registerAnthropicRoutes(app: FastifyInstance): Promise<voi
     reply.send({ input_tokens: inputTokens });
   });
 }
-
 // docs/13 §4–§7: incoming /v1/messages body structure logging.
 function logIncomingMessagesBody(requestId: string, body: Record<string, unknown>): void {
   debugHttp(requestId, 'BODY SUMMARY', [
@@ -145,12 +147,4 @@ function logIncomingMessagesBody(requestId: string, body: Record<string, unknown
       bodySize > LIMIT ? truncate(json, LIMIT) : json,
     ]);
   }
-}
-
-function authenticateGatewayHeaders(req: { headers: Record<string, string | string[] | undefined> }): AuthenticatedKey {
-  const key = authenticateGatewayKey(req);
-  if (!key) throw new GatewayError('authentication_error', 'Missing API key', { status: 401 });
-  if (!key.enabled) throw new GatewayError('authentication_error', 'API key disabled', { status: 401 });
-  if (key.expiresAt && new Date(key.expiresAt).getTime() < Date.now()) throw new GatewayError('authentication_error', 'API key expired', { status: 401 });
-  return key;
 }

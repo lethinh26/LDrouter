@@ -16,6 +16,7 @@ export function parseCidr(input: string): ParsedCidr {
   let prefix: number;
   if (cidr.includes('/')) {
     const parts = cidr.split('/');
+    if (parts.length !== 2 || !/^\d+$/.test(parts[1] ?? '')) throw new Error('invalid cidr prefix');
     base = parts[0]!;
     prefix = Number(parts[1]);
   } else {

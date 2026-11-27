@@ -478,6 +478,112 @@ describe('gateway smoke', () => {
     expect(res.status).toBe(401);
   });
 
+  it.each([
+    { endpoint: 'chat/completions', requested: { max_tokens: 200 }, field: 'max_tokens' },
+    { endpoint: 'chat/completions', requested: { max_completion_tokens: 200 }, field: 'max_completion_tokens' },
+    { endpoint: 'chat/completions', requested: {}, field: 'max_tokens' },
+    { endpoint: 'responses', requested: { max_output_tokens: 200, input: 'hi' }, field: 'max_completion_tokens' },
+    { endpoint: 'messages', requested: { max_tokens: 200 }, field: 'max_tokens' },
+  ])('API key output cap applies to $endpoint ($requested)', async ({ endpoint, requested, field }) => {
+    const { reset, pushHandler } = await import('./_mock-control.js');
+    reset();
+    const created = await fetch(`${baseUrl}/api/admin/api-keys`, {
+      method: 'POST', headers: { 'content-type': 'application/json', cookie: csrfCookies },
+      body: JSON.stringify({ name: 'output-cap', allowAllModels: true, maxOutputTokensPerRequest: 4 }),
+    });
+    expect(created.status).toBe(200);
+    const { id, secret } = await created.json() as { id: string; secret: string };
+    let outgoing: Record<string, unknown> | undefined;
+    pushHandler((_req, res, body) => {
+      outgoing = JSON.parse(body);
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({
+        id: 'cmpl-cap', object: 'chat.completion', created: 0, model: 'gpt-mock',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14 },
+      }));
+    });
+    const result = await fetch(`${baseUrl}/v1/${endpoint}`, {
+      method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${secret}` },
+      body: JSON.stringify({ model: 'mock/gpt-mock', messages: [{ role: 'user', content: 'hi' }], ...requested }),
+    });
+    expect(result.status, await result.text()).toBe(200);
+    expect(outgoing?.[field]).toBe(4);
+    const detail = await fetch(`${baseUrl}/api/admin/api-keys/${id}`, { headers: { cookie: csrfCookies } });
+    expect((await detail.json()).apiKey.totalTokensUsed).toBe(14);
+  });
+
+  it('API key lifetime quota includes past months and denies further upstream calls when exhausted', async () => {
+    const { reset, pushHandler } = await import('./_mock-control.js');
+    reset();
+    const created = await fetch(`${baseUrl}/api/admin/api-keys`, {
+      method: 'POST', headers: { 'content-type': 'application/json', cookie: csrfCookies },
+      body: JSON.stringify({ name: 'lifetime-cap', allowAllModels: true, maxOutputTokensPerRequest: 4, totalTokenLimit: 150 }),
+    });
+    expect(created.status).toBe(200);
+    const { id, secret } = await created.json() as { id: string; secret: string };
+    const { getDb, schema } = await import('../../src/server/db/index');
+    getDb().insert(schema.usageMonthly).values({ month: '2000-01', apiKeyId: id, inputTokens: 80, outputTokens: 20, totalTokens: 100 }).run();
+    let calls = 0;
+    pushHandler((_req, res) => {
+      calls++;
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({
+        id: 'cmpl-quota', object: 'chat.completion', created: 0, model: 'gpt-mock',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 46, completion_tokens: 4, total_tokens: 50 },
+      }));
+    });
+    const request = () => fetch(`${baseUrl}/v1/chat/completions`, {
+      method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${secret}` },
+      body: JSON.stringify({ model: 'mock/gpt-mock', messages: [{ role: 'user', content: 'hi' }], max_tokens: 4 }),
+    });
+    const first = await request();
+    expect(first.status, await first.text()).toBe(200);
+    const second = await request();
+    expect(second.status).toBe(429);
+    expect(await second.text()).toContain('Quota exceeded (total)');
+    expect(calls).toBe(1);
+    const denied = getDb().select().from(schema.requests).where(eq(schema.requests.apiKeyId, id)).all().find((row) => row.httpStatus === 429);
+    expect(denied).toMatchObject({ attemptsCount: 0, errorType: 'rate_limit_error', totalTokens: 0 });
+    const detail = await fetch(`${baseUrl}/api/admin/api-keys/${id}`, { headers: { cookie: csrfCookies } });
+    expect((await detail.json()).apiKey.totalTokensUsed).toBe(150);
+  });
+
+  it('API key alias-only permission allows the alias without granting its physical model', async () => {
+    const { getDb, schema } = await import('../../src/server/db/index');
+    const { uuid } = await import('../../src/server/auth/ids');
+    const { reset, pushHandler } = await import('./_mock-control.js');
+    reset();
+    const model = getDb().select().from(schema.models).where(eq(schema.models.publicModelId, 'mock/gpt-mock')).get()!;
+    const aliasId = uuid();
+    getDb().insert(schema.modelAliases).values({ id: aliasId, alias: 'key-only-alias', targetKind: 'model', targetId: model.id, enabled: true }).run();
+    const created = await fetch(`${baseUrl}/api/admin/api-keys`, {
+      method: 'POST', headers: { 'content-type': 'application/json', cookie: csrfCookies },
+      body: JSON.stringify({ name: 'alias-key', permissions: [{ targetKind: 'alias', targetId: aliasId }] }),
+    });
+    expect(created.status).toBe(200);
+    const { secret } = await created.json() as { secret: string };
+    const headers = { 'content-type': 'application/json', authorization: `Bearer ${secret}` };
+    const list = await fetch(`${baseUrl}/v1/models`, { headers });
+    expect((await list.json()).data.map((m: { id: string }) => m.id)).toEqual(['key-only-alias']);
+    const request = (model: string, endpoint = 'chat/completions') => fetch(`${baseUrl}/v1/${endpoint}`, {
+      method: 'POST', headers, body: JSON.stringify({ model, messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    expect((await request('mock/gpt-mock')).status).toBe(403);
+    expect((await request('mock/gpt-mock', 'messages/count_tokens')).status).toBe(403);
+    expect((await request('key-only-alias', 'messages/count_tokens')).status).toBe(200);
+    pushHandler((_req, res) => {
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({
+        id: 'cmpl-alias', object: 'chat.completion', created: 0, model: 'gpt-mock',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 5, completion_tokens: 1, total_tokens: 6 },
+      }));
+    });
+    expect((await request('key-only-alias')).status).toBe(200);
+  });
+
   it('custom key WITHOUT ld- prefix authenticates successfully', async () => {
     const customSecret = 'my-custom-key-without-prefix-123456';
     const createRes = await fetch(`${baseUrl}/api/admin/api-keys`, {

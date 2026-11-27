@@ -27,6 +27,7 @@ export interface CanonicalRequest {
   temperature?: number;
   topP?: number;
   maxOutputTokens?: number;
+  outputTokenParameter?: 'max_tokens' | 'max_completion_tokens';
   stop?: string[];
   stream: boolean;
   /** OpenAI-compatible upstreams only report `usage` on a streamed answer when

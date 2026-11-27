@@ -1,6 +1,6 @@
 // Gateway execution pipeline: auth -> resolve -> ACL -> limits -> route -> attempt -> persist.
 
-import { getDb, getRawDb, schema } from '../db/index';
+import { getDb, getRawDb, getDatabaseEpoch, schema } from '../db/index';
 import { desc, eq } from 'drizzle-orm';
 import { GatewayError, clientDisconnectedError } from '../errors';
 import { resolveRequestedModel, unwrapAlias } from '../routing/resolver';
@@ -9,9 +9,9 @@ import { loadCombo, selectCandidates, orderCandidates, shouldFallback, type Comb
 import { classifyWorkload, pickAdaptiveCandidate, type AdaptiveDecision } from '../routing/combo-policy';
 import { beginAdaptiveAttempt, listAdaptiveStates, claimAdaptiveProbe, claimAdaptiveExploration, recordAdaptiveOutcome, releaseAdaptiveProbe } from '../routing/combo-adaptive-state';
 import { claimCircuitAttempt, releaseCircuitAttempt, recordSuccess, recordFailure, recordThrottle, recordModelThrottle, modelThrottleBlocks, circuitBlocks } from '../routing/circuit';
-import { checkRpm, checkTpm, acquireConcurrent, releaseConcurrent } from '../routing/ratelimit';
-import { checkDailyMonthly, consumeUsage } from '../routing/quota';
-import { keyAllowedFor, type AuthenticatedKey } from '../auth/api-key';
+import { checkRpm, checkTpm, acquireConcurrent, releaseConcurrent, reconcileTpm } from '../routing/ratelimit';
+import { reserveQuota, consumeUsage, type QuotaReservation } from '../routing/quota';
+import { keyAllowedForTarget, keyIpAllowed, keyIsActive, type AuthenticatedKey } from '../auth/api-key';
 import { providerToUpstreamConfig, callUpstreamNonStreaming, callUpstreamStreaming, upstreamUrl, upstreamHttpError, retryAfterMs, type UpstreamCall } from '../upstream/client';
 import { canonicalToOpenAIRequest, openAIResponseToCanonical, extractAssistantText, tokenCount } from '../protocols/canonical';
 import { canonicalToAnthropicRequest, anthropicResponseToCanonical } from '../protocols/anthropic';
@@ -124,6 +124,17 @@ export class GatewayRunner {
     const start = Date.now();
     const startMono = performance.now();
     let concurrencyAcquired = false;
+    let quotaReservation: QuotaReservation | undefined;
+    const databaseEpoch = getDatabaseEpoch();
+    let estimatedInput = 0;
+    let estimatedOutput = 0;
+    let tpmReserved = 0;
+    let quotaInput = 0;
+    let quotaOutput = 0;
+    const accountQuota = (reported: UsageSummary, generated: boolean, anthropic = false) => {
+      quotaInput += reported.input + (anthropic ? reported.cacheRead + reported.cacheWrite : 0) || (generated ? estimatedInput : 0);
+      quotaOutput += reported.output || (generated ? estimatedOutput : 0);
+    };
 
     const usage: UsageSummary = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, total: 0 };
     const attempts: AttemptOutcome[] = [];
@@ -143,13 +154,21 @@ export class GatewayRunner {
     }
 
     // --- ACL check ---
-    if (ctx.key) {
-      if (resolved.kind === 'model') {
-        if (!keyAllowedFor(ctx.key, 'model', resolved.modelId)) throw new GatewayError('permission_error', 'Model not permitted for this API key', { status: 403 });
-      } else if (resolved.kind === 'combo') {
-        if (!keyAllowedFor(ctx.key, 'combo', resolved.comboId)) throw new GatewayError('permission_error', 'Combo not permitted for this API key', { status: 403 });
-      }
-    }
+    if (ctx.key && !keyAllowedForTarget(ctx.key, target)) throw new GatewayError('permission_error', 'Model not permitted for this API key', { status: 403 });
+
+    const rejectLimit = async (error: GatewayError): Promise<never> => {
+      const outcome: GatewayOutcome = {
+        success: false, httpStatus: error.status, errorType: error.type,
+        errorMessage: error.message, errorCode: error.code, text: null, toolCalls: null,
+        finishReason: null, usage, ttftMs: null, latencyMs: Math.round(performance.now() - startMono),
+        attempts, finalModelId: null, resolvedTargetKind: resolved.kind,
+        resolvedTargetId: this.resolvedId(resolved), gatewayCacheHit: false, streamEvents: null,
+      };
+      await this.persistRequest(req, ctx, resolved, outcome, usage, attempts, false);
+      metrics.requestsTotal.inc({ protocol: req.protocol, status: String(error.status) });
+      metrics.requestDuration.observe(outcome.latencyMs, { protocol: req.protocol });
+      throw error;
+    };
 
     // --- Limits: RPM / TPM / concurrency / quota ---
     if (ctx.key) {
@@ -157,28 +176,42 @@ export class GatewayRunner {
       if (!rpm.allowed) {
         metrics.rateLimited.inc({ reason: 'rpm' });
         const err = new GatewayError('rate_limit_error', 'Rate limit exceeded (RPM)', { status: 429, code: 'rpm_limit' });
-        (err as { retryAfter?: number }).retryAfter = rpm.retryAfterSeconds;
-        throw err;
+        if (rpm.retryAfterSeconds && typeof ctx.reply.header === 'function') ctx.reply.header('retry-after', String(rpm.retryAfterSeconds));
+        return rejectLimit(err);
       }
-      // Estimate input tokens for TPM: conservative approximation (4 chars/token)
-      const estimatedInput = estimateTokens(JSON.stringify(req.canonical.messages));
-      const tpm = checkTpm(ctx.key.id, ctx.key.tpmLimit, estimatedInput + (req.canonical.maxOutputTokens ?? 1024));
-      if (!tpm.allowed) {
-        metrics.rateLimited.inc({ reason: 'tpm' });
-        const err = new GatewayError('rate_limit_error', 'Rate limit exceeded (TPM)', { status: 429, code: 'tpm_limit' });
-        (err as { retryAfter?: number }).retryAfter = tpm.retryAfterSeconds;
-        throw err;
+      // Apply the cap before caching, admission and conversion to either upstream
+      // protocol. A finite token budget must also bound an omitted output limit.
+      estimatedInput = estimateTokens(JSON.stringify({ messages: req.canonical.messages, system: req.canonical.system, tools: req.canonical.tools, responseFormat: req.canonical.responseFormat }));
+      const outputCap = ctx.key.maxOutputTokensPerRequest ?? Infinity;
+      estimatedOutput = Math.min(req.canonical.maxOutputTokens ?? 1024, outputCap);
+      if (req.canonical.maxOutputTokens !== undefined || [ctx.key.maxOutputTokensPerRequest, ctx.key.tpmLimit, ctx.key.dailyTokenLimit, ctx.key.monthlyTokenLimit, ctx.key.totalTokenLimit].some((limit) => limit != null)) {
+        req = { ...req, canonical: { ...req.canonical, maxOutputTokens: estimatedOutput } };
       }
-      const quota = checkDailyMonthly(ctx.key.id, ctx.key.dailyTokenLimit, ctx.key.monthlyTokenLimit, estimatedInput + (req.canonical.maxOutputTokens ?? 1024));
-      if (!quota.allowed) {
-        metrics.rateLimited.inc({ reason: quota.reason ?? 'quota' });
-        throw new GatewayError('rate_limit_error', `Quota exceeded (${quota.reason})`, { status: 429, code: 'quota_limit' });
+      if (req.canonical.reasoning?.budgetTokens && req.canonical.maxOutputTokens !== undefined && req.canonical.reasoning.budgetTokens >= req.canonical.maxOutputTokens) {
+        throw new GatewayError('invalid_request_error', 'Thinking budget must be smaller than the effective output token limit', { status: 400 });
       }
+      const estimate = estimatedInput + estimatedOutput;
+      const quota = reserveQuota(ctx.key.id, ctx.key, estimate);
+      if (!quota.result.allowed) {
+        metrics.rateLimited.inc({ reason: quota.result.reason ?? 'quota' });
+        return rejectLimit(new GatewayError('rate_limit_error', `Quota exceeded (${quota.result.reason})`, { status: 429, code: 'quota_limit' }));
+      }
+      quotaReservation = quota.reservation;
       if (!acquireConcurrent(ctx.key.id, ctx.key.maxConcurrent)) {
+        quotaReservation?.release();
         metrics.rateLimited.inc({ reason: 'concurrency' });
-        throw new GatewayError('rate_limit_error', 'Too many concurrent requests', { status: 429, code: 'concurrency_limit' });
+        return rejectLimit(new GatewayError('rate_limit_error', 'Too many concurrent requests', { status: 429, code: 'concurrency_limit' }));
       }
       concurrencyAcquired = true;
+      const tpm = checkTpm(ctx.key.id, ctx.key.tpmLimit, estimate);
+      if (!tpm.allowed) {
+        quotaReservation?.release();
+        releaseConcurrent(ctx.key.id);
+        metrics.rateLimited.inc({ reason: 'tpm' });
+        if (tpm.retryAfterSeconds && typeof ctx.reply.header === 'function') ctx.reply.header('retry-after', String(tpm.retryAfterSeconds));
+        return rejectLimit(new GatewayError('rate_limit_error', 'Rate limit exceeded (TPM)', { status: 429, code: 'tpm_limit' }));
+      }
+      tpmReserved = estimate;
     }
 
     metrics.activeRequests.inc();
@@ -296,6 +329,17 @@ export class GatewayRunner {
             // Evict that stale entry so the live provider can retry/fallback normally.
             getDb().delete(schema.responseCache).where(eq(schema.responseCache.cacheKey, cacheKey)).run();
           } else {
+            if (ctx.key) {
+              const cachedInput = g.usage.input || estimatedInput;
+              const cachedOutput = g.usage.output || estimatedOutput;
+              const quota = quotaReservation?.resize(ctx.key, cachedInput + cachedOutput);
+              if (quota && !quota.allowed) {
+                metrics.rateLimited.inc({ reason: quota.reason ?? 'quota' });
+                return await rejectLimit(new GatewayError('rate_limit_error', `Quota exceeded (${quota.reason})`, { status: 429, code: 'quota_limit' }));
+              }
+              quotaInput = cachedInput;
+              quotaOutput = cachedOutput;
+            }
             metrics.cacheHits.inc();
             await this.persistRequest(req, ctx, resolved, g, usageFromCache(cached.usage), attempts, true);
             return g;
@@ -355,10 +399,31 @@ export class GatewayRunner {
         }
         if (ctx.key) {
           const currentKey = getDb().select().from(schema.apiKeys).where(eq(schema.apiKeys.id, ctx.key.id)).get();
-          if (!currentKey || !currentKey.enabled || (currentKey.expiresAt && Date.parse(currentKey.expiresAt) <= Date.now())
-            || !keyAllowedFor({ ...ctx.key, allowAllModels: currentKey.allowAllModels }, resolved.kind, this.resolvedId(resolved))) {
+          const currentAlias = target.kind === 'alias' ? getDb().select().from(schema.modelAliases).where(eq(schema.modelAliases.id, target.aliasId)).get() : null;
+          if (!currentKey || !keyIsActive(currentKey) || !keyIpAllowed(ctx.key.id, ctx.clientIp)
+            || (target.kind === 'alias' && (!currentAlias?.enabled || currentAlias.targetKind !== resolved.kind || currentAlias.targetId !== this.resolvedId(resolved)))
+            || !keyAllowedForTarget({ ...ctx.key, allowAllModels: currentKey.allowAllModels }, target)) {
             lastError = new GatewayError('permission_error', 'Model no longer permitted for this API key', { status: 403 });
             break;
+          }
+          // A retry/fallback is another upstream attempt. Include already spent
+          // tokens in its reservation so known failed usage cannot bypass quota.
+          const requiredTokens = quotaInput + quotaOutput + estimatedInput + estimatedOutput;
+          const quota = quotaReservation?.resize(currentKey, requiredTokens);
+          if (quota && !quota.allowed) {
+            metrics.rateLimited.inc({ reason: quota.reason ?? 'quota' });
+            lastError = new GatewayError('rate_limit_error', `Quota exceeded (${quota.reason})`, { status: 429, code: 'quota_limit' });
+            break;
+          }
+          if (requiredTokens > tpmReserved) {
+            const extra = checkTpm(ctx.key.id, ctx.key.tpmLimit, requiredTokens - tpmReserved);
+            if (!extra.allowed) {
+              metrics.rateLimited.inc({ reason: 'tpm' });
+              lastError = new GatewayError('rate_limit_error', 'Rate limit exceeded (TPM)', { status: 429, code: 'tpm_limit' });
+              if (extra.retryAfterSeconds && typeof ctx.reply.header === 'function') ctx.reply.header('retry-after', String(extra.retryAfterSeconds));
+              break;
+            }
+            tpmReserved = requiredTokens;
           }
         }
         const afterRefresh = abortError();
@@ -548,6 +613,7 @@ export class GatewayRunner {
           usage.cacheWrite += out.usage.cacheWrite;
           usage.reasoning += out.usage.reasoning;
           usage.total += out.usage.total;
+          if (ctx.key) accountQuota(out.usage, true, cfg.type === 'anthropic');
           resultText = out.result.text;
           resultToolCalls = out.result.toolCalls;
           resultFinishReason = out.result.finishReason;
@@ -606,6 +672,7 @@ export class GatewayRunner {
             usage.reasoning += normalizedFailedUsage.reasoning;
             usage.total += normalizedFailedUsage.total;
           }
+          if (ctx.key) accountQuota(attempt.usage, attempt.streamStarted, cfg.type === 'anthropic');
           if (isUpstreamHealthFailure(err) && recordFailure(provider.id, provider.cbFailureThreshold, provider.cbCooldownSeconds, circuitPermit)) {
             try {
               getDb().update(schema.providers).set({ healthState: 'down', updatedAt: new Date().toISOString() }).where(eq(schema.providers.id, provider.id)).run();
@@ -729,14 +796,20 @@ export class GatewayRunner {
       metrics.tokensCacheRead.inc({ protocol: req.protocol }, usage.cacheRead);
       metrics.tokensCacheWrite.inc({ protocol: req.protocol }, usage.cacheWrite);
       metrics.tokensReasoning.inc({ protocol: req.protocol }, usage.reasoning);
-      if (ctx.key) consumeUsage(ctx.key.id, usage.input, usage.output);
-
       return outcome;
     } finally {
       if (deadlineTimer) clearTimeout(deadlineTimer);
       detachDownstream?.();
-      if (concurrencyAcquired && ctx.key) releaseConcurrent(ctx.key.id);
-      metrics.activeRequests.dec();
+      try {
+        if (ctx.key && databaseEpoch === getDatabaseEpoch()) {
+          consumeUsage(ctx.key.id, quotaInput, quotaOutput);
+          reconcileTpm(ctx.key.id, ctx.key.tpmLimit, tpmReserved, quotaInput + quotaOutput);
+        }
+      } finally {
+        quotaReservation?.release();
+        if (concurrencyAcquired && ctx.key) releaseConcurrent(ctx.key.id);
+        metrics.activeRequests.dec();
+      }
     }
   }
 

@@ -310,6 +310,7 @@ export const apiKeys = sqliteTable(
     tpmLimit: integer('tpm_limit'),
     dailyTokenLimit: integer('daily_token_limit'),
     monthlyTokenLimit: integer('monthly_token_limit'),
+    totalTokenLimit: integer('total_token_limit'),
     maxConcurrent: integer('max_concurrent'),
     maxOutputTokensPerRequest: integer('max_output_tokens_per_request'),
     allowAllModels: integer('allow_all_models', { mode: 'boolean' }).notNull().notNull().default(false),
@@ -537,6 +538,7 @@ export const usageMonthly = sqliteTable(
   },
   (t) => ({
     pk: uniqueIndex('uniq_usage_month_key').on(t.month, t.apiKeyId),
+    keyIdx: index('idx_usage_month_key').on(t.apiKeyId),
   })
 );
 

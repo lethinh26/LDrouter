@@ -31,4 +31,8 @@ describe('parseCidr', () => {
     expect(ipMatchesAny('10.0.0.5', ['192.168.0.0/16', '10.0.0.0/8'])).toBe(true);
     expect(ipMatchesAny('8.8.8.8', ['192.168.0.0/16', '10.0.0.0/8'])).toBe(false);
   });
+
+  it.each(['127.0.0.1/nope', '127.0.0.1/', '127.0.0.1/1/2', '127.0.0.1/1.5', '2001:db8::/129'])('rejects malformed CIDR %s', (value) => {
+    expect(() => parseCidr(value)).toThrow();
+  });
 });
