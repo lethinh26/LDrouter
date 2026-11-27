@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
-export const CURRENT_SCHEMA_VERSION = 16;
+export const CURRENT_SCHEMA_VERSION = 17;
 
 interface MigrationFile {
   version: number;
@@ -47,6 +47,7 @@ export function runMigrations(raw: Database.Database, log: Logger, migrationsDir
   // Verify a claimed 0014 before any subsequent migration can change its DB.
   if (latest >= 14 && applied.includes(14)) assertRetiredProvidersRemoved(raw, parsed[13]!);
   if (latest >= 15 && applied.includes(15)) assertAdaptiveSchema(raw);
+  if (latest >= 17 && applied.includes(17)) assertIntegrationSchema(raw, parsed[16]!);
 
   for (const migration of parsed.slice(applied.length)) {
     log.info({ version: migration.version, name: migration.name }, 'applying migration');
@@ -65,6 +66,7 @@ export function runMigrations(raw: Database.Database, log: Logger, migrationsDir
           throw new Error('Database migration produced invalid adaptive foreign keys');
         }
       }
+      if (migration.version === 17) assertIntegrationSchema(raw, migration);
       raw.prepare('INSERT INTO schema_migrations (version, name) VALUES (?, ?)').run(migration.version, migration.name);
     });
     tx.immediate();
@@ -74,6 +76,21 @@ export function runMigrations(raw: Database.Database, log: Logger, migrationsDir
     ensureSettingsRow(raw, log);
     raw.prepare('UPDATE app_settings SET schema_version = ? WHERE id = 1').run(latest);
   })();
+}
+
+function assertIntegrationSchema(raw: Database.Database, migration: MigrationFile): void {
+  const expected = migration.sql.match(/^CREATE TABLE provider_integrations \([\s\S]*?^\);/m)?.[0];
+  const actual = raw.prepare("SELECT sql FROM sqlite_schema WHERE type='table' AND name='provider_integrations'").get() as { sql: string } | undefined;
+  const normalize = (ddl: string) => ddl.replace(/\r\n/g, '\n').replace(/;$/, '');
+  if (!expected || !actual?.sql || normalize(expected) !== normalize(actual.sql) ||
+      raw.prepare('PRAGMA foreign_key_check(provider_integrations)').all().length > 0 ||
+      raw.prepare(`SELECT 1 FROM provider_integrations i JOIN providers p ON p.id=i.provider_id
+        WHERE NOT ((i.provider_kind='codex' AND i.auth_mode='client_oauth' AND p.type='openai'
+          AND p.base_url='https://api.openai.com' AND p.encrypted_api_key IS NULL AND p.api_key_nonce IS NULL
+          AND p.custom_headers_encrypted IS NULL AND p.custom_headers_nonce IS NULL)
+          OR (i.provider_kind='claude_code' AND i.auth_mode='api_key' AND p.type='anthropic')) LIMIT 1`).get()) {
+    throw new Error('Database schema is inconsistent with provider integration migration (0017)');
+  }
 }
 
 function assertAdaptiveSchema(raw: Database.Database): void {

@@ -106,9 +106,11 @@ describe('retired provider migration 0014', () => {
     const db = new Database(':memory:');
     try {
       runMigrations(db,MIGRATION_LOG,MIGRATIONS_DIR,CURRENT_SCHEMA_VERSION);
-      db.exec("INSERT INTO schema_migrations(version,name) VALUES (16,'future'); UPDATE app_settings SET schema_version=16");
+      const future = CURRENT_SCHEMA_VERSION + 1;
+      db.prepare("INSERT INTO schema_migrations(version,name) VALUES (?,'future')").run(future);
+      db.prepare('UPDATE app_settings SET schema_version=?').run(future);
       expect(() => runMigrations(db,MIGRATION_LOG,MIGRATIONS_DIR,CURRENT_SCHEMA_VERSION)).toThrow(/newer/);
-      expect(db.prepare('SELECT schema_version FROM app_settings').get()).toEqual({schema_version:16});
+      expect(db.prepare('SELECT schema_version FROM app_settings').get()).toEqual({schema_version:future});
     } finally { db.close(); }
   });
 

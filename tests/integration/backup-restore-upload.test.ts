@@ -471,7 +471,7 @@ describe('streamed multipart restore', () => {
       expect(result.status, JSON.stringify(result.json)).toBe(200);
       const db = getRawDb();
       expect(db).not.toBe(before);
-      expect(db.prepare('SELECT schema_version FROM app_settings').get()).toEqual({schema_version:16});
+      expect(db.prepare('SELECT schema_version FROM app_settings').get()).toEqual({schema_version:17});
       expect(db.prepare("SELECT name FROM pragma_table_info('api_keys') WHERE name='total_token_limit'").get()).toEqual({name:'total_token_limit'});
       expect(db.prepare("SELECT name FROM sqlite_schema WHERE name='combo_member_slow_states'").get()).toBeUndefined();
       expect(db.prepare('SELECT * FROM combo_adaptive_states').all()).toEqual([]);

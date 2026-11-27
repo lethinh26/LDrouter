@@ -137,6 +137,14 @@ export const providers = sqliteTable(
 // Models
 // ============================================================================
 
+// Compatible providers have no integration row. Keep protocol and credentials
+// in providers; the integration is keyed exclusively by the provider UUID.
+export const providerIntegrations = sqliteTable('provider_integrations', {
+  providerId: text('provider_id').primaryKey().notNull().references(() => providers.id, { onDelete: 'cascade' }),
+  providerKind: text('provider_kind', { enum: ['codex', 'claude_code'] }).notNull(),
+  authMode: text('auth_mode', { enum: ['api_key', 'client_oauth'] }).notNull(),
+});
+
 export const models = sqliteTable(
   'models',
   {
