@@ -55,7 +55,9 @@ env_http_headers = { "X-API-Key" = "LATEDEV_API_KEY" }
 ```
 
 Use TLS for remote access. Native HTTP Responses streaming preserves tool and
-item IDs; use replayed input with `store=false`. Server-side continuation,
+item IDs; use replayed input with `store=false`. Stored conversation and item
+references are rejected; explicitly disabled model capabilities (tools, images,
+audio and structured output) are enforced before dispatch. Server-side continuation,
 WebSocket transport, background requests, account pooling and cross-provider
 combo fallback are not supported. Catalogs are filtered to gateway ACLs and
 are not shared between accounts. Native payloads are excluded from content
@@ -136,3 +138,20 @@ use the upstream `count_tokens` API; existing compatible/combo count requests
 retain their local estimate. Native Claude responses are not replayed from the
 gateway response cache. Features requiring different upstream protocols or
 additional endpoints have not been certified with the live Claude Code client.
+
+## Qualification
+
+The CI native-client smoke uses pinned official CLI binaries in a disposable
+Linux network/PID namespace with only loopback, fresh client homes, synthetic
+credentials and a test-only upstream fixture. It exercises the built gateway
+over HTTP, catalog filtering, native response completion and accounting. Codex
+uses a fixture environment-key provider, not a fabricated ChatGPT sign-in.
+This test does not establish real account eligibility or OAuth compatibility.
+
+For an authorized live pilot, use the supported client sign-in or API-key
+configuration above, one explicitly scoped gateway key and a disposable
+working directory. Verify the selected model, incremental SSE completion,
+tool-call/result loop, follow-up turn, revocation and reported usage. Record
+only the client version, gateway request ID, target, status and sanitized
+diagnostics. Never collect or export the user's authentication files. The
+pilot requires a provider-authorized account and is separate from CI.

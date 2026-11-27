@@ -4,6 +4,7 @@ import { CODEX_API_PATH, CODEX_ORIGIN } from '../providers/integration';
 import { tokenCount } from '../protocols/canonical';
 import { callUpstreamStreaming, type UpstreamConfig } from '../upstream/client';
 import type { GatewayContext, UsageSummary } from './runner';
+import type { RequiredCapabilities } from '../routing/capabilities';
 
 type Json = Record<string, unknown>;
 const record = (value: unknown): Json => value && typeof value === 'object' && !Array.isArray(value) ? value as Json : {};
@@ -31,9 +32,42 @@ function validFunctionArguments(value: unknown): value is string {
 }
 
 export function validateCodexRequest(body: Json): void {
-  if (body.stream !== true || !Array.isArray(body.input) || body.store === true || body.previous_response_id != null || body.max_output_tokens != null || body.background === true) {
-    throw new GatewayError('invalid_request_error', 'Codex HTTP requires stream=true, replayed input, store=false, and no previous_response_id, background or max_output_tokens', { status: 400, code: 'unsupported_codex_request' });
+  if (body.stream !== true || !Array.isArray(body.input) || body.store === true || body.previous_response_id != null || body.conversation != null || body.max_output_tokens != null || body.background === true || body.input.some(item => record(item).type === 'item_reference')) {
+    throw new GatewayError('invalid_request_error', 'Codex HTTP requires stream=true, replayed input, store=false, and no stored conversation references, background or max_output_tokens', { status: 400, code: 'unsupported_codex_request' });
   }
+}
+
+/** Inspect native Responses features without converting or discarding payload fields. */
+export function nativeCodexRequirements(body: Json): RequiredCapabilities {
+  let tools = Array.isArray(body.tools) && body.tools.length > 0;
+  let imageInput = false;
+  let audioInput = false;
+  for (const entry of Array.isArray(body.input) ? body.input : []) {
+    const item = record(entry);
+    if (typeof item.type === 'string' && /_call(?:_output)?$/.test(item.type)) tools = true;
+    for (const content of Array.isArray(item.content) ? item.content : []) {
+      const type = record(content).type;
+      if (type === 'input_image') imageInput = true;
+      if (type === 'input_audio') audioInput = true;
+    }
+  }
+  const format = record(record(body.text).format).type;
+  return { streaming: true, responses: true, tools, imageInput, audioInput,
+    structuredOutput: format === 'json_schema' || format === 'json_object', reasoning: body.reasoning != null };
+}
+
+function messageText(output: Json): string {
+  if (output.type !== 'message') return '';
+  if ((output.role !== undefined && output.role !== 'assistant') || (output.status !== undefined && output.status !== 'completed')) {
+    throw bad('Invalid Codex terminal message');
+  }
+  let text = '';
+  for (const part of Array.isArray(output.content) ? output.content : []) {
+    const p = record(part);
+    if (p.type === 'output_text' && nonblank(p.text)) text += p.text;
+    if (p.type === 'refusal' && nonblank(p.refusal)) text += p.refusal;
+  }
+  return text;
 }
 
 export function hasCodexTokenCap(key: { tpmLimit: number | null; dailyTokenLimit: number | null; monthlyTokenLimit: number | null; totalTokenLimit: number | null; maxOutputTokensPerRequest: number | null }): boolean {
@@ -93,17 +127,18 @@ export async function runCodexStreaming(
       }
       const item = record(obj.item);
       let commitOutput = (outputDeltas.has(type) && typeof obj.delta === 'string' && obj.delta.length > 0) ||
-        (type === 'response.output_item.added' && isToolCall(item));
+        (type === 'response.output_item.added' && isToolCall(item)) ||
+        (type === 'response.output_text.done' && nonblank(obj.text)) ||
+        (type === 'response.refusal.done' && nonblank(obj.refusal)) ||
+        (type === 'response.function_call_arguments.done' && nonblank(obj.arguments)) ||
+        (type === 'response.custom_tool_call_input.done' && typeof obj.input === 'string') ||
+        (type === 'response.output_item.done' && (isToolCall(item) || Boolean(messageText(item))));
       if (type === 'response.completed') {
         if (response.status !== 'completed' || !Array.isArray(response.output)) throw bad('Invalid Codex completion');
         for (const entry of response.output) {
           const output = record(entry);
-          if (output.type === 'message' && Array.isArray(output.content)) {
-            for (const part of output.content) {
-              const p = record(part);
-              if (p.type === 'output_text' && nonblank(p.text)) text += p.text;
-              if (p.type === 'refusal' && nonblank(p.refusal)) text += p.refusal;
-            }
+          if (output.type === 'message') {
+            text += messageText(output);
           } else if (output.type === 'function_call' || output.type === 'custom_tool_call') {
             const input = output.type === 'function_call' ? output.arguments : output.input;
             if (!isToolCall(output) || (output.status !== undefined && output.status !== 'completed') ||

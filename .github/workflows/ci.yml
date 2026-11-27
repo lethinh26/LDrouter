@@ -18,6 +18,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: pnpm/action-setup@v6 # version from packageManager field
       - uses: actions/setup-node@v7
         with:
@@ -28,9 +30,12 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm test
       - name: Build and verify npm tarball contents
+        id: build
         run: |
           # Run explicit build (no need for prepack hook since we removed it)
           pnpm run build
+          # Resolve the compiled ESM graph before downloading a browser.
+          node --input-type=module -e "await import('./dist/server/app.js')"
           # Capture npm pack output to verify all required files are included
           OUTPUT=$(npm pack --dry-run 2>&1)
           echo "Tarball contents:"
@@ -49,6 +54,14 @@ jobs:
           "$RUNNER_TEMP/ldrouter-e2e/bin/python" -m pip install playwright==1.55.0
           "$RUNNER_TEMP/ldrouter-e2e/bin/python" -m playwright install --with-deps chromium
           "$RUNNER_TEMP/ldrouter-e2e/bin/python" tests/e2e/adaptive_combo_smoke.py
+      - name: Native client CLI smoke (network-isolated fixtures)
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 8
+        run: |
+          PREFIX="$RUNNER_TEMP/ldrouter-cli-fixture"
+          mkdir -p "$PREFIX/home"
+          env -i HOME="$PREFIX/home" PATH="$PATH" npm install --prefix "$PREFIX" --no-save --no-package-lock --no-audit --no-fund --registry=https://registry.npmjs.org @openai/codex@0.172.0 @anthropic-ai/claude-code@2.1.326
+          bash tests/e2e/client_cli_smoke.sh "$PREFIX"
 
   docker-smoke:
     runs-on: ubuntu-latest

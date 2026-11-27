@@ -1,6 +1,6 @@
 // Shared namespace checks for the exact names accepted by the gateway resolver.
 import { eq, sql } from 'drizzle-orm';
-import { getDb, schema } from '../db';
+import { getDb, schema } from '../db/index';
 import { GatewayError } from '../errors';
 
 type NamespaceDb = Pick<ReturnType<typeof getDb>, 'select'>;

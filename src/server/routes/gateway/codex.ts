@@ -3,7 +3,7 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { eq } from 'drizzle-orm';
 import { z } from 'zod';
-import { getDb, getDatabaseEpoch, schema } from '../../db';
+import { getDb, getDatabaseEpoch, schema } from '../../db/index';
 import { requireGatewayKey, keyAllowedForTarget, keyIsActive, keyIpAllowed } from '../../auth/api-key';
 import { GatewayError, outcomeError, toOpenAIError } from '../../errors';
 import { resolveClientIp } from '../../util/client-ip';
@@ -33,7 +33,13 @@ function clientAuth(req: FastifyRequest) {
 function catalogTargets(key: ReturnType<typeof requireGatewayKey>) {
   const db = getDb();
   const providers = new Map(db.select().from(schema.providers).all().filter(p => p.enabled && providerIntegration(p).authMode === 'client_oauth').map(p => [p.id, p]));
-  const models = db.select().from(schema.models).all().filter(m => m.enabled && m.upstreamAvailable && providers.has(m.providerId));
+  const models = db.select().from(schema.models).all().filter(m => {
+    if (!m.enabled || !m.upstreamAvailable || !providers.has(m.providerId)) return false;
+    try {
+      const caps = JSON.parse(m.capabilitiesJson);
+      return caps.responses !== false && caps.streaming !== false;
+    } catch { return false; }
+  });
   const modelById = new Map(models.map(m => [m.id, m]));
   const names = models.map(m => ({ name: m.publicModelId, kind: 'model' as const, id: m.id, slugs: [m.upstreamModelId], displayName: m.displayName }));
   const combos = db.select().from(schema.combos).all().filter(c => c.enabled && c.comboKind === 'codex_native');

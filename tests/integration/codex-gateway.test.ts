@@ -120,6 +120,39 @@ describe('native Codex gateway', () => {
     expect((await responses('coding-alias', secret, { max_output_tokens: 50 })).statusCode).toBe(400);
     expect(calls).toHaveLength(0);
   });
+  it.each(['responses', 'streaming'])('hides direct models and aliases with disabled %s capability', async (capability) => {
+    expect((await admin('PATCH', 'models', { id: modelId, capabilities: { [capability]: false } })).statusCode).toBe(200);
+    try {
+      const list = await app.inject({ method: 'GET', url: '/backend-api/codex/models', headers: { authorization, 'x-api-key': secret } });
+      expect(list.statusCode).toBe(200);
+      expect(list.json().models).toEqual([]);
+      expect((await responses()).statusCode).toBe(400);
+      expect(calls).toHaveLength(0);
+    } finally {
+      expect((await admin('PATCH', 'models', { id: modelId, capabilities: { [capability]: true } })).statusCode).toBe(200);
+    }
+  });
+  it.each([
+    { conversation: 'conv_fixture' },
+    { input: [{ type: 'item_reference', id: 'msg_fixture' }] },
+  ])('rejects server-side conversation references before dispatch', async (extra) => {
+    expect((await responses('coding-alias', secret, extra)).statusCode).toBe(400);
+    expect(calls).toHaveLength(0);
+  });
+  it.each([
+    { capability: 'tools', extra: { tools: [{ type: 'function', name: 'fixture_tool', parameters: { type: 'object' } }] } },
+    { capability: 'image_input', extra: { input: [{ type: 'message', role: 'user', content: [{ type: 'input_image', image_url: 'fixture-image' }] }] } },
+    { capability: 'audio_input', extra: { input: [{ type: 'message', role: 'user', content: [{ type: 'input_audio', input_audio: { data: 'fixture', format: 'wav' } }] }] } },
+    { capability: 'structured_output', extra: { text: { format: { type: 'json_schema', name: 'fixture', schema: { type: 'object' } } } } },
+  ])('enforces native $capability requirements without altering the body', async ({ capability, extra }) => {
+    expect((await admin('PATCH', 'models', { id: modelId, capabilities: { [capability]: false } })).statusCode).toBe(200);
+    try {
+      expect((await responses('coding-alias', secret, extra)).statusCode).toBe(400);
+      expect(calls).toHaveLength(0);
+    } finally {
+      expect((await admin('PATCH', 'models', { id: modelId, capabilities: { [capability]: capability === 'tools' ? true : null } })).statusCode).toBe(200);
+    }
+  });
   it('does not expose OAuth models on the compatible endpoint or forward a dual credential there', async () => {
     const list = await app.inject({ method: 'GET', url: '/v1/models', headers: { authorization: `Bearer ${secret}` } });
     expect(list.statusCode).toBe(200); expect(list.body).not.toContain('coding-alias');
@@ -167,6 +200,8 @@ describe('native Codex gateway', () => {
     { label: 'untyped content', output: { type: 'message', id: 'msg_fixture', content: [{ type: 'unknown', text: 'fixture-not-an-answer' }] } },
     { label: 'blank text', output: { type: 'message', id: 'msg_fixture', content: [{ type: 'output_text', text: ' \n' }] } },
     { label: 'blank refusal', output: { type: 'message', id: 'msg_fixture', content: [{ type: 'refusal', refusal: ' ' }] } },
+    { label: 'non-assistant message', output: { type: 'message', role: 'user', status: 'completed', content: [{ type: 'output_text', text: 'fixture-not-an-answer' }] } },
+    { label: 'incomplete message', output: { type: 'message', role: 'assistant', status: 'incomplete', content: [{ type: 'output_text', text: 'fixture-incomplete' }] } },
     { label: 'missing call ID', output: { type: 'function_call', id: 'fc_fixture', call_id: '', name: 'fixture_tool', arguments: '{}' } },
     { label: 'malformed function arguments', output: { type: 'function_call', id: 'fc_fixture', call_id: 'call_fixture', name: 'fixture_tool', arguments: '{' } },
     { label: 'wrong custom tool input type', output: { type: 'custom_tool_call', id: 'ctc_fixture', call_id: 'call_fixture', name: 'fixture_tool', input: { x: 1 } } },
@@ -277,6 +312,16 @@ describe('native Codex combo', () => {
     expect(result.body).not.toContain('usage_limit_reached');
   });
 
+  it('commits a complete native output item before a missing terminal', async () => {
+    nativeEvents = [{ type: 'response.output_item.done', item: { type: 'message', role: 'assistant', status: 'completed', id: 'msg_fixture', content: [{ type: 'output_text', text: 'fixture-answer' }] } }];
+    const result = await responses(comboName, comboSecret);
+    expect(result.statusCode).toBe(200);
+    expect(result.body).toContain('response.output_item.done');
+    expect(result.body).toContain('event: error');
+    expect(result.body).not.toContain('response.completed');
+    expect(calls.map(c => c.body.model)).toEqual([undefined, 'fixture-model']);
+  });
+
   it('does not dispatch or persist an old request after database re-open during catalog discovery', async () => {
     const { closeDb, openDb, getRawDb } = await import('../../src/server/db');
     const file = getRawDb().name;
@@ -326,5 +371,15 @@ describe('native Codex combo', () => {
     expect((await responses(comboName, comboSecret, { input: [{ type: 'reasoning', encrypted_content: 'fixture-opaque-history' }] })).statusCode).toBe(400);
     expect((await responses(comboName, cappedSecret)).statusCode).toBe(400);
     expect(calls).toHaveLength(0);
+  });
+  it('excludes native combo members with explicitly unsupported request capabilities', async () => {
+    expect((await admin('PATCH', 'models', { id: modelId, capabilities: { image_input: false } })).statusCode).toBe(200);
+    try {
+      const result = await responses(comboName, comboSecret, { input: [{ type: 'message', role: 'user', content: [{ type: 'input_image', image_url: 'fixture-image' }] }] });
+      expect(result.statusCode).toBe(200);
+      expect(calls.map(c => c.body.model)).toEqual([undefined, 'fixture-fallback']);
+    } finally {
+      expect((await admin('PATCH', 'models', { id: modelId, capabilities: { image_input: null } })).statusCode).toBe(200);
+    }
   });
 });

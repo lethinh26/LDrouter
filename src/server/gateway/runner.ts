@@ -27,7 +27,7 @@ import { nextRequestCompletionTimestamp } from './request-timestamps';
 import { watchDownstreamDisconnect } from './downstream';
 import { debugHttp, debugBody, debugUpstream, debugStream, errorLine, getDebugFlags } from '../logging/debug';
 import { providerIntegration, CODEX_ORIGIN } from '../providers/integration';
-import { hasCodexTokenCap, runCodexStreaming, validateCodexRequest } from './codex';
+import { hasCodexTokenCap, nativeCodexRequirements, runCodexStreaming, validateCodexRequest } from './codex';
 import { compatibleCodexEntries, fetchCodexCatalog, validateCodexComboHistory } from './codex-catalog';
 
 export interface GatewayContext {
@@ -275,7 +275,7 @@ export class GatewayRunner {
     };
     try {
       // --- Capability requirements ---
-      const required = { ...deriveRequiredCapabilities(req.canonical), ...(req.nativeCodex ? { responses: true } : {}) };
+      const required = req.nativeCodex ? nativeCodexRequirements(req.nativeCodex) : deriveRequiredCapabilities(req.canonical);
       debugHttp(ctx.requestId, 'CAPABILITIES REQUIRED', [
         `tools=${required.tools}`,
         `stream=${required.streaming}`,

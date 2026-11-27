@@ -1,5 +1,5 @@
 import { eq } from 'drizzle-orm';
-import { getDb, schema } from '../db';
+import { getDb, schema } from '../db/index';
 import type { Provider } from '../db/schema';
 import { GatewayError } from '../errors';
 
