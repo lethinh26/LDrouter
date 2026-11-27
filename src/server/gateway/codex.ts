@@ -8,6 +8,27 @@ import type { GatewayContext, UsageSummary } from './runner';
 type Json = Record<string, unknown>;
 const record = (value: unknown): Json => value && typeof value === 'object' && !Array.isArray(value) ? value as Json : {};
 const bad = (message: string) => new GatewayError('upstream_error', message, { status: 502, code: 'upstream_bad_response' });
+const nonblank = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0;
+
+// These native events carry output that makes replay unsafe. Reasoning is
+// visible output too, but only a valid terminal answer or tool call can succeed.
+const outputDeltas = new Set([
+  'response.output_text.delta', 'response.refusal.delta',
+  'response.function_call_arguments.delta', 'response.custom_tool_call_input.delta',
+  'response.reasoning_text.delta', 'response.reasoning_summary_text.delta',
+]);
+
+function isToolCall(item: Json): item is Json & { call_id: string; name: string } {
+  return (item.type === 'function_call' || item.type === 'custom_tool_call') && nonblank(item.call_id) && nonblank(item.name);
+}
+
+function validFunctionArguments(value: unknown): value is string {
+  if (!nonblank(value)) return false;
+  try {
+    const args: unknown = JSON.parse(value);
+    return args !== null && typeof args === 'object' && !Array.isArray(args);
+  } catch { return false; }
+}
 
 export function validateCodexRequest(body: Json): void {
   if (body.stream !== true || !Array.isArray(body.input) || body.store === true || body.previous_response_id != null || body.max_output_tokens != null || body.background === true) {
@@ -35,8 +56,8 @@ export async function runCodexStreaming(
   const payload = { ...body, model: upstreamModel, stream: true, store: false };
   delete (payload as Json).previous_response_id;
   delete (payload as Json).max_output_tokens;
-  const emit = (s: string, generated: boolean) => {
-    if (!committed && !generated) {
+  const emit = (s: string, commitOutput: boolean) => {
+    if (!committed && !commitOutput) {
       preludeBytes += Buffer.byteLength(s);
       if (preludeBytes > 2 * 1024 * 1024) throw bad('Codex metadata exceeds the pre-stream buffer limit');
       pending.push(s);
@@ -68,12 +89,11 @@ export async function runCodexStreaming(
       if (type === 'error' || type === 'response.failed' || type === 'response.incomplete') {
         // Error payloads may contain sensitive provider context. Never reflect raw
         // errors into the logs or synthesize a successful terminal event.
-        if (committed) pipe.write(`event: error\ndata: ${JSON.stringify({ type: 'error', code: 'codex_upstream_failed', message: 'Codex response did not complete' })}\n\n`);
         throw bad('Codex upstream reported an unsuccessful response');
       }
       const item = record(obj.item);
-      let generated = (typeof obj.delta === 'string' && obj.delta.length > 0 && /\.(?:delta)$/.test(type)) ||
-        (type === 'response.output_item.added' && ['function_call', 'custom_tool_call'].includes(String(item.type)));
+      let commitOutput = (outputDeltas.has(type) && typeof obj.delta === 'string' && obj.delta.length > 0) ||
+        (type === 'response.output_item.added' && isToolCall(item));
       if (type === 'response.completed') {
         if (response.status !== 'completed' || !Array.isArray(response.output)) throw bad('Invalid Codex completion');
         for (const entry of response.output) {
@@ -81,28 +101,39 @@ export async function runCodexStreaming(
           if (output.type === 'message' && Array.isArray(output.content)) {
             for (const part of output.content) {
               const p = record(part);
-              if (typeof p.text === 'string') text += p.text;
-              if (typeof p.refusal === 'string') text += p.refusal;
+              if (p.type === 'output_text' && nonblank(p.text)) text += p.text;
+              if (p.type === 'refusal' && nonblank(p.refusal)) text += p.refusal;
             }
-          } else if (['function_call', 'custom_tool_call'].includes(String(output.type)) && typeof output.call_id === 'string' && typeof output.name === 'string') {
-            toolCalls.push({ id: output.call_id, name: output.name, input: output.arguments ?? output.input ?? '' });
+          } else if (output.type === 'function_call' || output.type === 'custom_tool_call') {
+            const input = output.type === 'function_call' ? output.arguments : output.input;
+            if (!isToolCall(output) || (output.status !== undefined && output.status !== 'completed') ||
+                (output.type === 'function_call' ? !validFunctionArguments(input) : typeof input !== 'string')) {
+              throw bad('Invalid Codex terminal tool call');
+            }
+            toolCalls.push({ id: output.call_id, name: output.name, input });
           }
         }
-        generated = Boolean(text || toolCalls.length || committed);
-        if (!generated) throw bad('Codex completed without generated content');
+        // Prior wire commitment cannot certify an otherwise empty completion.
+        if (!text && !toolCalls.length) throw bad('Codex completed without deliverable content');
+        commitOutput = true;
         terminal = true;
       }
       // Preserve native protocol events and response/item identifiers. The
       // only model rewriting is the configured upstream model in the request.
-      emit(`event: ${type}\ndata: ${JSON.stringify(obj)}\n\n`, generated);
-      return generated;
+      emit(`event: ${type}\ndata: ${JSON.stringify(obj)}\n\n`, commitOutput);
+      return commitOutput;
     }, ctx.requestId);
     if (!terminal || !meta.terminalSeen) throw bad('Codex stream ended without response.completed');
     pipe.end();
     return { statusCode: meta.upstreamStatus, ttftMs: meta.ttftMs, upstreamRequestId: meta.upstreamRequestId, usage, result: { text, toolCalls, finishReason: toolCalls.length ? 'tool_calls' : 'stop' } };
   } catch (e) {
-    if (committed && !pipe.writableEnded) pipe.end();
     const error = e instanceof GatewayError ? e : bad('Codex response processing failed');
+    if (committed && !pipe.writableEnded && !pipe.destroyed) {
+      if (!terminal && error.code !== 'client_disconnected') {
+        pipe.write(`event: error\ndata: ${JSON.stringify({ type: 'error', code: 'codex_upstream_failed', message: 'Codex response did not complete' })}\n\n`);
+      }
+      pipe.end();
+    }
     const cause = record(error.cause);
     throw new GatewayError(error.type, error.message, { status: error.status, code: error.code, cause: {
       usage, status: cause.status, upstreamStatus: cause.upstreamStatus, upstreamRequestId: cause.upstreamRequestId, retryAfterMs: cause.retryAfterMs,

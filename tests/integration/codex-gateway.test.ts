@@ -16,6 +16,7 @@ let cookie = '', csrf = '', providerId = '', modelId = '', aliasId = '', keyId =
 let compatibleModel = '';
 let nextStatus = 200;
 let truncated = false;
+let nativeEvents: Record<string, unknown>[] | null = null;
 const calls: { url: string; headers: Headers; body: Record<string, unknown>; redirect?: RequestRedirect }[] = [];
 
 function admin(method: 'POST' | 'PATCH', route: string, payload: unknown) {
@@ -26,6 +27,10 @@ function responses(model = 'coding-alias', token = secret, extra: Record<string,
 }
 function sse(events: Record<string, unknown>[]) {
   return events.map(e => `event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`).join('');
+}
+
+function completed(output: Record<string, unknown>[]) {
+  return { type: 'response.completed', response: { id: 'resp_fixture', status: 'completed', output, usage: { input_tokens: 12, output_tokens: 8, total_tokens: 20, input_tokens_details: { cached_tokens: 3 }, output_tokens_details: { reasoning_tokens: 2 } } } };
 }
 
 beforeAll(async () => {
@@ -43,6 +48,7 @@ beforeAll(async () => {
     calls.push({ url, headers: new Headers(init?.headers), body: JSON.parse(String(init?.body ?? '{}')), redirect: init?.redirect });
     if (url.startsWith(origin + '/models')) return Response.json({ models: [{ slug: 'fixture-model', display_name: 'Fixture', supported_reasoning_levels: ['high'], upgrade: { model: 'hidden' } }, { slug: 'unconfigured' }] });
     if (nextStatus !== 200) return new Response(authorization, { status: nextStatus, headers: { 'retry-after': '120' } });
+    if (nativeEvents) return new Response(sse(nativeEvents), { headers: { 'content-type': 'text/event-stream' } });
     const output = { type: 'function_call', id: 'fc_fixture', call_id: 'call_fixture', name: 'fixture_tool', arguments: '{"x":1}' };
     const events = [{ type: 'response.created', response: { id: 'resp_fixture' } }, { type: 'response.output_item.added', output_index: 0, item: output }, { type: 'response.function_call_arguments.delta', item_id: 'fc_fixture', delta: '{"x":1}' }];
     if (!truncated) events.push({ type: 'response.completed', response: { id: 'resp_fixture', status: 'completed', output: [output], usage: { input_tokens: 12, output_tokens: 8, total_tokens: 20, input_tokens_details: { cached_tokens: 3 }, output_tokens_details: { reasoning_tokens: 2 } } } } as never);
@@ -63,7 +69,7 @@ beforeAll(async () => {
   expect((await admin('POST', 'models/import', { providerId: compatible.json().id, modelIds: ['fixture-model'] })).statusCode).toBe(200);
   compatibleModel = 'compatible/fixture-model';
 });
-beforeEach(() => { calls.length = 0; nextStatus = 200; truncated = false; });
+beforeEach(() => { calls.length = 0; nextStatus = 200; truncated = false; nativeEvents = null; });
 afterAll(async () => { vi.restoreAllMocks(); await app?.close(); (await import('../../src/server/db')).closeDb(); fs.rmSync(dataDir, { recursive: true, force: true }); });
 
 describe('native Codex gateway', () => {
@@ -125,5 +131,74 @@ describe('native Codex gateway', () => {
     truncated = true; const res = await responses();
     expect(res.statusCode).toBe(200); expect(res.body).toContain('response.output_item.added'); expect(res.body).not.toContain('response.completed');
     truncated = false; expect((await responses()).statusCode).toBe(200);
+  });
+
+  it('rejects a native terminal with only an unknown delta before wire commitment', async () => {
+    nativeEvents = [{ type: 'response.unknown.delta', delta: 'fixture-unknown' }, completed([])];
+    const res = await responses();
+    expect(res.statusCode).toBe(502);
+    expect(res.body).not.toContain('fixture-unknown');
+    expect(res.body).not.toContain('response.completed');
+    expect(calls).toHaveLength(1);
+    const { getRawDb } = await import('../../src/server/db');
+    expect(getRawDb().prepare('SELECT success, partial_stream, ttft_ms, input_tokens, output_tokens FROM requests WHERE id=?').get(res.json().error.request_id)).toEqual({ success: 0, partial_stream: 0, ttft_ms: null, input_tokens: 12, output_tokens: 8 });
+  });
+
+  it('rejects a native terminal after a reasoning delta and accounts for the committed failure', async () => {
+    nativeEvents = [{ type: 'response.created', response: { id: 'resp_fixture' } }, { type: 'response.reasoning_summary_text.delta', item_id: 'rs_fixture', delta: 'fixture-reasoning' }, completed([{ type: 'reasoning', id: 'rs_fixture', summary: [{ type: 'summary_text', text: 'fixture-reasoning' }] }])];
+    const res = await responses();
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toContain('rs_fixture');
+    expect(res.body).toContain('event: error');
+    expect(res.body).not.toContain('response.completed');
+    expect(calls).toHaveLength(1);
+    const { getRawDb } = await import('../../src/server/db');
+    const requestId = res.headers['x-request-id'];
+    expect(getRawDb().prepare('SELECT success, partial_stream, ttft_ms, input_tokens, output_tokens, reasoning_tokens, attempts_count FROM requests WHERE id=?').get(requestId)).toEqual({ success: 0, partial_stream: 1, ttft_ms: expect.any(Number), input_tokens: 12, output_tokens: 8, reasoning_tokens: 2, attempts_count: 1 });
+    expect(getRawDb().prepare('SELECT success, stream_started, partial_response, input_tokens, output_tokens FROM request_attempts WHERE request_id=?').get(requestId)).toEqual({ success: 0, stream_started: 1, partial_response: 1, input_tokens: 12, output_tokens: 8 });
+  });
+
+  it.each([
+    { label: 'untyped content', output: { type: 'message', id: 'msg_fixture', content: [{ type: 'unknown', text: 'fixture-not-an-answer' }] } },
+    { label: 'blank text', output: { type: 'message', id: 'msg_fixture', content: [{ type: 'output_text', text: ' \n' }] } },
+    { label: 'blank refusal', output: { type: 'message', id: 'msg_fixture', content: [{ type: 'refusal', refusal: ' ' }] } },
+    { label: 'missing call ID', output: { type: 'function_call', id: 'fc_fixture', call_id: '', name: 'fixture_tool', arguments: '{}' } },
+    { label: 'malformed function arguments', output: { type: 'function_call', id: 'fc_fixture', call_id: 'call_fixture', name: 'fixture_tool', arguments: '{' } },
+    { label: 'wrong custom tool input type', output: { type: 'custom_tool_call', id: 'ctc_fixture', call_id: 'call_fixture', name: 'fixture_tool', input: { x: 1 } } },
+  ])('rejects a native terminal containing $label', async ({ output }) => {
+    nativeEvents = [completed([output])];
+    const res = await responses();
+    expect(res.statusCode).toBe(502);
+    expect(res.body).not.toContain('response.completed');
+    expect(calls).toHaveLength(1);
+  });
+
+  it.each([
+    { label: 'text', output: { type: 'message', id: 'msg_fixture', content: [{ type: 'output_text', text: 'fixture-answer' }] } },
+    { label: 'refusal', output: { type: 'message', id: 'msg_fixture', content: [{ type: 'refusal', refusal: 'fixture-refusal' }] } },
+    { label: 'custom tool call', output: { type: 'custom_tool_call', id: 'ctc_fixture', call_id: 'call_fixture', name: 'fixture_tool', input: 'fixture-tool-input' } },
+  ])('preserves native terminal $label and IDs following reasoning', async ({ output }) => {
+    nativeEvents = [{ type: 'response.reasoning_summary_text.delta', item_id: 'rs_fixture', delta: 'fixture-reasoning' }, completed([output])];
+    const res = await responses();
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toBe(sse(nativeEvents));
+    expect(calls).toHaveLength(1);
+    const { getRawDb } = await import('../../src/server/db');
+    expect(getRawDb().prepare('SELECT success, partial_stream, input_tokens, output_tokens FROM requests WHERE id=?').get(res.headers['x-request-id'])).toEqual({ success: 1, partial_stream: 0, input_tokens: 12, output_tokens: 8 });
+  });
+
+  it('reports an unsuccessful native terminal safely after actual answer output', async () => {
+    nativeEvents = [{ type: 'response.output_text.delta', item_id: 'msg_fixture', delta: 'fixture-answer' }, { type: 'response.failed', response: { id: 'resp_fixture', error: { message: 'fixture-private-upstream-error' }, usage: { input_tokens: 12, output_tokens: 8 } } }];
+    const res = await responses();
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toContain('fixture-answer');
+    expect(res.body).toContain('event: error');
+    expect(res.body).not.toContain('fixture-private-upstream-error');
+    expect(res.body).not.toContain('response.completed');
+    expect(calls).toHaveLength(1);
+    const { getRawDb } = await import('../../src/server/db');
+    const request = getRawDb().prepare('SELECT success, partial_stream, input_tokens, output_tokens, error_message FROM requests WHERE id=?').get(res.headers['x-request-id']);
+    expect(request).toMatchObject({ success: 0, partial_stream: 1, input_tokens: 12, output_tokens: 8 });
+    expect(JSON.stringify(request)).not.toContain('fixture-private-upstream-error');
   });
 });
