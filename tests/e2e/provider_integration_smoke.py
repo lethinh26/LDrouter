@@ -309,7 +309,12 @@ def smoke(base, upstream):
         })
 
         # ACL must distinguish identical upstream IDs in different namespaces.
-        page.goto("/api-keys")
+        navigation = page.goto("/api-keys")
+        assert navigation is not None and navigation.ok
+        assert "text/html" in navigation.headers.get("content-type", "")
+        for path in ("/api/missing-fixture", "/v1/missing-fixture", "/backend-api/codex/missing-fixture"):
+            missing = page.request.get(path)
+            assert missing.status == 404 and "application/json" in missing.headers.get("content-type", "")
         page.get_by_role("button", name="New key").click()
         dialog = page.get_by_role("dialog")
         dialog.get_by_label("Name", exact=True).fill("Provider scoped fixture")

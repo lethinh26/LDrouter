@@ -180,7 +180,9 @@ export async function buildApp(opts: AppOptions = {}): Promise<App> {
   }
 
   app.setNotFoundHandler((req, reply) => {
-    if (req.url.startsWith('/api') || req.url.startsWith('/v1') || req.url.startsWith('/health') || req.url.startsWith('/ready') || req.url.startsWith('/metrics')) {
+    const pathname = req.url.split('?', 1)[0] ?? '';
+    // Match whole API path segments, not UI names such as /api-keys.
+    if (/^\/(?:api|backend-api|v1|health|ready|metrics)(?:\/|$)/.test(pathname)) {
       const e = new GatewayError('invalid_request_error', 'Route not found', { status: 404 });
       reply.code(404).send(toOpenAIError(e, req.id as string));
       return;
