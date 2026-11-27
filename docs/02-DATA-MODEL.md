@@ -87,14 +87,15 @@ Unique constraint on `(provider_id, upstream_model_id)`.
 - `id`
 - `name`
 - `slug` unique
-- `public_model_id` unique, always `combo/<slug>`
+- `public_model_id` unique; normalized name by default or `combo/<slug>` when a slug is explicitly supplied
+- `combo_kind`: immutable `standard` (default) or `codex_native` (migration 0018)
 - `mode`: `fallback`
 - `enabled`
 - `max_total_attempts`
 - `max_request_duration_seconds` (nullable; additional overall combo deadline)
 - fallback-trigger policy
 - `fallback_on_total_timeout` (default true for new combos; migration 0012 copies the previous `fallback_on_connect_timeout` value for existing combos)
-- `slow_response_fallback_enabled` (default true)
+- `slow_response_fallback_enabled` (default true for standard, false for native Codex)
 - `slow_response_threshold_seconds` (default 60)
 - `slow_response_max_count` (default 3)
 - `slow_response_generation` (increments on routing/latency-affecting configuration changes, fencing stale outcomes)

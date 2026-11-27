@@ -17,6 +17,9 @@ let compatibleModel = '';
 let nextStatus = 200;
 let truncated = false;
 let nativeEvents: Record<string, unknown>[] | null = null;
+let catalogEntries: Record<string, unknown>[] | null = null;
+let modelStatuses: Record<string, number> = {};
+let onMockCall: ((url: string) => Promise<void>) | null = null;
 const calls: { url: string; headers: Headers; body: Record<string, unknown>; redirect?: RequestRedirect }[] = [];
 
 function admin(method: 'POST' | 'PATCH', route: string, payload: unknown) {
@@ -46,8 +49,10 @@ beforeAll(async () => {
     const url = String(input);
     if (!url.startsWith(origin + '/')) throw new Error('Unexpected upstream destination');
     calls.push({ url, headers: new Headers(init?.headers), body: JSON.parse(String(init?.body ?? '{}')), redirect: init?.redirect });
-    if (url.startsWith(origin + '/models')) return Response.json({ models: [{ slug: 'fixture-model', display_name: 'Fixture', supported_reasoning_levels: ['high'], upgrade: { model: 'hidden' } }, { slug: 'unconfigured' }] });
-    if (nextStatus !== 200) return new Response(authorization, { status: nextStatus, headers: { 'retry-after': '120' } });
+    await onMockCall?.(url);
+    if (url.startsWith(origin + '/models')) return Response.json({ models: catalogEntries ?? [{ slug: 'fixture-model', display_name: 'Fixture', supported_reasoning_levels: ['high'], upgrade: { model: 'hidden' } }, { slug: 'unconfigured' }] });
+    const status = modelStatuses[String(calls.at(-1)?.body.model)] ?? nextStatus;
+    if (status !== 200) return new Response(authorization, { status, headers: { 'retry-after': '120' } });
     if (nativeEvents) return new Response(sse(nativeEvents), { headers: { 'content-type': 'text/event-stream' } });
     const output = { type: 'function_call', id: 'fc_fixture', call_id: 'call_fixture', name: 'fixture_tool', arguments: '{"x":1}' };
     const events = [{ type: 'response.created', response: { id: 'resp_fixture' } }, { type: 'response.output_item.added', output_index: 0, item: output }, { type: 'response.function_call_arguments.delta', item_id: 'fc_fixture', delta: '{"x":1}' }];
@@ -69,7 +74,7 @@ beforeAll(async () => {
   expect((await admin('POST', 'models/import', { providerId: compatible.json().id, modelIds: ['fixture-model'] })).statusCode).toBe(200);
   compatibleModel = 'compatible/fixture-model';
 });
-beforeEach(() => { calls.length = 0; nextStatus = 200; truncated = false; nativeEvents = null; });
+beforeEach(() => { calls.length = 0; nextStatus = 200; truncated = false; nativeEvents = null; catalogEntries = null; modelStatuses = {}; onMockCall = null; });
 afterAll(async () => { vi.restoreAllMocks(); await app?.close(); (await import('../../src/server/db')).closeDb(); fs.rmSync(dataDir, { recursive: true, force: true }); });
 
 describe('native Codex gateway', () => {
@@ -200,5 +205,126 @@ describe('native Codex gateway', () => {
     const request = getRawDb().prepare('SELECT success, partial_stream, input_tokens, output_tokens, error_message FROM requests WHERE id=?').get(res.headers['x-request-id']);
     expect(request).toMatchObject({ success: 0, partial_stream: 1, input_tokens: 12, output_tokens: 8 });
     expect(JSON.stringify(request)).not.toContain('fixture-private-upstream-error');
+  });
+});
+
+describe('native Codex combo', () => {
+  let comboName = '', comboSecret = '', comboAlias = '';
+  const entries = [
+    { slug: 'fixture-model', display_name: 'Fixture A', supported_reasoning_levels: ['high'], context_window: 10000 },
+    { slug: 'fixture-fallback', display_name: 'Fixture B', supported_reasoning_levels: ['high'], context_window: 10000 },
+  ];
+  beforeAll(async () => {
+    expect((await admin('POST', 'models/import', { providerId, modelIds: ['fixture-fallback'] })).statusCode).toBe(200);
+    const { getRawDb } = await import('../../src/server/db');
+    const fallback = getRawDb().prepare('SELECT id FROM models WHERE provider_id=? AND upstream_model_id=?').get(providerId, 'fixture-fallback') as { id: string };
+    const combo = await admin('POST', 'combos', { name: 'Native coding', slug: 'native-coding', comboKind: 'codex_native', mode: 'fallback', members: [{ modelId, position: 0 }, { modelId: fallback.id, position: 1 }] });
+    expect(combo.statusCode).toBe(200);
+    comboName = combo.json().publicModelId;
+    const alias = await admin('POST', 'aliases', { alias: 'native-coding-alias', targetKind: 'combo', targetId: combo.json().id });
+    expect(alias.statusCode).toBe(200); comboAlias = 'native-coding-alias';
+    const key = await admin('POST', 'api-keys', { name: 'Native combo only', allowAllModels: false, permissions: [{ targetKind: 'combo', targetId: combo.json().id }], maxConcurrent: 1 });
+    expect(key.statusCode).toBe(200); comboSecret = key.json().secret;
+  });
+  beforeEach(() => { catalogEntries = entries.map(e => ({ ...e })); });
+
+  it('advertises only authorized combo and alias in the signed-in account catalog', async () => {
+    const list = await app.inject({ method: 'GET', url: '/backend-api/codex/models', headers: { authorization, 'x-api-key': comboSecret, 'chatgpt-account-id': 'fixture-account' } });
+    expect(list.statusCode).toBe(200);
+    expect(list.json().models.map((m: { slug: string }) => m.slug).sort()).toEqual([comboName, comboAlias].sort());
+    const generic = await app.inject({ method: 'GET', url: '/v1/models', headers: { authorization: `Bearer ${comboSecret}` } });
+    expect(generic.body).not.toContain(comboName); expect(generic.body).not.toContain(comboAlias);
+    expect((await responses('codex/fixture-model', comboSecret)).statusCode).toBe(403);
+    const denied = await app.inject({ method: 'POST', url: '/v1/chat/completions', headers: { authorization: `Bearer ${comboSecret}` }, payload: { model: comboName, messages: [{ role: 'user', content: 'hello' }] } });
+    expect(denied.statusCode).toBe(401);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('falls back on pre-output 503 with the exact same client identity and native body', async () => {
+    modelStatuses = { 'fixture-model': 503 };
+    const result = await responses(comboAlias, comboSecret);
+    expect(result.statusCode).toBe(200); expect(result.body).toContain('response.completed');
+    expect(calls.map(c => c.body.model)).toEqual([undefined, 'fixture-model', 'fixture-fallback']);
+    for (const call of calls) {
+      expect(call.headers.get('authorization')).toBe(authorization);
+      expect(call.headers.get('chatgpt-account-id')).toBe('fixture-account');
+      expect(call.headers.has('x-api-key')).toBe(false);
+    }
+    expect(calls[1]?.body.input).toEqual(calls[2]?.body.input);
+    const { getRawDb } = await import('../../src/server/db');
+    expect(getRawDb().prepare('SELECT success, attempts_count, input_tokens, output_tokens FROM requests WHERE id=?').get(result.headers['x-request-id'])).toEqual({ success: 1, attempts_count: 2, input_tokens: 12, output_tokens: 8 });
+  });
+
+  it.each([401, 403, 429])('stops on upstream %s without fallback', async (status) => {
+    modelStatuses = { 'fixture-model': status };
+    const result = await responses(comboName, comboSecret);
+    expect(result.statusCode).toBe(status);
+    expect(calls.map(c => c.body.model)).toEqual([undefined, 'fixture-model']);
+  });
+
+  it('never retries after native output has started', async () => {
+    truncated = true;
+    const result = await responses(comboName, comboSecret);
+    expect(result.statusCode).toBe(200); expect(result.body).not.toContain('response.completed');
+    expect(calls.map(c => c.body.model)).toEqual([undefined, 'fixture-model']);
+  });
+
+  it('does not replay a semantic error encoded in a successful HTTP SSE response', async () => {
+    nativeEvents = [{ type: 'response.failed', response: { error: { code: 'usage_limit_reached' } } }];
+    const result = await responses(comboName, comboSecret);
+    expect(result.statusCode).toBe(502);
+    expect(calls.map(c => c.body.model)).toEqual([undefined, 'fixture-model']);
+    expect(result.body).not.toContain('usage_limit_reached');
+  });
+
+  it('does not dispatch or persist an old request after database re-open during catalog discovery', async () => {
+    const { closeDb, openDb, getRawDb } = await import('../../src/server/db');
+    const file = getRawDb().name;
+    const before = getRawDb().prepare('SELECT COUNT(*) AS n FROM requests').get();
+    onMockCall = async (url) => {
+      if (!url.includes('/models')) return;
+      onMockCall = null;
+      closeDb();
+      openDb(file);
+    };
+    const result = await responses(comboName, comboSecret);
+    expect(result.statusCode).toBe(409);
+    expect(calls.map(c => c.body.model)).toEqual([undefined]);
+    expect(getRawDb().prepare('SELECT COUNT(*) AS n FROM requests').get()).toEqual(before);
+  });
+
+  it('does not fall back or write into the new DB epoch after an upstream attempt', async () => {
+    const { closeDb, openDb, getRawDb } = await import('../../src/server/db');
+    const file = getRawDb().name;
+    const before = getRawDb().prepare('SELECT COUNT(*) AS n FROM requests').get();
+    modelStatuses = { 'fixture-model': 503 };
+    onMockCall = async (url) => {
+      if (!url.endsWith('/responses')) return;
+      onMockCall = null;
+      closeDb();
+      openDb(file);
+    };
+    const result = await responses(comboName, comboSecret);
+    expect(result.statusCode).toBe(409);
+    expect(calls.map(c => c.body.model)).toEqual([undefined, 'fixture-model']);
+    expect(getRawDb().prepare('SELECT COUNT(*) AS n FROM requests').get()).toEqual(before);
+  });
+
+  it('does not route a combo with missing or incompatible catalog metadata', async () => {
+    catalogEntries = [{ ...entries[0] }, { ...entries[1], context_window: 5000 }];
+    const list = await app.inject({ method: 'GET', url: '/backend-api/codex/models', headers: { authorization, 'x-api-key': comboSecret } });
+    expect(list.json().models).toEqual([]);
+    const result = await responses(comboName, comboSecret);
+    expect(result.statusCode).toBe(400);
+    expect(calls.every(c => c.url.includes('/models'))).toBe(true);
+    catalogEntries = [entries[0]!];
+    expect((await responses(comboName, comboSecret)).statusCode).toBe(400);
+    expect(calls.every(c => c.url.includes('/models'))).toBe(true);
+  });
+
+  it('rejects opaque model-bound history and finite caps before catalog dispatch', async () => {
+    expect((await responses(comboName, comboSecret, { input: [{ type: 'reasoning', encrypted_content: 'fixture-opaque-history' }] })).statusCode).toBe(400);
+    expect((await responses(comboName, cappedSecret)).statusCode).toBe(400);
+    expect(calls).toHaveLength(0);
   });
 });

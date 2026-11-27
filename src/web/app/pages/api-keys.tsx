@@ -18,9 +18,10 @@ import { toast } from 'sonner';
 import { Plus, Copy, Eye, Trash2, Ban, CheckCircle2, Pencil, HelpCircle } from 'lucide-react';
 
 interface KeyRow { id: string; name: string; keyPrefix: string; enabled: boolean; expiresAt: string | null; lastUsedAt: string | null; allowAllModels: boolean; modelScopeCount: number; rpmLimit: number | null; tpmLimit: number | null; concurrencyLimit: number | null; dailyTokenLimit: number | null; monthlyTokenLimit: number | null; totalTokenLimit: number | null; totalTokensUsed: number; maxOutputTokensPerRequest: number | null; cacheOverrideEnabled: boolean | null; secret: string | null; }
-interface Model { id: string; publicModelId: string; }
-interface Combo { id: string; publicModelId: string; }
-interface Alias { id: string; alias: string; }
+type RouteKind = 'standard' | 'codex_native' | 'unknown';
+interface Model { id: string; publicModelId: string; providerKind: 'compatible' | 'codex' | 'claude_code'; }
+interface Combo { id: string; publicModelId: string; comboKind: 'standard' | 'codex_native'; }
+interface Alias { id: string; alias: string; targetKind: 'model' | 'combo'; targetId: string; }
 interface Perm { targetKind: 'model' | 'combo' | 'alias'; targetId: string; }
 interface IpRule { mode: 'allow' | 'deny'; cidr: string; }
 type KeyDetail = Omit<KeyRow, 'concurrencyLimit'> & { maxConcurrent: number | null; permissions: Perm[]; ipRules: IpRule[] };
@@ -70,6 +71,7 @@ export function ApiKeys() {
   const [combos, setCombos] = useState<Combo[]>([]);
   const [aliases, setAliases] = useState<Alias[]>([]);
   const [scopeSearch, setScopeSearch] = useState('');
+  const [scopeKind, setScopeKind] = useState<RouteKind | 'all'>('all');
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
   const [saving, setSaving] = useState(false);
@@ -190,19 +192,25 @@ export function ApiKeys() {
     } catch (e) { toast.error((e as Error).message); }
   };
 
-  const targets: Array<Perm & { label: string; group: string }> = [
-    ...combos.map((c) => ({ targetKind: 'combo' as const, targetId: c.id, label: c.publicModelId, group: 'Combos' })),
-    ...aliases.map((a) => ({ targetKind: 'alias' as const, targetId: a.id, label: a.alias, group: 'Aliases' })),
-    ...models.map((m) => ({ targetKind: 'model' as const, targetId: m.id, label: m.publicModelId, group: `Models · ${m.publicModelId.split('/')[0]}` })),
+  const modelKinds = new Map(models.map((m) => [m.id, m.providerKind === 'codex' ? 'codex_native' as const : m.providerKind === 'compatible' || m.providerKind === 'claude_code' ? 'standard' as const : 'unknown' as const]));
+  const comboKinds = new Map(combos.map((c) => [c.id, c.comboKind]));
+  const aliasKind = (a: Alias): RouteKind => (a.targetKind === 'model' ? modelKinds.get(a.targetId) : comboKinds.get(a.targetId)) ?? 'unknown';
+  const routeLabel = (kind: RouteKind) => kind === 'codex_native' ? 'Codex native' : kind === 'standard' ? 'Standard' : 'Unknown route';
+  const targets: Array<Perm & { label: string; group: string; routeKind: RouteKind }> = [
+    ...combos.map((c) => ({ targetKind: 'combo' as const, targetId: c.id, label: c.publicModelId, routeKind: c.comboKind ?? 'unknown' as const, group: `${routeLabel(c.comboKind ?? 'unknown')} · Combos` })),
+    ...aliases.map((a) => ({ targetKind: 'alias' as const, targetId: a.id, label: a.alias, routeKind: aliasKind(a), group: `${routeLabel(aliasKind(a))} · Aliases` })),
+    ...models.map((m) => ({ targetKind: 'model' as const, targetId: m.id, label: m.publicModelId, routeKind: modelKinds.get(m.id) ?? 'unknown' as const, group: `${routeLabel(modelKinds.get(m.id) ?? 'unknown')} · Models · ${m.publicModelId.split('/')[0]}` })),
   ];
-  for (const p of form.permissions) if (!targets.some((t) => t.targetId === p.targetId && t.targetKind === p.targetKind)) targets.push({ ...p, label: p.targetId, group: 'Unavailable targets' });
-  const filteredTargets = targets.filter((t) => `${t.label} ${t.group}`.toLowerCase().includes(scopeSearch.toLowerCase().trim()));
+  for (const p of form.permissions) if (!targets.some((t) => t.targetId === p.targetId && t.targetKind === p.targetKind)) targets.push({ ...p, label: p.targetId, group: 'Unavailable targets', routeKind: 'unknown' });
+  const filteredTargets = targets.filter((t) => (scopeKind === 'all' || t.routeKind === scopeKind) && `${t.label} ${t.group}`.toLowerCase().includes(scopeSearch.toLowerCase().trim()));
+  const codexScope = form.allowAll || targets.some((t) => t.routeKind === 'codex_native' && form.permissions.some((p) => p.targetKind === t.targetKind && p.targetId === t.targetId));
+  const hasTokenCaps = [form.tpmLimit, form.dailyTokenLimit, form.monthlyTokenLimit, form.totalTokenLimit, form.maxOutputTokensPerRequest].some((value) => value.trim() !== '');
 
   return (
     <TooltipProvider delayDuration={200}>
     <div>
       <PageHeader title="API Keys" description="Gateway bearer keys for client applications" actions={
-        <Dialog open={open} onOpenChange={(o) => { if (!o && !saving) cancelEdit(); else if (o) { setScopeSearch(''); setOpen(true); } }}>
+        <Dialog open={open} onOpenChange={(o) => { if (!o && !saving) cancelEdit(); else if (o) { setScopeSearch(''); setScopeKind('all'); setOpen(true); } }}>
           <DialogTrigger asChild><Button disabled={loading || !!loadError}><Plus className="mr-1 h-4 w-4" /> New key</Button></DialogTrigger>
           <DialogContent className="max-h-[90dvh] max-w-2xl grid-rows-[auto_minmax(0,1fr)_auto]">
             <DialogHeader><DialogTitle>{editingId ? 'Edit API key' : 'New API key'}</DialogTitle><DialogDescription>Configure access, token budgets and security rules for this key.</DialogDescription></DialogHeader>
@@ -220,12 +228,15 @@ export function ApiKeys() {
                 <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
                   {limits.map((limit) => <div key={limit.field} className="flex flex-col gap-1.5"><HelpLabel label={limit.label} htmlFor={`key-${limit.field}`} help={limit.help} /><Input id={`key-${limit.field}`} value={form[limit.field]} onChange={(e) => setForm({ ...form, [limit.field]: e.target.value })} type="number" min={1} step={1} placeholder="Unlimited" /></div>)}
                 </div>
+                {codexScope && hasTokenCaps && <p role="alert" className="rounded border border-amber-500/50 p-2 text-xs text-amber-700 dark:text-amber-400">Native Codex rejects finite token limits (TPM, daily, monthly, lifetime or max output). This key can still serve standard routes, but Codex models, native combos and their aliases will reject requests. Use a separate uncapped key for Codex; RPM, IP, expiry and concurrency limits remain available.</p>}
               </div>
               <div className="flex flex-col gap-2 border-t pt-3">
               <div className="flex items-center gap-2"><Switch id="key-allow-all" checked={form.allowAll} onCheckedChange={(v) => setForm({ ...form, allowAll: v })} /><HelpLabel label="Allow all current and future models" htmlFor="key-allow-all" help="If disabled, only explicitly selected models, combos or aliases can be used. An empty selection denies all generation." /></div>
               {!form.allowAll && (
                 <div className="flex flex-col gap-2">
                   <HelpLabel label={`Scope (${form.permissions.length} selected)`} help="A combo or alias grant does not grant direct access to its underlying physical models. A direct model or combo grant also permits its aliases." />
+                  <Select value={scopeKind} onValueChange={(kind) => setScopeKind(kind as RouteKind | 'all')}><SelectTrigger aria-label="Filter routes by type"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="all">All route types</SelectItem><SelectItem value="standard">Standard</SelectItem><SelectItem value="codex_native">Codex native</SelectItem><SelectItem value="unknown">Unknown route</SelectItem></SelectContent></Select>
+                  <p className="text-xs text-muted-foreground">Filter by route type to scope a client key. Filtering retains existing selections.</p>
                   <Input aria-label="Search permitted targets" placeholder="Search models, combos, aliases…" value={scopeSearch} onChange={(e) => setScopeSearch(e.target.value)} />
                   <div className="max-h-48 overflow-auto rounded border p-2">
                     {filteredTargets.length === 0 && <p className="p-2 text-xs text-muted-foreground">No matching targets.</p>}
@@ -234,6 +245,7 @@ export function ApiKeys() {
                       return (
                         <label key={`${t.targetKind}:${t.targetId}`} className="flex items-center gap-2 rounded p-1 text-sm hover:bg-accent">
                           <Checkbox
+                            aria-label={t.label}
                             checked={on}
                             onCheckedChange={(c) => {
                               setForm((f) => ({ ...f, permissions: c ? [...f.permissions, { targetKind: t.targetKind, targetId: t.targetId }] : f.permissions.filter((p) => !(p.targetKind === t.targetKind && p.targetId === t.targetId)) }));
@@ -296,7 +308,7 @@ export function ApiKeys() {
                           </Button>
                         </>
                       )}
-                      <Button size="sm" variant="ghost" title="Edit" aria-label="Edit API key" onClick={() => void openEdit(k)}>
+                      <Button size="sm" variant="ghost" title="Edit" aria-label="Edit API key" onClick={() => { setScopeKind('all'); void openEdit(k); }}>
                         <Pencil className="h-3.5 w-3.5" />
                       </Button>
                       <Button size="sm" variant="outline" onClick={() => toggle(k.id, k.enabled)}>

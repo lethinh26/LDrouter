@@ -32,7 +32,7 @@ Redirects, stored client credentials, and custom upstream headers are forbidden.
 1. Create a Codex provider and import the exact upstream model IDs you are
    authorized to use. The actual account catalog is fetched only with the
    signed-in client; admin discovery does not invent model availability.
-2. Create a gateway key limited to the desired models or aliases. RPM, IP,
+2. Create a gateway key limited to the desired models, native Codex combos or aliases. RPM, IP,
    expiration and concurrency limits remain available. Finite token quotas
    and output caps fail closed for native Codex because this adapter has not
    verified an enforceable upstream maximum. They are never silently ignored.
@@ -62,6 +62,46 @@ are not shared between accounts. Native payloads are excluded from content
 logging and response caching. Usage reported by the upstream is accounted for.
 This integration does not establish eligibility for a particular OpenAI plan
 or authorize a commercial relay. Follow the applicable service terms.
+
+### Native Codex combos
+
+Create a Combo with type **Codex native** and ordered, distinct Codex upstream
+model IDs. Existing combos remain standard after migration 0018; kind is
+immutable. Mixed API-key providers and native OAuth members are rejected.
+Use the saved combo public ID (or a permitted alias) in the client configuration.
+The ordinary OpenAI-compatible endpoints and synthetic admin Test cannot invoke
+this combo; both client authorization and the gateway API key are required.
+
+Configured availability is not an account entitlement. For every native combo
+request the gateway fetches the signed-in account's catalog using that same
+credential, with a bounded timeout and response size. All eligible members
+must exist in the catalog and have matching behavioral metadata (including
+context window and supported reasoning levels). Only cosmetic model identifiers,
+labels, priority and upgrade hints are ignored during comparison. Incompatible
+or missing entries suppress the combo in the catalog and fail closed at
+dispatch. This conservative compatibility check may exclude some real model
+combinations; live clients/catalogs have not yet been certified.
+
+The gateway preserves the native Responses request and event/item/tool IDs.
+Model-bound encrypted history and item references require a direct model.
+Ordered fallback may occur on configured transport failures, timeouts, HTTP
+408 or 5xx before any SSE output is sent. No fallback is permitted after output,
+on 401/403/429, on semantic SSE errors or on malformed/incomplete responses.
+Every attempt uses the same client credential and account header; no account
+switching, shared adaptive state, token rotation or same-model replay is used.
+Attempt and overall deadline limits still apply. No request payload or opaque
+upstream request identifier is persisted for native Codex.
+
+### OAuth authorization boundary
+
+The gateway does not currently provide browser OAuth login, persistent profile
+management or automatic refresh. Client sign-in and refresh remain with Codex.
+A future integration-specific managed OAuth flow requires a provider-approved
+registration, grant and deployment/storage policy permitting that specific use;
+the official [Sign in with ChatGPT terms](https://openai.com/policies/sign-in-with-chatgpt-terms/)
+do not establish permission for a general-purpose subscription relay or account
+pool. Do not reuse another application's OAuth registration or credential store.
+Claude Code remains API-key based as described below.
 
 ## Claude Code
 

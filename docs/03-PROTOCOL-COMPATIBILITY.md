@@ -67,6 +67,11 @@ Eligible public targets:
 
 Never leak provider credentials or private admin metadata.
 
+Native Codex models, combos and their aliases are excluded from this generic
+catalog. The dedicated signed-in Codex catalog at `/backend-api/codex/models`
+uses both the gateway key and the request's client-held credential; see
+[client integrations](14-CLIENT-INTEGRATIONS.md).
+
 ## Model resolution
 
 Input `model` may be:

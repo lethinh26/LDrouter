@@ -433,6 +433,33 @@ describe('streamed multipart restore', () => {
     } finally { fs.rmSync(dir,{recursive:true,force:true}); }
   });
 
+  it('rejects a schema-18 backup containing a mixed native combo before swapping the live database', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'latedev-native-restore-'));
+    try {
+      const { runMigrations, CURRENT_SCHEMA_VERSION } = await import('../../src/server/db/migrate');
+      const { MIGRATIONS_DIR, MIGRATION_LOG } = await import('../fixtures/legacy-db');
+      const staged = createLegacyDatabase(dir);
+      try {
+        runMigrations(staged, MIGRATION_LOG, MIGRATIONS_DIR, CURRENT_SCHEMA_VERSION);
+        staged.exec(`INSERT INTO combos(id,name,slug,public_model_id,mode,combo_kind,fallback_on_429,slow_response_fallback_enabled)
+          VALUES ('forged-native','Forged native','forged-native','forged-native','fallback','codex_native',0,0);
+          INSERT INTO combo_members(id,combo_id,model_id,position,enabled) VALUES ('forged-member','forged-native','m-openai',0,0);`);
+        expect(staged.prepare('PRAGMA integrity_check').get()).toEqual({ integrity_check: 'ok' });
+        expect(staged.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+      } finally { staged.close(); }
+      const bytes = fs.readFileSync(path.join(dir, 'legacy.sqlite'));
+      const { getRawDb } = await import('../../src/server/db/index');
+      const before = getRawDb();
+      const models = await modelIds();
+      const result = await uploadBuffer(await buildContainer(zlib.gzipSync(bytes), { profile: 'full', excludedTables: [], schemaVersion: CURRENT_SCHEMA_VERSION, uncompressedBytes: bytes.length }));
+      expect(result.status, JSON.stringify(result.json)).toBe(400);
+      expect(result.json).toMatchObject({ error: { code: 'invalid_schema' } });
+      expect(getRawDb()).toBe(before);
+      expect(await modelIds()).toEqual(models);
+      expect(await waitForEmptyTmp()).toEqual([]);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it.each(['v1', 'v2-full', 'v2-compact'] as const)('upgrades a genuine pre-0014 %s backup before replacing the live DB', async (format) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'latedev-legacy-restore-'));
     try {
@@ -471,7 +498,7 @@ describe('streamed multipart restore', () => {
       expect(result.status, JSON.stringify(result.json)).toBe(200);
       const db = getRawDb();
       expect(db).not.toBe(before);
-      expect(db.prepare('SELECT schema_version FROM app_settings').get()).toEqual({schema_version:17});
+      expect(db.prepare('SELECT schema_version FROM app_settings').get()).toEqual({schema_version:18});
       expect(db.prepare("SELECT name FROM pragma_table_info('api_keys') WHERE name='total_token_limit'").get()).toEqual({name:'total_token_limit'});
       expect(db.prepare("SELECT name FROM sqlite_schema WHERE name='combo_member_slow_states'").get()).toBeUndefined();
       expect(db.prepare('SELECT * FROM combo_adaptive_states').all()).toEqual([]);

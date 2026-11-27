@@ -184,6 +184,7 @@ export const combos = sqliteTable(
     name: text('name').notNull(),
     slug: text('slug').notNull().unique(),
     publicModelId: text('public_model_id').notNull().unique(),
+    comboKind: text('combo_kind', { enum: ['standard', 'codex_native'] }).notNull().default('standard'),
     mode: text('mode', { enum: ['fallback'] }).notNull(),
     enabled: integer('enabled', { mode: 'boolean' }).notNull().notNull().default(true),
     maxTotalAttempts: integer('max_total_attempts').notNull().default(3),

@@ -71,6 +71,7 @@ export function Models() {
   const [discovered, setDiscovered] = useState<Discovered[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [fetching, setFetching] = useState(false);
+  const [importing, setImporting] = useState(false);
   const [search, setSearch] = useState('');
   const [discoverSearch, setDiscoverSearch] = useState('');
   const [testingId, setTestingId] = useState<string | null>(null);
@@ -128,6 +129,7 @@ export function Models() {
   const providerById = new Map(providers.map((provider) => [provider.id, provider]));
   const manualImport = providerById.get(fetchProviderId)?.providerKind === 'codex';
   const manualIds = [...new Set(manualModels.split(/[\s,]+/).filter(Boolean))];
+  const discoveryBusy = fetching || importing;
   const providerGroups = Array.from(filtered.reduce((groups, model) => {
     const provider = providerById.get(model.providerId);
     const id = model.providerId || model.providerSlug;
@@ -166,8 +168,10 @@ export function Models() {
   });
 
   const fetch = async () => {
-    if (!fetchProviderId) return;
+    if (!fetchProviderId || discoveryBusy) return;
     setFetching(true);
+    setDiscovered([]);
+    setSelected(new Set());
     try {
       const r = await api.post<{ models: Discovered[] }>(`/api/admin/providers/${fetchProviderId}/discover`);
       setDiscovered(r.models);
@@ -178,13 +182,15 @@ export function Models() {
 
   const importSelected = async () => {
     const modelIds = manualImport ? manualIds : Array.from(selected);
-    if (!modelIds.length) return;
+    if (!fetchProviderId || !modelIds.length || discoveryBusy) return;
+    setImporting(true);
     try {
       const r = await api.post<{ imported: number; requested: number }>('/api/admin/models/import', { providerId: fetchProviderId, modelIds });
       toast.success(`Imported ${r.imported} of ${r.requested}`);
-      setFetchOpen(false); setDiscovered([]); setSelected(new Set()); setManualModels('');
+      setFetchOpen(false); setFetchProviderId(''); setDiscovered([]); setSelected(new Set()); setManualModels(''); setDiscoverSearch('');
       void reload();
     } catch (e) { toast.error((e as Error).message); }
+    finally { setImporting(false); }
   };
 
   const handleDelete = async () => {
@@ -299,7 +305,11 @@ export function Models() {
   return (
     <div>
       <PageHeader title="Models" description="Physical models imported from providers" actions={
-        <Dialog open={fetchOpen} onOpenChange={setFetchOpen}>
+        <Dialog open={fetchOpen} onOpenChange={(open) => {
+          if (discoveryBusy) return;
+          setFetchOpen(open);
+          if (!open) { setFetchProviderId(''); setDiscovered([]); setSelected(new Set()); setManualModels(''); setDiscoverSearch(''); }
+        }}>
           <DialogTrigger asChild>
             <Button variant="outline"><Download className="mr-1 h-4 w-4" /> Fetch models</Button>
           </DialogTrigger>
@@ -308,12 +318,12 @@ export function Models() {
             <div className="space-y-3">
               <div className="flex items-end gap-2">
                 <div className="flex-1">
-                  <Select value={fetchProviderId} onValueChange={(id) => { setFetchProviderId(id); setDiscovered([]); setSelected(new Set()); setManualModels(''); }}>
+                  <Select value={fetchProviderId} disabled={discoveryBusy} onValueChange={(id) => { setFetchProviderId(id); setDiscovered([]); setSelected(new Set()); setManualModels(''); setDiscoverSearch(''); }}>
                     <SelectTrigger><SelectValue placeholder="Choose provider" /></SelectTrigger>
                     <SelectContent>{providers.map((p) => <SelectItem key={p.id} value={p.id}>{p.name}</SelectItem>)}</SelectContent>
                   </Select>
                 </div>
-                {!manualImport && <Button onClick={fetch} disabled={!fetchProviderId || fetching}>{fetching ? 'Fetching…' : 'Fetch'}</Button>}
+                {!manualImport && <Button onClick={fetch} disabled={!fetchProviderId || discoveryBusy}>{fetching ? 'Fetching…' : 'Fetch'}</Button>}
               </div>
               {manualImport && <div className="space-y-2"><p className="text-sm text-muted-foreground">Enter exact upstream model IDs available to your signed-in Codex client. Separate IDs with commas or newlines. Account availability is verified when the client fetches its catalog.</p><textarea aria-label="Codex upstream model IDs" className="min-h-24 w-full rounded-md border bg-background p-3 font-mono text-sm" value={manualModels} onChange={(e) => setManualModels(e.target.value)} placeholder="YOUR_UPSTREAM_MODEL_ID" /></div>}
               {!manualImport && discovered.length > 0 && (
@@ -358,8 +368,8 @@ export function Models() {
               )}
             </div>
             <DialogFooter>
-              <Button variant="outline" onClick={() => setFetchOpen(false)}>Cancel</Button>
-              <Button disabled={manualImport ? !manualIds.length : selected.size === 0} onClick={importSelected}>Import {(manualImport ? manualIds.length : selected.size) || ''}</Button>
+              <Button variant="outline" disabled={discoveryBusy} onClick={() => { setFetchOpen(false); setFetchProviderId(''); setDiscovered([]); setSelected(new Set()); setManualModels(''); setDiscoverSearch(''); }}>Cancel</Button>
+              <Button disabled={discoveryBusy || (manualImport ? !manualIds.length : selected.size === 0)} onClick={importSelected}>{importing ? 'Importing…' : `Import ${(manualImport ? manualIds.length : selected.size) || ''}`}</Button>
             </DialogFooter>
           </DialogContent>
         </Dialog>
@@ -395,6 +405,7 @@ export function Models() {
             </div>}
             {providerGroups.map((group) => {
               const expanded = search.trim().length > 0 || expandedProviders.has(group.id);
+              const native = providerById.get(group.id)?.providerKind === 'codex';
               const availableCount = group.models.filter((model) => model.upstreamAvailable).length;
               const enabledCount = group.models.filter((model) => model.enabled).length;
               const contentId = `provider-models-${group.id}`;
@@ -406,14 +417,14 @@ export function Models() {
                       <span className="min-w-0">
                         <span className="flex flex-wrap items-center gap-2">
                           <span className="truncate font-semibold text-foreground">{group.name}</span>
-                          <Badge variant="outline">{group.type}</Badge>
+                          <Badge variant="outline">{native ? 'Codex native' : group.type}</Badge>
                         </span>
                         <span className="mt-1 block truncate text-xs font-normal text-muted-foreground">{group.slug}</span>
                       </span>
                     </span>
                     <span className="flex shrink-0 items-center gap-2">
                       <Badge variant="secondary">{group.models.length} models</Badge>
-                      <Badge variant={availableCount > 0 ? 'success' : 'destructive'}>{availableCount} available</Badge>
+                      <Badge variant={availableCount > 0 ? (native ? 'outline' : 'success') : 'destructive'}>{availableCount} {native ? 'eligible · account unverified' : 'available'}</Badge>
                       <span className="hidden text-xs text-muted-foreground sm:inline">{enabledCount} enabled</span>
                     </span>
                   </Button>
@@ -437,7 +448,7 @@ export function Models() {
                               {Object.values(m.capabilities).every((value) => value !== true) && <span className="text-xs text-muted-foreground">—</span>}
                             </div>
                           </TableCell>
-                          <TableCell>{m.upstreamAvailable ? <Badge variant="success">Available</Badge> : <Badge variant="destructive">Unavailable</Badge>}</TableCell>
+                          <TableCell>{m.upstreamAvailable ? native ? <Badge variant="outline" title="Availability is checked against the signed-in client's catalog">Account unverified</Badge> : <Badge variant="success">Available</Badge> : <Badge variant="destructive">Unavailable</Badge>}</TableCell>
                           <TableCell>{m.enabled ? <Badge variant="success">Enabled</Badge> : <Badge variant="secondary">Disabled</Badge>}</TableCell>
                           <TableCell className="text-right">
                             <div className="flex items-center justify-end gap-1">

@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
-export const CURRENT_SCHEMA_VERSION = 17;
+export const CURRENT_SCHEMA_VERSION = 18;
 
 interface MigrationFile {
   version: number;
@@ -48,6 +48,7 @@ export function runMigrations(raw: Database.Database, log: Logger, migrationsDir
   if (latest >= 14 && applied.includes(14)) assertRetiredProvidersRemoved(raw, parsed[13]!);
   if (latest >= 15 && applied.includes(15)) assertAdaptiveSchema(raw);
   if (latest >= 17 && applied.includes(17)) assertIntegrationSchema(raw, parsed[16]!);
+  if (latest >= 18 && applied.includes(18)) assertComboKindSchema(raw, parsed[17]!);
 
   for (const migration of parsed.slice(applied.length)) {
     log.info({ version: migration.version, name: migration.name }, 'applying migration');
@@ -67,6 +68,7 @@ export function runMigrations(raw: Database.Database, log: Logger, migrationsDir
         }
       }
       if (migration.version === 17) assertIntegrationSchema(raw, migration);
+      if (migration.version === 18) assertComboKindSchema(raw, migration);
       raw.prepare('INSERT INTO schema_migrations (version, name) VALUES (?, ?)').run(migration.version, migration.name);
     });
     tx.immediate();
@@ -76,6 +78,26 @@ export function runMigrations(raw: Database.Database, log: Logger, migrationsDir
     ensureSettingsRow(raw, log);
     raw.prepare('UPDATE app_settings SET schema_version = ? WHERE id = 1').run(latest);
   })();
+}
+
+function assertComboKindSchema(raw: Database.Database, migration: MigrationFile): void {
+  const fail = () => new Error('Database schema is inconsistent with combo kind migration (0018)');
+  const expected = migration.sql.match(/ALTER TABLE combos ADD COLUMN ([\s\S]*?);/)?.[1];
+  const actual = raw.prepare("SELECT sql FROM sqlite_schema WHERE type='table' AND name='combos'").get() as { sql: string } | undefined;
+  const normalize = (ddl: string) => ddl.replace(/\s+/g, ' ').trim();
+  const column = raw.prepare("SELECT type, [notnull] AS required, dflt_value FROM pragma_table_xinfo('combos') WHERE name='combo_kind'").get() as { type: string; required: number; dflt_value: string } | undefined;
+  if (!expected || !actual?.sql || !normalize(actual.sql).includes(normalize(expected)) || column?.type !== 'TEXT' || column.required !== 1 || column.dflt_value !== "'standard'") throw fail();
+  if (raw.prepare('PRAGMA foreign_key_check(combo_members)').all().length > 0 ||
+      raw.prepare(`SELECT 1 FROM combos WHERE combo_kind IS NULL OR combo_kind NOT IN ('standard','codex_native')
+        OR (combo_kind='codex_native' AND (mode IS NOT 'fallback' OR fallback_on_429 IS NOT 0 OR slow_response_fallback_enabled IS NOT 0)) LIMIT 1`).get() ||
+      raw.prepare(`SELECT 1 FROM combo_members cm JOIN combos c ON c.id=cm.combo_id
+        JOIN models m ON m.id=cm.model_id LEFT JOIN provider_integrations i ON i.provider_id=m.provider_id
+        WHERE (c.combo_kind='standard' AND i.auth_mode='client_oauth')
+          OR (c.combo_kind='codex_native' AND (i.provider_kind IS NOT 'codex' OR i.auth_mode IS NOT 'client_oauth')) LIMIT 1`).get() ||
+      raw.prepare(`SELECT 1 FROM combo_members cm JOIN combos c ON c.id=cm.combo_id JOIN models m ON m.id=cm.model_id
+        WHERE c.combo_kind='codex_native' GROUP BY cm.combo_id,m.upstream_model_id HAVING count(*)>1 LIMIT 1`).get() ||
+      raw.prepare(`SELECT 1 FROM combo_adaptive_states s JOIN combos c ON c.id=s.combo_id WHERE c.combo_kind='codex_native' LIMIT 1`).get() ||
+      raw.prepare(`SELECT 1 FROM combo_adaptive_exploration e JOIN combos c ON c.id=e.combo_id WHERE c.combo_kind='codex_native' LIMIT 1`).get()) throw fail();
 }
 
 function assertIntegrationSchema(raw: Database.Database, migration: MigrationFile): void {

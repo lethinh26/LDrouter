@@ -252,7 +252,7 @@ export function listRoutableModelIds(models: ModelRow[], key: AuthenticatedKey, 
   const modelIds = new Set(models.map((m) => m.id));
   const modelById = new Map(models.map((m) => [m.id, m.publicModelId]));
 
-  let combos = db.select().from(schema.combos).where(eq(schema.combos.enabled, true)).all();
+  let combos = db.select().from(schema.combos).where(eq(schema.combos.enabled, true)).all().filter(c => c.comboKind === 'standard');
   const members = combos.length > 0
     ? db.select().from(schema.comboMembers).where(inArray(schema.comboMembers.comboId, combos.map((c) => c.id))).all()
     : [];

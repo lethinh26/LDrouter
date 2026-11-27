@@ -39,6 +39,8 @@ jobs:
           echo "$OUTPUT" | grep -q "dist/web/index.html" || { echo "FAIL: dist/web/index.html not in tarball"; exit 1; }
           echo "$OUTPUT" | grep -q "migrations/0001_initial_schema.sql" || { echo "FAIL: migrations not in tarball"; exit 1; }
           echo "$OUTPUT" | grep -q "migrations/0015_adaptive_combo_state.sql" || { echo "FAIL: adaptive migration not in tarball"; exit 1; }
+          echo "$OUTPUT" | grep -q "migrations/0017_provider_integrations.sql" || { echo "FAIL: integration migration not in tarball"; exit 1; }
+          echo "$OUTPUT" | grep -q "migrations/0018_combo_kind.sql" || { echo "FAIL: native combo migration not in tarball"; exit 1; }
           echo "$OUTPUT" | grep -q "CHANGELOG.md" || { echo "FAIL: CHANGELOG.md not in tarball"; exit 1; }
           echo "✓ tarball OK"
       - name: Browser smoke (isolated mock upstream)

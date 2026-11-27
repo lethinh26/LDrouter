@@ -114,6 +114,7 @@ def smoke(base, upstream):
         detail_path = f"/api/admin/combos/{combo['id']}"
         def detail():
             return page.request.get(detail_path).json()["combo"]
+        assert detail()["comboKind"] == "standard", "Legacy creation without comboKind must default to standard"
         assert [m["modelId"] for m in detail()["members"]] == [models["b"], models["a"]]
         before = [m["adaptiveStates"] for m in detail()["members"]]
         row.get_by_role("button", name="Test", exact=True).click()
@@ -174,3 +175,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # Run the provider/ACL regression in its own database and mock server.
+    from provider_integration_smoke import main as provider_smoke
+    provider_smoke()
