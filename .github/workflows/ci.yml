@@ -48,6 +48,7 @@ jobs:
           echo "$OUTPUT" | grep -q "migrations/0018_combo_kind.sql" || { echo "FAIL: native combo migration not in tarball"; exit 1; }
           echo "$OUTPUT" | grep -q "migrations/0019_provider_connections.sql" || { echo "FAIL: built-in connection migration not in tarball"; exit 1; }
           echo "$OUTPUT" | grep -q "migrations/0020_gateway_oauth.sql" || { echo "FAIL: gateway OAuth migration not in tarball"; exit 1; }
+          echo "$OUTPUT" | grep -q "migrations/0021_subscription_quotas.sql" || { echo "FAIL: subscription quota migration not in tarball"; exit 1; }
           echo "$OUTPUT" | grep -q "CHANGELOG.md" || { echo "FAIL: CHANGELOG.md not in tarball"; exit 1; }
           echo "✓ tarball OK"
       - name: Browser smoke (isolated mock upstream)

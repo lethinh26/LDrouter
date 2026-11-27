@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
-export const CURRENT_SCHEMA_VERSION = 20;
+export const CURRENT_SCHEMA_VERSION = 21;
 
 interface MigrationFile {
   version: number;
@@ -51,6 +51,7 @@ export function runMigrations(raw: Database.Database, log: Logger, migrationsDir
   if (latest >= 18 && applied.includes(18)) assertComboKindSchema(raw, parsed[17]!);
   if (latest >= 19 && applied.includes(19)) assertConnectionSchema(raw, parsed[18]!);
   if (latest >= 20 && applied.includes(20)) assertGatewayOAuthSchema(raw, parsed[19]!);
+  if (latest >= 21 && applied.includes(21)) assertSubscriptionQuotaSchema(raw, parsed[20]!);
 
   for (const migration of parsed.slice(applied.length)) {
     log.info({ version: migration.version, name: migration.name }, 'applying migration');
@@ -73,6 +74,7 @@ export function runMigrations(raw: Database.Database, log: Logger, migrationsDir
       if (migration.version === 18) assertComboKindSchema(raw, migration);
       if (migration.version === 19) assertConnectionSchema(raw, migration);
       if (migration.version === 20) assertGatewayOAuthSchema(raw, migration);
+      if (migration.version === 21) assertSubscriptionQuotaSchema(raw, migration);
       raw.prepare('INSERT INTO schema_migrations (version, name) VALUES (?, ?)').run(migration.version, migration.name);
     });
     tx.immediate();
@@ -82,6 +84,15 @@ export function runMigrations(raw: Database.Database, log: Logger, migrationsDir
     ensureSettingsRow(raw, log);
     raw.prepare('UPDATE app_settings SET schema_version = ? WHERE id = 1').run(latest);
   })();
+}
+
+function assertSubscriptionQuotaSchema(raw: Database.Database, migration: MigrationFile): void {
+  const expected = migration.sql.match(/^CREATE TABLE subscription_quota_accounts \([\s\S]*?^\);/m)?.[0];
+  const actual = raw.prepare("SELECT sql FROM sqlite_schema WHERE type='table' AND name='subscription_quota_accounts'").get() as { sql: string } | undefined;
+  const normalize = (ddl: string) => ddl.replace(/\s+/g, ' ').replace(/;$/, '').trim();
+  if (!expected || !actual?.sql || normalize(expected) !== normalize(actual.sql)) {
+    throw new Error('Database schema is inconsistent with subscription quota migration (0021)');
+  }
 }
 
 function assertGatewayOAuthSchema(raw: Database.Database, migration: MigrationFile): void {

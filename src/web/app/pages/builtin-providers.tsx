@@ -14,6 +14,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '.
 import { api } from '../../lib/api';
 import { GATEWAY_OAUTH_CLIENT_ID, GATEWAY_OAUTH_PATH, GATEWAY_OAUTH_REDIRECT_PORT } from '../../lib/gateway-oauth';
 import { GatewayOAuthGrants } from './gateway-oauth-grants';
+import { QuotaRegistry } from './quota-registry';
 
 export type BuiltinKind = 'codex' | 'claude_code';
 export interface BuiltinConnection {
@@ -292,7 +293,7 @@ export function BuiltinProviders({ revision }: { revision: number }) {
               {provider.kind === 'codex' ? <p className="text-sm text-muted-foreground">Sign in to the upstream account and test inside Codex. The profile is not a stored upstream account. The API-key configuration below remains supported; use a separate scoped gateway key without token caps. Native Codex combos or their aliases may be used when eligible for the same signed-in account.</p>
                 : <p className="text-sm text-muted-foreground">Use a scoped gateway API key in the client environment, not the upstream Anthropic API key. Model IDs select their pinned backing connection. Claude subscription OAuth is not supported.</p>}
               <p className="text-xs text-muted-foreground">Use HTTPS for remote clients.</p>
-              <pre className="overflow-x-auto whitespace-pre-wrap break-all rounded-md bg-muted p-3 font-mono text-xs leading-relaxed">{config}</pre>
+              <pre aria-label="API key client configuration" className="overflow-x-auto whitespace-pre-wrap break-all rounded-md bg-muted p-3 font-mono text-xs leading-relaxed">{config}</pre>
               {provider.kind === 'codex' && <div className="space-y-2 border-t pt-3">
                 <div className="flex flex-wrap items-center justify-between gap-2"><h4 className="text-sm font-semibold">Alternative: Gateway OAuth</h4><Button variant="outline" size="sm" onClick={() => {
                   void navigator.clipboard?.writeText(gatewayOAuthConfig).then(() => toast.success('Gateway OAuth configuration copied'), () => toast.error('Clipboard unavailable'));
@@ -300,7 +301,7 @@ export function BuiltinProviders({ revision }: { revision: number }) {
                 }}><Copy className="mr-1 h-3.5 w-3.5" />Copy Gateway OAuth config</Button></div>
                 <p className="text-sm text-muted-foreground">Use this complete configuration instead of the API-key configuration, with a Codex version that supports gateway OAuth. Keep upstream sign-in enabled. Start gateway sign-in inside Codex, then approve an existing scoped API key in LDrouter. Do not combine both gateway credential methods.</p>
                 <p className="text-xs text-muted-foreground">The client receives LDrouter access and refresh tokens using the fixed loopback callback; these do not replace upstream account sign-in or refresh upstream tokens.</p>
-                <pre className="overflow-x-auto whitespace-pre-wrap break-all rounded-md bg-muted p-3 font-mono text-xs leading-relaxed">{gatewayOAuthConfig}</pre>
+                <pre aria-label="Gateway OAuth client configuration" className="overflow-x-auto whitespace-pre-wrap break-all rounded-md bg-muted p-3 font-mono text-xs leading-relaxed">{gatewayOAuthConfig}</pre>
               </div>}
             </div>
           </> : <>
@@ -334,6 +335,7 @@ export function BuiltinProviders({ revision }: { revision: number }) {
         </CardContent>
       </Card>}
     <GatewayOAuthGrants />
+    <QuotaRegistry />
 
     <Dialog open={createOpen && !!provider} onOpenChange={(next) => { if (!next && busy === null) clearCreate(); }}>
       <DialogContent className="max-h-[90vh] overflow-y-auto">

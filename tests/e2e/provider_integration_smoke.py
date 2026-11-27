@@ -199,12 +199,18 @@ def smoke(base, upstream):
             assert connection(kind, connection_id)["enabled"]
 
         def check_config(kind, prefix, copy=False):
-            config = builtin.locator("pre")
+            config = builtin.locator('pre[aria-label="API key client configuration"]')
             if kind == "codex":
                 expect(config).to_contain_text(f'model = "{prefix}/YOUR_IMPORTED_MODEL"')
                 expect(config).to_contain_text(base + "/backend-api/codex")
                 expect(config).to_contain_text(base + "/backend-api/codex/models")
                 expect(config).to_contain_text('env_http_headers = { "X-API-Key" = "LATEDEV_API_KEY" }')
+                oauth_config = builtin.locator('pre[aria-label="Gateway OAuth client configuration"]')
+                expect(oauth_config).to_contain_text(f'model = "{prefix}/YOUR_IMPORTED_MODEL"')
+                expect(oauth_config).to_contain_text(f'authorization_url = "{base}/oauth/authorize"')
+                expect(oauth_config).to_contain_text(f'token_url = "{base}/api/oauth/token"')
+                expect(oauth_config).to_contain_text('client_id = "ldrouter-codex"')
+                expect(oauth_config).not_to_contain_text('env_http_headers')
             else:
                 expect(config).to_contain_text("ANTHROPIC_BASE_URL=" + base)
                 expect(config).to_contain_text(f"ANTHROPIC_MODEL={prefix}/YOUR_IMPORTED_MODEL")
@@ -695,6 +701,42 @@ def smoke(base, upstream):
             assert ProviderFixture.calls == ["fixture-a"]
         finally:
             public_client.dispose()
+        quota_card = page.locator('[aria-label="Subscription quotas"]')
+        expect(quota_card.get_by_text("No quota accounts yet.", exact=True)).to_be_visible()
+        for provider_kind, account_name in [("codex", "Codex quota fixture"), ("claude_code", "Claude quota fixture")]:
+            quota_card.get_by_role("button", name="Add quota account", exact=True).click()
+            dialog = page.get_by_role("dialog", name="Add quota account")
+            dialog.get_by_label("Provider", exact=True).select_option(provider_kind)
+            dialog.get_by_label("Account name", exact=True).fill(account_name)
+            dialog.get_by_role("button", name="Save quota record", exact=True).click()
+            expect(dialog).not_to_be_visible()
+            expect(quota_card.get_by_role("region", name="Quota account " + account_name)).to_be_visible()
+        codex_quota = quota_card.get_by_role("region", name="Quota account Codex quota fixture")
+        claude_quota = quota_card.get_by_role("region", name="Quota account Claude quota fixture")
+        codex_quota.get_by_role("button", name="Update observation", exact=True).click()
+        dialog = page.get_by_role("dialog", name="Update quota observation")
+        dialog.get_by_label("Observation source").select_option("codex_app_server")
+        dialog.get_by_label("Codex rate-limit result JSON").fill(json.dumps({
+            "rateLimits": {"limitId": "codex", "planType": "plus", "primary": {
+                "usedPercent": 41, "windowDurationMins": 300,
+                "resetsAt": int(time.time()) + 3600,
+            }},
+            "accountId": "quota-fixture-account",
+        }))
+        dialog.get_by_role("button", name="Save quota record", exact=True).click()
+        expect(dialog).not_to_be_visible()
+        expect(codex_quota.get_by_text("41% used · 59% remaining", exact=True)).to_be_visible()
+        expect(claude_quota.get_by_text("Usage and reset times are unknown.", exact=True)).to_be_visible()
+        claude_quota.get_by_role("button", name="Update observation", exact=True).click()
+        dialog = page.get_by_role("dialog", name="Update quota observation")
+        dialog.get_by_label("Window label", exact=True).fill("Weekly")
+        dialog.get_by_label("Used %", exact=True).fill("75")
+        dialog.get_by_role("button", name="Save quota record", exact=True).click()
+        expect(dialog).not_to_be_visible()
+        expect(claude_quota.get_by_text("75% used · 25% remaining", exact=True)).to_be_visible()
+        expect(codex_quota.get_by_text("41% used · 59% remaining", exact=True)).to_be_visible()
+        assert len(get("/api/admin/subscription-quotas")["accounts"]) == 2
+        assert ProviderFixture.calls == ["fixture-a"]
         browser.close()
 
 

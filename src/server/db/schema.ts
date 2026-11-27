@@ -631,6 +631,23 @@ export const csrfTokens = sqliteTable(
 );
 
 // ============================================================================
+// Subscription quota observations (not credential-bearing provider connections)
+// ============================================================================
+
+export const subscriptionQuotaAccounts = sqliteTable('subscription_quota_accounts', {
+  id: text('id').primaryKey(),
+  providerKind: text('provider_kind').notNull(),
+  name: text('name').notNull(),
+  accountFingerprint: text('account_fingerprint'),
+  snapshotJson: text('snapshot_json'),
+  createdAtMs: integer('created_at_ms').notNull(),
+  updatedAtMs: integer('updated_at_ms').notNull(),
+}, (t) => ({
+  nameIdx: uniqueIndex('idx_subscription_quota_name').on(t.providerKind, t.name),
+  fingerprintIdx: uniqueIndex('idx_subscription_quota_identity').on(t.providerKind, t.accountFingerprint),
+}));
+
+// ============================================================================
 // Schema version tracking (for backup compatibility checks)
 // ============================================================================
 

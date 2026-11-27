@@ -16,6 +16,7 @@ import { registerSettingsRoutes } from './admin/settings';
 import { registerBackupRoutes } from './admin/backup';
 import { registerDashboardRoutes } from './admin/dashboard';
 import { registerGatewayOAuthAdminRoutes } from './gateway-oauth';
+import { registerQuotaRegistryRoutes } from './admin/quota-registry';
 
 export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
   // Setup routes are always reachable (used on first run).
@@ -46,6 +47,7 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
     await registerSettingsRoutes(instance);
     await registerDashboardRoutes(instance);
     await registerGatewayOAuthAdminRoutes(instance);
+    await registerQuotaRegistryRoutes(instance);
   });
 
   // Backup routes get their own scope. The first-run import (setup.tsx) must be reachable before

@@ -54,6 +54,37 @@ would be required for the applicable managed login flow. Do not interpret a
 saved Codex profile as a verified signed-in account or a newly saved Claude
 API key as verified until its connection test succeeds.
 
+## Subscription quota monitoring (schema 0021)
+
+Open Providers → Built-in Providers → Subscription quotas. Create a named
+monitoring record for each subscription account you are authorized to use,
+select Codex or Claude Code, and update its latest observation. This registry
+is independent of provider connections, model IDs and gateway API keys. It
+does not authenticate an account or make it available for routing.
+
+For Codex, read the quota from the signed-in official Codex client (/status
+or the ChatGPT usage screen), or import the result of the documented
+[Codex app-server `account/rateLimits/read`](https://learn.chatgpt.com/docs/app-server)
+method. The import supports primary and secondary windows from multiple
+limit buckets, including reported window durations, used percentages, reset
+timestamps and plan metadata when supplied. Use the result belonging to the
+selected account. An optional account identifier is stored only as a
+fingerprint to prevent accidentally replacing a bound record with another
+account's imported snapshot. Imported data is operator-supplied, not
+independently authenticated by LDrouter.
+
+For Claude Code, use the subscription's official Usage display to enter
+the observed percentages and reset times manually. The Anthropic API-key
+connection's rate limits, gateway token counters and subscription allowances
+are separate. Unknown values must not be interpreted as zero usage.
+
+Only normalized observations are persisted, with no raw app-server response
+or subscription credential. Both backup profiles retain these monitoring
+records. Data may be stale; passing a reset time never proves that a limit
+has recovered. Update from the official client before relying on it.
+There is no automatic upstream quota polling, credential collection,
+subscription pooling, quota aggregation, or quota-driven account selection.
+
 ## Identity and credential boundary
 
 Migration 0017 introduces `provider_integrations`, keyed by the existing
