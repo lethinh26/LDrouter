@@ -26,12 +26,12 @@ interface IpRule { mode: 'allow' | 'deny'; cidr: string; }
 type KeyDetail = Omit<KeyRow, 'concurrencyLimit'> & { maxConcurrent: number | null; permissions: Perm[]; ipRules: IpRule[] };
 const limits = [
   { field: 'rpmLimit', label: 'RPM limit', help: 'Requests per minute. A token bucket allows short bursts up to this value.' },
-  { field: 'tpmLimit', label: 'TPM limit', help: 'Tokens per minute, including input and output. The gateway reserves an estimate and reconciles it with usage.' },
+  { field: 'tpmLimit', label: 'TPM limit', help: 'Tokens per minute, including input and output. The gateway reserves an estimate and reconciles it with usage. Native Codex requests reject finite token limits.' },
   { field: 'concurrency', label: 'Concurrency', help: 'Maximum requests in progress at the same time, including streaming requests.' },
   { field: 'dailyTokenLimit', label: 'Daily tokens', help: 'Total input and output tokens per UTC calendar day. Resets at midnight UTC.' },
   { field: 'monthlyTokenLimit', label: 'Monthly tokens', help: 'Total input and output tokens per UTC calendar month. Resets on the first day of the month.' },
   { field: 'totalTokenLimit', label: 'Total tokens (lifetime)', help: 'Cumulative input and output tokens for this key, across all months. Never resets automatically; requests exceeding the remaining estimated budget are rejected.' },
-  { field: 'maxOutputTokensPerRequest', label: 'Max output tokens / request', help: 'Caps generated tokens per request. Larger requested values are reduced; if omitted, the gateway uses at most 1,024 or this cap, whichever is smaller.' },
+  { field: 'maxOutputTokensPerRequest', label: 'Max output tokens / request', help: 'Caps generated tokens per request. Larger requested values are reduced; if omitted, the gateway uses at most 1,024 or this cap, whichever is smaller. Native Codex rejects capped keys rather than bypassing the cap.' },
 ] as const;
 
 function emptyForm() {

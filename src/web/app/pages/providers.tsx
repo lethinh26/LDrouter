@@ -17,13 +17,18 @@ import { Play, Trash2 } from 'lucide-react';
 
 interface Provider {
   id: string; name: string; slug: string; type: 'openai' | 'anthropic'; baseUrl: string;
+  providerKind: 'compatible' | 'codex' | 'claude_code'; authMode: 'api_key' | 'client_oauth';
   enabled: boolean; health: string; modelCount: number;
 }
 
-const EMPTY = { name: '', slug: '', type: 'openai' as 'openai' | 'anthropic', baseUrl: 'https://api.openai.com', apiKey: '', customHeaders: '', enabled: true };
+const EMPTY = { name: '', slug: '', type: 'openai' as 'openai' | 'anthropic', providerKind: 'compatible' as Provider['providerKind'], baseUrl: 'https://api.openai.com', apiKey: '', customHeaders: '', enabled: true };
 const DEFAULT_BASE_URL: Record<'openai' | 'anthropic', string> = {
   openai: 'https://api.openai.com', anthropic: 'https://api.anthropic.com',
 };
+function integrationHelp(kind: Provider['providerKind'], slug: string) {
+  if (kind === 'codex') return `model_provider = "latedev-codex"\nmodel = "${slug || 'codex'}/YOUR_IMPORTED_MODEL"\n\n[model_providers.latedev-codex]\nname = "LateDev Codex"\nbase_url = "${window.location.origin}/backend-api/codex"\nmodel_catalog_url = "${window.location.origin}/backend-api/codex/models"\nwire_api = "responses"\nrequires_openai_auth = true\nsupports_websockets = false\nenv_http_headers = { "X-API-Key" = "LATEDEV_API_KEY" }`;
+  return `ANTHROPIC_BASE_URL=${window.location.origin}\nANTHROPIC_AUTH_TOKEN=YOUR_GATEWAY_API_KEY\nANTHROPIC_MODEL=${slug || 'claude-code'}/YOUR_IMPORTED_MODEL`;
+}
 export function Providers() {
   const [rows, setRows] = useState<Provider[]>([]);
   const [open, setOpen] = useState(false);
@@ -53,7 +58,7 @@ export function Providers() {
         try { customHeaders = JSON.parse(form.customHeaders); }
         catch { throw new Error('Custom headers must be valid JSON object'); }
       }
-      await api.post('/api/admin/providers', { name: form.name, slug: form.slug || undefined, type: form.type, baseUrl: form.baseUrl, apiKey: form.apiKey, customHeaders, enabled: form.enabled });
+      await api.post('/api/admin/providers', { name: form.name, slug: form.slug || undefined, type: form.type, providerKind: form.providerKind, baseUrl: form.baseUrl, apiKey: form.providerKind === 'codex' ? undefined : form.apiKey, customHeaders: form.providerKind === 'codex' ? undefined : customHeaders, enabled: form.enabled });
       toast.success('Provider created');
       setOpen(false);
       setForm(EMPTY);
@@ -74,7 +79,7 @@ export function Providers() {
 
   const startEdit = (p: Provider) => {
     setEditingId(p.id);
-    setEditForm({ ...EMPTY, name: p.name, slug: p.slug || '', type: p.type, baseUrl: p.baseUrl, apiKey: '', customHeaders: '', enabled: p.enabled });
+    setEditForm({ ...EMPTY, name: p.name, slug: p.slug || '', type: p.type, providerKind: p.providerKind, baseUrl: p.baseUrl, apiKey: '', customHeaders: '', enabled: p.enabled });
   };
 
   const editSubmit = async () => {
@@ -86,7 +91,7 @@ export function Providers() {
         try { customHeaders = JSON.parse(editForm.customHeaders); }
         catch { throw new Error('Custom headers must be valid JSON object'); }
       }
-      await api.patch('/api/admin/providers', { id: editingId, name: editForm.name, slug: editForm.slug || undefined, type: editForm.type, baseUrl: editForm.baseUrl, apiKey: editForm.apiKey || undefined, customHeaders, enabled: editForm.enabled });
+      await api.patch('/api/admin/providers', { id: editingId, name: editForm.name, slug: editForm.slug || undefined, type: editForm.type, providerKind: editForm.providerKind, baseUrl: editForm.baseUrl, apiKey: editForm.providerKind === 'codex' ? undefined : editForm.apiKey || undefined, customHeaders: editForm.providerKind === 'codex' ? undefined : customHeaders, enabled: editForm.enabled });
       toast.success('Provider updated');
       setEditingId(null);
       setEditForm(EMPTY);
@@ -107,32 +112,39 @@ export function Providers() {
       <PageHeader title="Providers" description="Upstream LLM providers and their credentials" actions={
         <div className="flex gap-2">
           <Dialog open={open} onOpenChange={setOpen}>
-            <DialogTrigger asChild><Button>Add compatible provider</Button></DialogTrigger>
-            <DialogContent>
+            <DialogTrigger asChild><Button>Add provider</Button></DialogTrigger>
+            <DialogContent className="max-h-[90vh] overflow-y-auto">
               <DialogHeader>
                 <DialogTitle>New provider</DialogTitle>
-                <DialogDescription>API-key or compatible endpoint.</DialogDescription>
+                <DialogDescription>Choose an upstream integration and credential mode.</DialogDescription>
               </DialogHeader>
               <div className="space-y-3">
                 <div><Label htmlFor="provider-name">Name</Label><Input id="provider-name" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></div>
                 <div><Label htmlFor="provider-slug">Slug (optional)</Label><Input id="provider-slug" value={form.slug} onChange={(e) => setForm({ ...form, slug: e.target.value })} /><p className="mt-1 text-xs text-muted-foreground">Unique model prefix. Defaults to the normalized name. Reserved prefix: combo. The slug is locked after models are imported.</p></div>
                 <div><Label>Type</Label>
-                  <Select value={form.type} onValueChange={(v) => setForm((current) => ({ ...current, type: v as 'openai' | 'anthropic', baseUrl: DEFAULT_BASE_URL[v as 'openai' | 'anthropic'] }))}>
+                  <Select value={form.providerKind === 'compatible' ? form.type : form.providerKind} onValueChange={(v) => setForm((current) => {
+                    const type = v === 'anthropic' || v === 'claude_code' ? 'anthropic' : 'openai';
+                    return { ...current, type, providerKind: v === 'codex' || v === 'claude_code' ? v : 'compatible', baseUrl: v === 'codex' ? 'https://chatgpt.com' : DEFAULT_BASE_URL[type], apiKey: '', customHeaders: '' };
+                  })}>
                     <SelectTrigger><SelectValue /></SelectTrigger>
                     <SelectContent>
                       <SelectItem value="openai">OpenAI-compatible</SelectItem>
                       <SelectItem value="anthropic">Anthropic-compatible</SelectItem>
+                      <SelectItem value="codex">Codex (client sign-in)</SelectItem>
+                      <SelectItem value="claude_code">Claude Code (API key)</SelectItem>
                     </SelectContent>
                   </Select>
                 </div>
-                <div><Label htmlFor="provider-base-url">Base URL</Label><Input id="provider-base-url" value={form.baseUrl} onChange={(e) => setForm({ ...form, baseUrl: e.target.value })} /></div>
-                <div><Label htmlFor="provider-api-key">API key</Label><Input id="provider-api-key" type="password" value={form.apiKey} onChange={(e) => setForm({ ...form, apiKey: e.target.value })} /></div>
-                <div><Label htmlFor="provider-headers">Custom headers (JSON)</Label><Input id="provider-headers" value={form.customHeaders} onChange={(e) => setForm({ ...form, customHeaders: e.target.value })} placeholder='{"X-Org":"acme"}' /></div>
+                <div><Label htmlFor="provider-base-url">Base URL</Label><Input id="provider-base-url" disabled={form.providerKind !== 'compatible'} value={form.baseUrl} onChange={(e) => setForm({ ...form, baseUrl: e.target.value })} /></div>
+                {form.providerKind !== 'codex' && <div><Label htmlFor="provider-api-key">API key</Label><Input id="provider-api-key" type="password" value={form.apiKey} onChange={(e) => setForm({ ...form, apiKey: e.target.value })} /></div>}
+                {form.providerKind === 'compatible' && <div><Label htmlFor="provider-headers">Custom headers (JSON)</Label><Input id="provider-headers" value={form.customHeaders} onChange={(e) => setForm({ ...form, customHeaders: e.target.value })} placeholder='{"X-Org":"acme"}' /></div>}
+                {form.providerKind === 'codex' && <p className="rounded-md border p-3 text-sm text-muted-foreground">Sign in inside Codex. LateDev never stores your ChatGPT token. Import model IDs manually, then connect with a separate scoped gateway key. Token caps and combos are not supported.</p>}
+                {form.providerKind === 'claude_code' && <p className="rounded-md border p-3 text-sm text-muted-foreground">Use your own Anthropic API key. Claude subscription OAuth tokens are not supported.</p>}
                 <div className="flex items-center gap-2"><Switch checked={form.enabled} onCheckedChange={(v) => setForm({ ...form, enabled: v })} /><Label>Enabled</Label></div>
               </div>
               <DialogFooter>
                 <Button variant="outline" onClick={() => setOpen(false)}>Cancel</Button>
-                <Button disabled={submitting || !form.name || !form.apiKey} onClick={submit}>{submitting ? 'Creating…' : 'Create'}</Button>
+                <Button disabled={submitting || !form.name || (form.providerKind !== 'codex' && !form.apiKey)} onClick={submit}>{submitting ? 'Creating…' : 'Create'}</Button>
               </DialogFooter>
             </DialogContent>
           </Dialog>
@@ -158,14 +170,14 @@ export function Providers() {
               {rows.map((p) => (
                 <TableRow key={p.id}>
                   <TableCell className="font-medium">{p.name} <span className="text-xs text-muted-foreground">{p.slug}</span></TableCell>
-                  <TableCell><Badge variant="outline">{p.type}</Badge></TableCell>
+                  <TableCell><Badge variant="outline">{p.providerKind === 'codex' ? 'Codex OAuth' : p.providerKind === 'claude_code' ? 'Claude Code' : p.type}</Badge></TableCell>
                   <TableCell className="text-xs text-muted-foreground">{p.baseUrl}</TableCell>
                   <TableCell>{p.modelCount}</TableCell>
                   <TableCell><Badge variant={p.health === 'healthy' ? 'success' : p.health === 'down' ? 'destructive' : 'secondary'}>{p.health}</Badge></TableCell>
                   <TableCell>{p.enabled ? 'Yes' : 'No'}</TableCell>
                   <TableCell className="text-right">
                     <div className="flex justify-end gap-1">
-                      <Button size="sm" variant="outline" disabled={testingId === p.id} onClick={() => test(p.id)}><Play className="h-3 w-3" /></Button>
+                      <Button size="sm" variant="outline" title={p.providerKind === 'codex' ? 'Test from signed-in Codex client' : 'Test connection'} disabled={testingId === p.id || p.providerKind === 'codex'} onClick={() => test(p.id)}><Play className="h-3 w-3" /></Button>
                       <Button size="sm" variant="outline" onClick={() => startEdit(p)}>✎</Button>
                       <Button size="sm" variant="outline" onClick={() => setDeletingId(p.id)}><Trash2 className="h-3 w-3" /></Button>
                     </div>
@@ -179,23 +191,26 @@ export function Providers() {
 
       {/* Edit Dialog */}
       <Dialog open={!!editingId} onOpenChange={(open) => { if (!open) { setEditingId(null); setEditForm(EMPTY); } }}>
-        <DialogContent>
+        <DialogContent className="max-h-[90vh] overflow-y-auto">
           <DialogHeader><DialogTitle>Edit provider</DialogTitle></DialogHeader>
           <div className="space-y-3">
             <div><Label>Name</Label><Input value={editForm.name} onChange={(e) => setEditForm({ ...editForm, name: e.target.value })} /></div>
             <div><Label htmlFor="edit-provider-slug">Slug</Label><Input id="edit-provider-slug" value={editForm.slug} disabled={slugLocked} onChange={(e) => setEditForm({ ...editForm, slug: e.target.value })} /><p className="mt-1 text-xs text-muted-foreground">{slugLocked ? 'Locked to preserve existing public model IDs and client configurations.' : 'Unique model prefix; may be changed before importing models.'}</p></div>
             <div><Label>Type</Label>
-              <Select value={editForm.type} disabled>
+              <Select value={editForm.providerKind === 'compatible' ? editForm.type : editForm.providerKind} disabled>
                 <SelectTrigger><SelectValue /></SelectTrigger>
                 <SelectContent>
                   <SelectItem value="openai">OpenAI-compatible</SelectItem>
                   <SelectItem value="anthropic">Anthropic-compatible</SelectItem>
+                  <SelectItem value="codex">Codex (client sign-in)</SelectItem>
+                  <SelectItem value="claude_code">Claude Code (API key)</SelectItem>
                   </SelectContent>
               </Select>
             </div>
-            <div><Label>Base URL</Label><Input value={editForm.baseUrl} onChange={(e) => setEditForm({ ...editForm, baseUrl: e.target.value })} /></div>
-            <div><Label>API key (leave empty to keep current)</Label><Input type="password" value={editForm.apiKey} onChange={(e) => setEditForm({ ...editForm, apiKey: e.target.value })} /></div>
-            <div><Label>Custom headers (JSON)</Label><Input value={editForm.customHeaders} onChange={(e) => setEditForm({ ...editForm, customHeaders: e.target.value })} placeholder='{"X-Org":"acme"}' /></div>
+            <div><Label>Base URL</Label><Input disabled={editForm.providerKind !== 'compatible'} value={editForm.baseUrl} onChange={(e) => setEditForm({ ...editForm, baseUrl: e.target.value })} /></div>
+            {editForm.providerKind !== 'codex' && <div><Label>API key (leave empty to keep current)</Label><Input type="password" value={editForm.apiKey} onChange={(e) => setEditForm({ ...editForm, apiKey: e.target.value })} /></div>}
+            {editForm.providerKind === 'compatible' && <div><Label>Custom headers (JSON)</Label><Input value={editForm.customHeaders} onChange={(e) => setEditForm({ ...editForm, customHeaders: e.target.value })} placeholder='{"X-Org":"acme"}' /></div>}
+            {editForm.providerKind !== 'compatible' && <div className="space-y-2 rounded-md border p-3"><Label>Client configuration</Label><p className="text-xs text-muted-foreground">Import a model first. Replace the placeholders and set the gateway key in the client environment. Use HTTPS for remote clients.</p><pre className="overflow-auto whitespace-pre-wrap break-all text-xs">{integrationHelp(editForm.providerKind, editingProvider?.slug ?? editForm.slug)}</pre><Button variant="outline" size="sm" onClick={() => { void navigator.clipboard.writeText(integrationHelp(editForm.providerKind, editingProvider?.slug ?? editForm.slug)).then(() => toast.success('Configuration copied'), () => toast.error('Clipboard unavailable')); }}>Copy configuration</Button></div>}
             <div className="flex items-center gap-2"><Switch checked={editForm.enabled} onCheckedChange={(v) => setEditForm({ ...editForm, enabled: v })} /><Label>Enabled</Label></div>
           </div>
           <DialogFooter>

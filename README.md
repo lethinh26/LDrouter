@@ -70,7 +70,7 @@ Restore validates the container, checksum, gzip, SQLite integrity, schema versio
 
 ### Upgrade from retired provider integrations
 
-Only OpenAI-compatible and Anthropic-compatible providers are supported. Schema migration 0014 permanently removes retired Codex/Qoder provider configuration and account credentials, removes invalid combo members, aliases and model permissions, and invalidates affected response-cache entries. Remaining combo priority and API-key restrictions are preserved; a combo with no surviving members is disabled. Generic request/attempt history and daily statistics are retained, although removed provider/model names may be shown as historical IDs.
+OpenAI-compatible and Anthropic-compatible providers remain supported. Migration 0014 permanently removes the retired Codex/Qoder account pools and their credentials; remaining routing restrictions and history are preserved. Migration 0017 adds separate client integration metadata for Codex client-owned sign-in and Claude Code API-key mode, without restoring those pools. See [client integrations](docs/14-CLIENT-INTEGRATIONS.md) for configuration and limitations.
 
 Take a full backup before upgrading and retain its passphrase. Older backups are migrated before activation, so restoring one in the new version does not bring retired integrations back. A downgrade requires the earlier application and a pre-upgrade backup; the upgraded schema cannot be downgraded in place.
 

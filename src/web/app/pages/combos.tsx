@@ -21,7 +21,7 @@ import { cn } from '../../lib/utils';
 interface Combo { id: string; name: string; slug: string; publicModelId: string; enabled: boolean; memberCount: number; healthyMemberCount: number; slowCooldownCount: number; slowProbeCount: number; status: string; unavailableReasons: string[]; capabilityWarnings: string[]; }
 interface SlowStateView { modelId: string; workload: string; latencyKind: 'ttft' | 'completion'; medianLatencyMs: number | null; sampleCount: number; consecutiveSlowCount: number; relativeSlowCount: number; degraded: 'absolute' | 'relative' | null; comparatorModelId: string | null; probeDueMs: number | null; probeLeaseUntilMs: number | null; recoverySuccesses: number; lastLatencyMs: number | null; updatedAtMs: number; state: string }
 interface ComboDetail extends Combo { maxTotalAttempts: number; maxRequestDurationSeconds: number | null; fallbackOnConnection: boolean; fallbackOnConnectTimeout: boolean; fallbackOnFirstTokenTimeout: boolean; fallbackOnTotalTimeout: boolean; fallbackOn408: boolean; fallbackOn429: boolean; fallbackOn5xx: boolean; slowResponseFallbackEnabled: boolean; slowResponseThresholdSeconds: number; slowResponseMaxCount: number; members: Array<{ id: string; modelId: string; publicModelId: string; upstreamModelId: string; displayName: string; providerSlug: string; position: number; enabled: boolean; upstreamAvailable: boolean; providerEnabled: boolean; providerHealth: string; circuitOpen: boolean; capabilities: Record<string, unknown>; status: { state: string; reason: string }; adaptiveStates: SlowStateView[] }>; capabilityWarnings: string[]; }
-interface ModelRow { id: string; publicModelId: string; upstreamModelId: string; displayName: string; providerSlug: string; enabled: boolean; upstreamAvailable: boolean; providerEnabled: boolean; providerHealth: string; providerTotalTimeoutMs: number | null; circuitOpen: boolean; capabilities: Record<string, unknown>; }
+interface ModelRow { id: string; publicModelId: string; upstreamModelId: string; displayName: string; providerSlug: string; providerKind?: string; enabled: boolean; upstreamAvailable: boolean; providerEnabled: boolean; providerHealth: string; providerTotalTimeoutMs: number | null; circuitOpen: boolean; capabilities: Record<string, unknown>; }
 interface MemberForm { id?: string; modelId: string; position: number; enabled: boolean }
 interface ComboTestResult {
   success: boolean;
@@ -491,7 +491,7 @@ function MemberPicker({ models, addedIds, onAdd }: { models: ModelRow[]; addedId
       return m.publicModelId.toLowerCase().includes(s) || m.displayName.toLowerCase().includes(s);
     })
     : models;
-  const available = filtered.filter((m) => !addedIds.includes(m.id));
+  const available = filtered.filter((m) => m.providerKind !== 'codex' && !addedIds.includes(m.id));
   return (
     <div className="space-y-1">
       <div className="relative">
