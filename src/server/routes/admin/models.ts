@@ -4,8 +4,6 @@ import { z } from 'zod';
 import { eq, sql } from 'drizzle-orm';
 import { getDb, getDatabaseEpoch, schema } from '../../db/index';
 import { assertRoutingNameFree } from '../../routing/namespace';
-import { providerIntegration } from '../../providers/integration';
-import { BUILTIN_PROVIDERS, assertBuiltinNamespaceAvailable, connectionNamespaceMode, providerPublicPrefix } from '../../providers/builtin';
 import { requireAdminAuth } from '../../auth/middleware';
 import { recordAudit } from '../../db/repositories/audit';
 import { uuid } from '../../auth/ids';
@@ -51,8 +49,6 @@ export async function registerModelRoutes(app: FastifyInstance): Promise<void> {
     let rows = db.select().from(schema.models).all();
     const providers = db.select().from(schema.providers).all();
     const providerMap = new Map(providers.map((p) => [p.id, p]));
-    const providerPrefixes = new Map(providers.map(p => [p.id, providerPublicPrefix(db, p)]));
-    const integrationMap = new Map(db.select().from(schema.providerIntegrations).all().map(i => [i.providerId, i]));
     if (q.providerId) rows = rows.filter((r) => r.providerId === q.providerId);
     if (q.enabled !== undefined) rows = rows.filter((r) => r.enabled === (q.enabled === 'true'));
     if (q.upstreamAvailable !== undefined) rows = rows.filter((r) => r.upstreamAvailable === (q.upstreamAvailable === 'true'));
@@ -65,9 +61,8 @@ export async function registerModelRoutes(app: FastifyInstance): Promise<void> {
     const models = rows.map((m) => ({
       id: m.id,
       providerId: m.providerId,
-      providerSlug: providerPrefixes.get(m.providerId) ?? '',
+      providerSlug: providerMap.get(m.providerId)?.slug ?? '',
       providerType: providerMap.get(m.providerId)?.type ?? 'openai',
-      providerKind: integrationMap.get(m.providerId)?.providerKind ?? 'compatible',
       publicModelId: m.publicModelId,
       upstreamModelId: m.upstreamModelId,
       displayName: m.displayName,
@@ -93,11 +88,6 @@ export async function registerModelRoutes(app: FastifyInstance): Promise<void> {
     const provider = db.select().from(schema.providers).where(eq(schema.providers.id, body.providerId)).get();
     if (!provider) throw new GatewayError('invalid_request_error', 'Provider not found', { status: 404 });
     const epoch = getDatabaseEpoch();
-    const integration = providerIntegration(provider);
-    const codex = integration.authMode === 'client_oauth';
-    if (codex && body.modelIds.some(id => !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(id))) {
-      throw new GatewayError('invalid_request_error', 'Codex model IDs must be exact upstream catalog slugs', { status: 400 });
-    }
 
     // Fetch discovered model metadata fresh (so import uses current discovery data)
     // For simplicity: re-discover and match by upstream id.
@@ -108,13 +98,11 @@ export async function registerModelRoutes(app: FastifyInstance): Promise<void> {
       if (!provider.encryptedApiKey || !provider.apiKeyNonce) throw new GatewayError('invalid_request_error', 'Provider credentials are missing', { status: 501 });
       const apiKey = decryptSecret({ ciphertext: provider.encryptedApiKey, nonce: provider.apiKeyNonce, version: provider.apiKeyVersion });
       const headers = decryptCustomHeaders(provider.customHeadersEncrypted && provider.customHeadersNonce ? { ciphertext: provider.customHeadersEncrypted, nonce: provider.customHeadersNonce, version: 1 } : null);
-      discovered = await discoverProviderModels({ type: provider.type, providerKind: integration.providerKind, baseUrl: provider.baseUrl, apiKey, customHeaders: headers, connectTimeoutMs: 5000, totalTimeoutMs: 30000 });
-    } catch (e) {
-      if (integration.providerKind === 'claude_code') throw e;
+      discovered = await discoverProviderModels({ type: provider.type, baseUrl: provider.baseUrl, apiKey, customHeaders: headers, connectTimeoutMs: 5000, totalTimeoutMs: 30000 });
+    } catch {
       discovered = [];
     }
     const discMap = new Map(discovered.map((d) => [d.upstreamId, d]));
-    if (integration.providerKind === 'claude_code' && body.modelIds.some(id => !discMap.has(id))) throw new GatewayError('invalid_request_error', 'Requested Claude model is absent from the current upstream catalog', { status: 400 });
     const now = new Date().toISOString();
     if (epoch !== getDatabaseEpoch()) throw new GatewayError('invalid_request_error', 'Database changed during discovery; retry import', { status: 409 });
     let imported = 0;
@@ -123,17 +111,10 @@ export async function registerModelRoutes(app: FastifyInstance): Promise<void> {
     if (!current || current.slug !== provider.slug || current.updatedAt !== provider.updatedAt) {
       throw new GatewayError('invalid_request_error', 'Provider changed during discovery; retry import', { status: 409 });
     }
-    const canonical = connectionNamespaceMode(tx, provider.id) === 'canonical';
-    const prefix = providerPublicPrefix(tx, current);
-    if (canonical) {
-      const builtin = BUILTIN_PROVIDERS.find(b => b.kind === integration.providerKind);
-      if (!builtin) throw new GatewayError('gateway_error', 'Invalid built-in connection', { status: 500 });
-      assertBuiltinNamespaceAvailable(tx, builtin);
-    }
     for (const upstreamId of new Set(body.modelIds)) {
       const existing = tx.select().from(schema.models).where(sql`provider_id = ${provider.id} AND upstream_model_id = ${upstreamId}`).get();
       const disc = discMap.get(upstreamId);
-      const caps = codex ? { chat: false, responses: true, streaming: true, tools: true } as Record<string, unknown> : (disc?.capabilities as Record<string, unknown>) ?? { chat: true, streaming: true, tools: true };
+      const caps = (disc?.capabilities as Record<string, unknown>) ?? { chat: true, streaming: true, tools: true };
       if (existing) {
         // Refresh capabilities so stale discoveries (e.g. a wrong
         // `image_input: false`) heal on re-import, while admin edits survive.
@@ -154,10 +135,7 @@ export async function registerModelRoutes(app: FastifyInstance): Promise<void> {
           .run();
         continue;
       }
-      const publicModelId = `${prefix}/${upstreamId}`;
-      if (canonical && tx.select({ id: schema.models.id }).from(schema.models).where(eq(schema.models.publicModelId, publicModelId)).get()) {
-        throw new GatewayError('invalid_request_error', 'This built-in model is already bound to another connection; its identity and permissions were not changed', { status: 409, code: 'builtin_model_bound' });
-      }
+      const publicModelId = `${provider.slug}/${upstreamId}`;
       assertRoutingNameFree(tx, publicModelId, 'model');
       tx.insert(schema.models).values({
         id: uuid(),
@@ -239,7 +217,6 @@ export async function registerModelRoutes(app: FastifyInstance): Promise<void> {
     if (!m.upstreamAvailable) throw new GatewayError('invalid_request_error', 'Model is not available upstream', { status: 400 });
     const provider = db.select().from(schema.providers).where(eq(schema.providers.id, m.providerId)).get();
     if (!provider || !provider.enabled) throw new GatewayError('invalid_request_error', 'Provider is disabled', { status: 400 });
-    if (providerIntegration(provider).authMode === 'client_oauth') throw new GatewayError('invalid_request_error', 'Test this model from the signed-in Codex client', { status: 400 });
 
     // Hijack reply so runner streams SSE directly to the client.
     reply.hijack();
@@ -333,7 +310,6 @@ export async function registerModelRoutes(app: FastifyInstance): Promise<void> {
     if (!m.upstreamAvailable) throw new GatewayError('invalid_request_error', 'Model is not available upstream', { status: 400 });
     const provider = db.select().from(schema.providers).where(eq(schema.providers.id, m.providerId)).get();
     if (!provider || !provider.enabled) throw new GatewayError('invalid_request_error', 'Provider is disabled', { status: 400 });
-    if (providerIntegration(provider).authMode === 'client_oauth') throw new GatewayError('invalid_request_error', 'Test this model from the signed-in Codex client', { status: 400 });
 
     const { GatewayRunner } = await import('../../gateway/runner');
     const runner = new GatewayRunner();

@@ -13,8 +13,6 @@ export interface ComboMember {
 
 export interface ComboPlan {
   comboId: string;
-  comboKind?: 'standard' | 'codex_native';
-  configVersion?: number;
   mode: 'fallback';
   maxTotalAttempts: number;
   slowResponseFallbackEnabled?: boolean;
@@ -42,11 +40,9 @@ export function loadCombo(comboId: string): ComboPlan | null {
   const members = db.select().from(schema.comboMembers).where(eq(schema.comboMembers.comboId, comboId)).all();
   return {
     comboId: c.id,
-    comboKind: c.comboKind,
-    configVersion: c.configVersion,
     mode: 'fallback',
     maxTotalAttempts: c.maxTotalAttempts,
-    slowResponseFallbackEnabled: c.comboKind !== 'codex_native' && c.slowResponseFallbackEnabled,
+    slowResponseFallbackEnabled: c.slowResponseFallbackEnabled,
     slowResponseThresholdMs: c.slowResponseThresholdSeconds * 1000,
     slowResponseMaxCount: c.slowResponseMaxCount,
     slowResponseGeneration: c.slowResponseGeneration,
@@ -59,7 +55,7 @@ export function loadCombo(comboId: string): ComboPlan | null {
       firstTokenTimeout: c.fallbackOnFirstTokenTimeout,
       totalTimeout: c.fallbackOnTotalTimeout,
       on408: c.fallbackOn408,
-      on429: c.comboKind !== 'codex_native' && c.fallbackOn429,
+      on429: c.fallbackOn429,
       on5xx: c.fallbackOn5xx,
     },
   };

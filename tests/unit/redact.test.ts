@@ -14,12 +14,6 @@ describe('redactValue', () => {
     expect(out).toEqual({ authorization: '[REDACTED]', x: 1 });
   });
 
-  it('redacts first-party OAuth codes, refresh/access tokens and the separate gateway header', () => {
-    const tokens = [...['a', 'r', 'c'].map(kind => 'ldo-' + kind + '-' + 'x'.repeat(43)), 'ldq-' + 'x'.repeat(43)];
-    for (const token of tokens) expect(redactString('value=' + token)).toBe('value=[REDACTED]');
-    expect(redactValue({ 'x-gateway-token': 'Bearer ' + tokens[0] })).toEqual({ 'x-gateway-token': '[REDACTED]' });
-  });
-
   it('redacts nested api keys', () => {
     const out = redactValue({ provider: { apiKey: 'sk-real-secret' } });
     expect((out as Record<string, unknown>).provider).toEqual({ apiKey: '[REDACTED]' });

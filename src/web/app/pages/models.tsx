@@ -42,8 +42,8 @@ interface ModelRow {
   enabled: boolean; upstreamAvailable: boolean; capabilities: Record<string, unknown>;
   discoveredCapabilities: Record<string, unknown> | null; maxContextTokens: number | null; maxOutputTokens: number | null;
 }
-interface Provider { id: string; name: string; slug: string; type: string; providerKind?: string; }
-interface Discovered { upstreamId: string; displayName: string; capabilities: Record<string, unknown>; alreadyImported: boolean; existingModelId: string | null; boundElsewhere?: boolean; boundConnectionName?: string | null; }
+interface Provider { id: string; name: string; slug: string; type: string; }
+interface Discovered { upstreamId: string; displayName: string; capabilities: Record<string, unknown>; alreadyImported: boolean; existingModelId: string | null; }
 interface TestResult {
   success: boolean;
   text: string;
@@ -67,11 +67,9 @@ export function Models() {
   const [expandedProviders, setExpandedProviders] = useState<Set<string>>(new Set());
   const [fetchOpen, setFetchOpen] = useState(false);
   const [fetchProviderId, setFetchProviderId] = useState<string>('');
-  const [manualModels, setManualModels] = useState('');
   const [discovered, setDiscovered] = useState<Discovered[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [fetching, setFetching] = useState(false);
-  const [importing, setImporting] = useState(false);
   const [search, setSearch] = useState('');
   const [discoverSearch, setDiscoverSearch] = useState('');
   const [testingId, setTestingId] = useState<string | null>(null);
@@ -127,9 +125,6 @@ export function Models() {
 
   const sortedProviders = [...providers].sort((a, b) => compareAlphabetically(a.name || a.slug, b.name || b.slug));
   const providerById = new Map(providers.map((provider) => [provider.id, provider]));
-  const manualImport = providerById.get(fetchProviderId)?.providerKind === 'codex';
-  const manualIds = [...new Set(manualModels.split(/[\s,]+/).filter(Boolean))];
-  const discoveryBusy = fetching || importing;
   const providerGroups = Array.from(filtered.reduce((groups, model) => {
     const provider = providerById.get(model.providerId);
     const id = model.providerId || model.providerSlug;
@@ -168,10 +163,8 @@ export function Models() {
   });
 
   const fetch = async () => {
-    if (!fetchProviderId || discoveryBusy) return;
+    if (!fetchProviderId) return;
     setFetching(true);
-    setDiscovered([]);
-    setSelected(new Set());
     try {
       const r = await api.post<{ models: Discovered[] }>(`/api/admin/providers/${fetchProviderId}/discover`);
       setDiscovered(r.models);
@@ -181,16 +174,13 @@ export function Models() {
   };
 
   const importSelected = async () => {
-    const modelIds = manualImport ? manualIds : Array.from(selected);
-    if (!fetchProviderId || !modelIds.length || discoveryBusy) return;
-    setImporting(true);
+    if (selected.size === 0) return;
     try {
-      const r = await api.post<{ imported: number; requested: number }>('/api/admin/models/import', { providerId: fetchProviderId, modelIds });
+      const r = await api.post<{ imported: number; requested: number }>('/api/admin/models/import', { providerId: fetchProviderId, modelIds: Array.from(selected) });
       toast.success(`Imported ${r.imported} of ${r.requested}`);
-      setFetchOpen(false); setFetchProviderId(''); setDiscovered([]); setSelected(new Set()); setManualModels(''); setDiscoverSearch('');
+      setFetchOpen(false); setDiscovered([]); setSelected(new Set());
       void reload();
     } catch (e) { toast.error((e as Error).message); }
-    finally { setImporting(false); }
   };
 
   const handleDelete = async () => {
@@ -305,11 +295,7 @@ export function Models() {
   return (
     <div>
       <PageHeader title="Models" description="Physical models imported from providers" actions={
-        <Dialog open={fetchOpen} onOpenChange={(open) => {
-          if (discoveryBusy) return;
-          setFetchOpen(open);
-          if (!open) { setFetchProviderId(''); setDiscovered([]); setSelected(new Set()); setManualModels(''); setDiscoverSearch(''); }
-        }}>
+        <Dialog open={fetchOpen} onOpenChange={setFetchOpen}>
           <DialogTrigger asChild>
             <Button variant="outline"><Download className="mr-1 h-4 w-4" /> Fetch models</Button>
           </DialogTrigger>
@@ -318,15 +304,14 @@ export function Models() {
             <div className="space-y-3">
               <div className="flex items-end gap-2">
                 <div className="flex-1">
-                  <Select value={fetchProviderId} disabled={discoveryBusy} onValueChange={(id) => { setFetchProviderId(id); setDiscovered([]); setSelected(new Set()); setManualModels(''); setDiscoverSearch(''); }}>
+                  <Select value={fetchProviderId} onValueChange={setFetchProviderId}>
                     <SelectTrigger><SelectValue placeholder="Choose provider" /></SelectTrigger>
                     <SelectContent>{providers.map((p) => <SelectItem key={p.id} value={p.id}>{p.name}</SelectItem>)}</SelectContent>
                   </Select>
                 </div>
-                {!manualImport && <Button onClick={fetch} disabled={!fetchProviderId || discoveryBusy}>{fetching ? 'Fetching…' : 'Fetch'}</Button>}
+                <Button onClick={fetch} disabled={!fetchProviderId || fetching}>{fetching ? 'Fetching…' : 'Fetch'}</Button>
               </div>
-              {manualImport && <div className="space-y-2"><p className="text-sm text-muted-foreground">Enter exact upstream model IDs available to your signed-in Codex client. Separate IDs with commas or newlines. Account availability is verified when the client fetches its catalog.</p><textarea aria-label="Codex upstream model IDs" className="min-h-24 w-full rounded-md border bg-background p-3 font-mono text-sm" value={manualModels} onChange={(e) => setManualModels(e.target.value)} placeholder="YOUR_UPSTREAM_MODEL_ID" /></div>}
-              {!manualImport && discovered.length > 0 && (
+              {discovered.length > 0 && (
                 <div className="space-y-2">
                   <div className="flex items-center justify-between gap-2">
                     <div className="flex items-center gap-2 flex-1">
@@ -340,7 +325,7 @@ export function Models() {
                     </div>
                     <div className="flex items-center gap-2">
                       <span className="text-sm text-muted-foreground">{filteredDiscovered.length} / {discovered.length} · {selected.size} selected</span>
-                      <Button variant="outline" size="sm" onClick={() => setSelected(new Set(filteredDiscovered.filter((d) => !d.alreadyImported && !d.boundElsewhere).map((d) => d.upstreamId)))}>Select All (new)</Button>
+                      <Button variant="outline" size="sm" onClick={() => setSelected(new Set(filteredDiscovered.filter((d) => !d.alreadyImported).map((d) => d.upstreamId)))}>Select All (new)</Button>
                       <Button variant="outline" size="sm" onClick={() => setSelected(new Set())}>Clear</Button>
                     </div>
                   </div>
@@ -352,7 +337,6 @@ export function Models() {
                         <label key={d.upstreamId} className="flex items-center gap-2 rounded p-1 text-sm hover:bg-accent">
                           <Checkbox
                             checked={selected.has(d.upstreamId)}
-                            disabled={d.boundElsewhere}
                             onCheckedChange={(c) => {
                               const next = new Set(selected);
                               if (c) next.add(d.upstreamId); else next.delete(d.upstreamId);
@@ -361,7 +345,6 @@ export function Models() {
                           />
                           <span className="font-mono text-xs">{d.upstreamId}</span>
                           {d.alreadyImported && <Badge variant="secondary">imported</Badge>}
-                          {d.boundElsewhere && <Badge variant="outline">Bound to {d.boundConnectionName ?? 'another connection'}</Badge>}
                         </label>
                       ))
                     )}
@@ -370,8 +353,8 @@ export function Models() {
               )}
             </div>
             <DialogFooter>
-              <Button variant="outline" disabled={discoveryBusy} onClick={() => { setFetchOpen(false); setFetchProviderId(''); setDiscovered([]); setSelected(new Set()); setManualModels(''); setDiscoverSearch(''); }}>Cancel</Button>
-              <Button disabled={discoveryBusy || (manualImport ? !manualIds.length : selected.size === 0)} onClick={importSelected}>{importing ? 'Importing…' : `Import ${(manualImport ? manualIds.length : selected.size) || ''}`}</Button>
+              <Button variant="outline" onClick={() => setFetchOpen(false)}>Cancel</Button>
+              <Button disabled={selected.size === 0} onClick={importSelected}>Import {selected.size || ''}</Button>
             </DialogFooter>
           </DialogContent>
         </Dialog>
@@ -407,7 +390,6 @@ export function Models() {
             </div>}
             {providerGroups.map((group) => {
               const expanded = search.trim().length > 0 || expandedProviders.has(group.id);
-              const native = providerById.get(group.id)?.providerKind === 'codex';
               const availableCount = group.models.filter((model) => model.upstreamAvailable).length;
               const enabledCount = group.models.filter((model) => model.enabled).length;
               const contentId = `provider-models-${group.id}`;
@@ -419,14 +401,14 @@ export function Models() {
                       <span className="min-w-0">
                         <span className="flex flex-wrap items-center gap-2">
                           <span className="truncate font-semibold text-foreground">{group.name}</span>
-                          <Badge variant="outline">{native ? 'Codex native' : group.type}</Badge>
+                          <Badge variant="outline">{group.type}</Badge>
                         </span>
                         <span className="mt-1 block truncate text-xs font-normal text-muted-foreground">{group.slug}</span>
                       </span>
                     </span>
                     <span className="flex shrink-0 items-center gap-2">
                       <Badge variant="secondary">{group.models.length} models</Badge>
-                      <Badge variant={availableCount > 0 ? (native ? 'outline' : 'success') : 'destructive'}>{availableCount} {native ? 'eligible · account unverified' : 'available'}</Badge>
+                      <Badge variant={availableCount > 0 ? 'success' : 'destructive'}>{availableCount} available</Badge>
                       <span className="hidden text-xs text-muted-foreground sm:inline">{enabledCount} enabled</span>
                     </span>
                   </Button>
@@ -450,12 +432,12 @@ export function Models() {
                               {Object.values(m.capabilities).every((value) => value !== true) && <span className="text-xs text-muted-foreground">—</span>}
                             </div>
                           </TableCell>
-                          <TableCell>{m.upstreamAvailable ? native ? <Badge variant="outline" title="Availability is checked against the signed-in client's catalog">Account unverified</Badge> : <Badge variant="success">Available</Badge> : <Badge variant="destructive">Unavailable</Badge>}</TableCell>
+                          <TableCell>{m.upstreamAvailable ? <Badge variant="success">Available</Badge> : <Badge variant="destructive">Unavailable</Badge>}</TableCell>
                           <TableCell>{m.enabled ? <Badge variant="success">Enabled</Badge> : <Badge variant="secondary">Disabled</Badge>}</TableCell>
                           <TableCell className="text-right">
                             <div className="flex items-center justify-end gap-1">
                               <Button size="sm" variant="outline" onClick={() => openCaps(m)} disabled={testingId !== null}><SlidersHorizontal className="h-3.5 w-3.5" /> Capabilities</Button>
-                              <Button size="sm" variant="outline" title={providerById.get(m.providerId)?.providerKind === 'codex' ? 'Test from signed-in Codex client' : 'Test model'} onClick={() => void testModel(m.id)} disabled={testingId !== null || providerById.get(m.providerId)?.providerKind === 'codex'}>{testingId === m.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <FlaskConical className="h-3.5 w-3.5" />} Test</Button>
+                              <Button size="sm" variant="outline" onClick={() => void testModel(m.id)} disabled={testingId !== null}>{testingId === m.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <FlaskConical className="h-3.5 w-3.5" />} Test</Button>
                               <Button size="sm" variant="destructive" onClick={() => setDeleteTarget(m)} disabled={testingId !== null}><Trash2 className="h-3.5 w-3.5" /> Delete</Button>
                             </div>
                           </TableCell>

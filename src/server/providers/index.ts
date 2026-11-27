@@ -2,7 +2,6 @@
 
 export interface ProviderConfig {
   type: 'openai' | 'anthropic';
-  providerKind?: 'compatible' | 'codex' | 'claude_code';
   baseUrl: string;
   apiKey: string;
   customHeaders: Record<string, string>;
@@ -64,10 +63,6 @@ export async function probeProvider(cfg: ProviderConfig): Promise<ProbeResult> {
   const start = Date.now();
   if (cfg.type !== 'openai' && cfg.type !== 'anthropic') return { ok: false, detail: 'Unsupported provider type', latencyMs: 0 };
   try {
-    if (cfg.providerKind === 'claude_code') {
-      const models = await discoverClaudeCode(cfg);
-      return { ok: true, detail: 'Connected', latencyMs: Date.now() - start, modelCount: models.length };
-    }
     const url = `${stripSlash(cfg.baseUrl)}/v1/models`;
     const res = await fetchWithTimeout(url, { method: 'GET', headers: buildHeaders(cfg) }, cfg.totalTimeoutMs);
     const latency = Date.now() - start;
@@ -83,30 +78,9 @@ export async function probeProvider(cfg: ProviderConfig): Promise<ProbeResult> {
 }
 
 export async function discoverProviderModels(cfg: ProviderConfig): Promise<DiscoveredModel[]> {
-  if (cfg.providerKind === 'claude_code') return discoverClaudeCode(cfg);
   if (cfg.type === 'openai') return discoverOpenAI(cfg);
   if (cfg.type === 'anthropic') return discoverAnthropic(cfg);
   throw new Error('Unsupported provider type');
-}
-
-async function discoverClaudeCode(cfg: ProviderConfig): Promise<DiscoveredModel[]> {
-  if (cfg.type !== 'anthropic' || cfg.baseUrl !== 'https://api.anthropic.com' || !/^sk-ant-api[A-Za-z0-9_-]+$/.test(cfg.apiKey)) throw new Error('Invalid Claude Code API credential or destination');
-  const models = new Map<string, DiscoveredModel>();
-  const cursors = new Set<string>();
-  const signal = AbortSignal.timeout(cfg.totalTimeoutMs);
-  const url = new URL('https://api.anthropic.com/v1/models');
-  url.searchParams.set('limit', '100');
-  for (let page = 0; page < 20; page++) {
-    const res = await fetch(url, { headers: { 'x-api-key': cfg.apiKey, 'anthropic-version': '2023-06-01', accept: 'application/json' }, redirect: 'error', signal });
-    if (!res.ok) { void res.body?.cancel().catch(() => undefined); throw new Error(`Claude model catalog HTTP ${res.status}`); }
-    const body = await res.json() as { data?: { id: string; display_name?: string }[]; has_more?: boolean; last_id?: string };
-    if (!Array.isArray(body.data)) throw new Error('Invalid Claude model catalog');
-    for (const model of body.data) if (typeof model?.id === 'string' && model.id) models.set(model.id, { upstreamId: model.id, displayName: model.display_name || model.id, capabilities: { chat: true, streaming: true, tools: true } });
-    if (!body.has_more) return [...models.values()];
-    if (typeof body.last_id !== 'string' || !body.last_id || cursors.has(body.last_id)) throw new Error('Invalid Claude model catalog cursor');
-    cursors.add(body.last_id); url.searchParams.set('after_id', body.last_id);
-  }
-  throw new Error('Claude model catalog pagination limit exceeded');
 }
 
 async function discoverOpenAI(cfg: ProviderConfig): Promise<DiscoveredModel[]> {

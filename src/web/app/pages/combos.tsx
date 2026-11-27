@@ -10,7 +10,6 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '.
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from '../../components/ui/dialog';
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from '../../components/ui/alert-dialog';
 import { Switch } from '../../components/ui/switch';
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../../components/ui/select';
 import { api } from '../../lib/api';
 import { toast } from 'sonner';
 import { Plus, Edit, Trash2, Search, X, GripVertical, ChevronUp, ChevronDown, Play, Loader2, CheckCircle2, AlertTriangle } from 'lucide-react';
@@ -19,11 +18,10 @@ import { restrictToParentElement, restrictToVerticalAxis } from '@dnd-kit/modifi
 import { SortableContext, arrayMove, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable';
 import { cn } from '../../lib/utils';
 
-type ComboKind = 'standard' | 'codex_native';
-interface Combo { id: string; name: string; slug: string; publicModelId: string; comboKind: ComboKind; enabled: boolean; memberCount: number; healthyMemberCount: number; slowCooldownCount: number; slowProbeCount: number; status: string; unavailableReasons: string[]; capabilityWarnings: string[]; }
+interface Combo { id: string; name: string; slug: string; publicModelId: string; enabled: boolean; memberCount: number; healthyMemberCount: number; slowCooldownCount: number; slowProbeCount: number; status: string; unavailableReasons: string[]; capabilityWarnings: string[]; }
 interface SlowStateView { modelId: string; workload: string; latencyKind: 'ttft' | 'completion'; medianLatencyMs: number | null; sampleCount: number; consecutiveSlowCount: number; relativeSlowCount: number; degraded: 'absolute' | 'relative' | null; comparatorModelId: string | null; probeDueMs: number | null; probeLeaseUntilMs: number | null; recoverySuccesses: number; lastLatencyMs: number | null; updatedAtMs: number; state: string }
 interface ComboDetail extends Combo { maxTotalAttempts: number; maxRequestDurationSeconds: number | null; fallbackOnConnection: boolean; fallbackOnConnectTimeout: boolean; fallbackOnFirstTokenTimeout: boolean; fallbackOnTotalTimeout: boolean; fallbackOn408: boolean; fallbackOn429: boolean; fallbackOn5xx: boolean; slowResponseFallbackEnabled: boolean; slowResponseThresholdSeconds: number; slowResponseMaxCount: number; members: Array<{ id: string; modelId: string; publicModelId: string; upstreamModelId: string; displayName: string; providerSlug: string; position: number; enabled: boolean; upstreamAvailable: boolean; providerEnabled: boolean; providerHealth: string; circuitOpen: boolean; capabilities: Record<string, unknown>; status: { state: string; reason: string }; adaptiveStates: SlowStateView[] }>; capabilityWarnings: string[]; }
-interface ModelRow { id: string; publicModelId: string; upstreamModelId: string; displayName: string; providerSlug: string; providerKind?: string; enabled: boolean; upstreamAvailable: boolean; providerEnabled: boolean; providerHealth: string; providerTotalTimeoutMs: number | null; circuitOpen: boolean; capabilities: Record<string, unknown>; }
+interface ModelRow { id: string; publicModelId: string; upstreamModelId: string; displayName: string; providerSlug: string; enabled: boolean; upstreamAvailable: boolean; providerEnabled: boolean; providerHealth: string; providerTotalTimeoutMs: number | null; circuitOpen: boolean; capabilities: Record<string, unknown>; }
 interface MemberForm { id?: string; modelId: string; position: number; enabled: boolean }
 interface ComboTestResult {
   success: boolean;
@@ -35,7 +33,6 @@ interface ComboTestResult {
 
 type ComboSettings = { maxTotalAttempts: number; maxRequestDurationSeconds: number | null; fallbackOnConnection: boolean; fallbackOnConnectTimeout: boolean; fallbackOnFirstTokenTimeout: boolean; fallbackOnTotalTimeout: boolean; fallbackOn408: boolean; fallbackOn429: boolean; fallbackOn5xx: boolean; slowResponseFallbackEnabled: boolean; slowResponseThresholdSeconds: number; slowResponseMaxCount: number };
 const defaultComboSettings: ComboSettings = { maxTotalAttempts: 3, maxRequestDurationSeconds: null, fallbackOnConnection: true, fallbackOnConnectTimeout: true, fallbackOnFirstTokenTimeout: true, fallbackOnTotalTimeout: true, fallbackOn408: true, fallbackOn429: true, fallbackOn5xx: true, slowResponseFallbackEnabled: true, slowResponseThresholdSeconds: 60, slowResponseMaxCount: 3 };
-const emptyComboForm = () => ({ name: '', slug: '', enabled: true, comboKind: 'standard' as ComboKind, ...defaultComboSettings, members: [] as MemberForm[] });
 const reasonLabels: Record<string, string> = { member_disabled: 'member disabled', model_missing: 'model missing', provider_disabled: 'provider disabled', provider_down: 'provider down', model_disabled: 'model disabled', upstream_unavailable: 'upstream unavailable', circuit_open: 'circuit open', chat_capability_unavailable: 'chat capability unavailable', slow_response_cooldown: 'slow-response cooldown', slow_response_probe_active: 'recovery probe already running', slow_response_timeout: 'slow response' };
 const compareAlphabetically = (a: string, b: string) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
 
@@ -54,8 +51,8 @@ export function Combos() {
   const [testResult, setTestResult] = useState<ComboTestResult | null>(null);
   const [editSlowStates, setEditSlowStates] = useState<SlowStateView[]>([]);
   const [comboSearch, setComboSearch] = useState('');
-  const [form, setForm] = useState(emptyComboForm);
-  const [editForm, setEditForm] = useState(emptyComboForm);
+  const [form, setForm] = useState({ name: '', slug: '', enabled: true, ...defaultComboSettings, members: [] as MemberForm[] });
+  const [editForm, setEditForm] = useState({ name: '', slug: '', enabled: true, ...defaultComboSettings, members: [] as typeof form.members });
   const [deleting, setDeleting] = useState<Combo | null>(null);
 
   const reload = async () => {
@@ -77,7 +74,6 @@ export function Combos() {
       || compareAlphabetically(a.publicModelId, b.publicModelId));
 
   const testCombo = async (combo: Combo) => {
-    if (combo.comboKind === 'codex_native') return;
     setTestingId(combo.id);
     try {
       setTestResult(await api.post<ComboTestResult>("/api/admin/combos/" + combo.id + "/test"));
@@ -92,9 +88,9 @@ export function Combos() {
     if (form.members.length === 0) { toast.error('Add at least one member'); return; }
     setCreating(true);
     try {
-      await api.post('/api/admin/combos', { name: form.name, slug: form.slug.trim() || undefined, enabled: form.enabled, comboKind: form.comboKind, ...editSettings(form), members: form.members });
+      await api.post('/api/admin/combos', { name: form.name, slug: form.slug.trim() || undefined, enabled: form.enabled, ...editSettings(form), members: form.members });
       toast.success('Combo created');
-      setOpen(false); setForm(emptyComboForm());
+      setOpen(false); setForm({ name: '', slug: '', enabled: true, ...defaultComboSettings, members: [] });
       void reload();
     } catch (e) { toast.error((e as Error).message); }
     finally { setCreating(false); }
@@ -108,7 +104,6 @@ export function Combos() {
       setEditingId(d.id);
       setEditForm({
         name: d.name,
-        comboKind: d.comboKind,
         // The server derives `slug` from the name for slugless combos, but
         // `publicModelId` is the real switch for the "combo/" prefix. Seeding the
         // box from `slug` made every "open edit → save" round-trip look like the
@@ -122,9 +117,9 @@ export function Combos() {
         fallbackOnFirstTokenTimeout: d.fallbackOnFirstTokenTimeout,
         fallbackOnTotalTimeout: d.fallbackOnTotalTimeout,
         fallbackOn408: d.fallbackOn408,
-        fallbackOn429: d.comboKind === 'codex_native' ? false : d.fallbackOn429,
+        fallbackOn429: d.fallbackOn429,
         fallbackOn5xx: d.fallbackOn5xx,
-        slowResponseFallbackEnabled: d.comboKind === 'codex_native' ? false : d.slowResponseFallbackEnabled,
+        slowResponseFallbackEnabled: d.slowResponseFallbackEnabled,
         slowResponseThresholdSeconds: d.slowResponseThresholdSeconds,
         slowResponseMaxCount: d.slowResponseMaxCount,
         members: d.members.map((m) => ({ modelId: m.modelId, position: m.position, enabled: m.enabled })),
@@ -167,20 +162,19 @@ export function Combos() {
   return (
     <div>
       <PageHeader title="Combos" description="Virtual models combining physical models" actions={
-        <Dialog open={open} onOpenChange={(next) => { if (next) setForm(emptyComboForm()); setOpen(next); }}>
+        <Dialog open={open} onOpenChange={setOpen}>
           <DialogTrigger asChild><Button><Plus className="mr-1 h-4 w-4" /> New combo</Button></DialogTrigger>
           <DialogContent className="max-h-[calc(100vh-2rem)] max-w-2xl grid-rows-[auto_minmax(0,1fr)_auto] overflow-hidden">
             <DialogHeader><DialogTitle>New combo</DialogTitle></DialogHeader>
             <div className="min-h-0 space-y-3 overflow-y-auto pr-1">
-              <div><Label htmlFor="combo-name">Name</Label><Input id="combo-name" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></div>
+              <div><Label>Name</Label><Input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></div>
               <div><Label>Slug (optional — empty uses the name as the model ID)</Label><Input value={form.slug} onChange={(e) => setForm({ ...form, slug: e.target.value })} placeholder="empty → gpt-5.5 · set → combo/gpt-5.5" /></div>
-              <ComboKindField value={form.comboKind} onChange={(comboKind) => setForm((current) => ({ ...current, comboKind, members: [], fallbackOn429: comboKind === 'standard', slowResponseFallbackEnabled: comboKind === 'standard' }))} />
               <div className="flex items-center gap-2"><Switch checked={form.enabled} onCheckedChange={(v) => setForm({ ...form, enabled: v })} /><Label>Enabled</Label></div>
-               <ComboSettingsFields value={form} comboKind={form.comboKind} onChange={(patch) => setForm((current) => ({ ...current, ...patch }))} hardTimeouts={form.members.filter((m) => m.enabled).map((m) => models.find((x) => x.id === m.modelId)?.providerTotalTimeoutMs ?? null)} />
+               <ComboSettingsFields value={form} onChange={(patch) => setForm((current) => ({ ...current, ...patch }))} hardTimeouts={form.members.filter((m) => m.enabled).map((m) => models.find((x) => x.id === m.modelId)?.providerTotalTimeoutMs ?? null)} />
               <div>
                 <Label>Members — priority order · drag to reorder</Label>
-                <MemberPicker key={form.comboKind} comboKind={form.comboKind} models={models} addedIds={form.members.map((m) => m.modelId)} onAdd={addMember} />
-               <RoutePreview adaptive={form.slowResponseFallbackEnabled} members={form.members} modelFor={(m) => models.find((x) => x.id === m.modelId) ?? null} />
+                <MemberPicker models={models} addedIds={form.members.map((m) => m.modelId)} onAdd={addMember} />
+               <RoutePreview members={form.members} modelFor={(m) => models.find((x) => x.id === m.modelId) ?? null} />
                 <MemberList
                   className="mt-2"
                   members={form.members}
@@ -213,13 +207,13 @@ export function Combos() {
               {visibleCombos.length === 0 && <TableRow><TableCell colSpan={5} className="py-8 text-center text-muted-foreground">{combos.length === 0 ? 'No combos yet. Create a combo to combine physical models.' : 'No combos match your search.'}</TableCell></TableRow>}
               {visibleCombos.map((c) => (
                 <TableRow key={c.id}>
-                  <TableCell><div className="flex flex-wrap items-center gap-2"><span className="font-medium">{c.name}</span><Badge variant="outline">{c.comboKind === 'codex_native' ? 'Codex native' : 'Standard'}</Badge></div><div className="mt-0.5 font-mono text-xs text-muted-foreground">{c.publicModelId}</div></TableCell>
+                  <TableCell><div className="font-medium">{c.name}</div><div className="mt-0.5 font-mono text-xs text-muted-foreground">{c.publicModelId}</div></TableCell>
                   <TableCell>{c.memberCount}</TableCell>
-                  <TableCell><Badge variant={c.status === 'ready' ? (c.comboKind === 'codex_native' ? 'outline' : 'success') : c.status === 'disabled' ? 'secondary' : 'destructive'}>{c.healthyMemberCount}/{c.memberCount} {c.comboKind === 'codex_native' ? 'eligible' : 'available'}</Badge>{c.comboKind === 'codex_native' && <div className="text-xs text-muted-foreground">Account unverified</div>}{c.slowCooldownCount > 0 && <div className="text-xs text-amber-600 dark:text-amber-400">{c.slowCooldownCount} with degraded workloads</div>}{c.slowProbeCount > 0 && <div className="text-xs text-muted-foreground">{c.slowProbeCount} recovery probe running</div>}{c.capabilityWarnings.length > 0 && <div className="text-xs text-amber-600">Capability metadata differs</div>}{c.status === 'unavailable' && c.unavailableReasons.length > 0 && <div className="text-xs text-muted-foreground">{c.unavailableReasons.map((reason) => reasonLabels[reason] ?? reason).join(', ')}</div>}</TableCell>
+                  <TableCell><Badge variant={c.status === 'ready' ? 'success' : c.status === 'disabled' ? 'secondary' : 'destructive'}>{c.healthyMemberCount}/{c.memberCount} available</Badge>{c.slowCooldownCount > 0 && <div className="text-xs text-amber-600 dark:text-amber-400">{c.slowCooldownCount} with degraded workloads</div>}{c.slowProbeCount > 0 && <div className="text-xs text-muted-foreground">{c.slowProbeCount} recovery probe running</div>}{c.capabilityWarnings.length > 0 && <div className="text-xs text-amber-600">Capability metadata differs</div>}{c.status === 'unavailable' && c.unavailableReasons.length > 0 && <div className="text-xs text-muted-foreground">{c.unavailableReasons.map((reason) => reasonLabels[reason] ?? reason).join(', ')}</div>}</TableCell>
                   <TableCell>{c.enabled ? 'Yes' : 'No'}</TableCell>
                   <TableCell className="text-right">
                     <div className="flex items-center justify-end gap-1">
-                       <Button size="sm" variant="outline" title={c.comboKind === 'codex_native' ? 'Test from signed-in Codex client' : 'Sends a real non-streaming inference request'} onClick={() => void testCombo(c)} disabled={testingId === c.id || c.comboKind === 'codex_native'}>
+                       <Button size="sm" variant="outline" title="Sends a real non-streaming inference request" onClick={() => void testCombo(c)} disabled={testingId === c.id}>
                         {testingId === c.id ? <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" /> : <Play className="mr-1 h-3.5 w-3.5" />} Test
                       </Button>
                       <Button size="sm" variant="outline" onClick={() => void openEdit(c)}><Edit className="h-3.5 w-3.5" /> Sửa</Button>
@@ -238,16 +232,14 @@ export function Combos() {
         <DialogContent className="max-h-[calc(100vh-2rem)] max-w-2xl grid-rows-[auto_minmax(0,1fr)_auto] overflow-hidden">
           <DialogHeader><DialogTitle>Edit combo</DialogTitle></DialogHeader>
           <div className="min-h-0 space-y-3 overflow-y-auto pr-1">
-            <div><Label htmlFor="edit-combo-name">Name</Label><Input id="edit-combo-name" value={editForm.name} onChange={(e) => setEditForm({ ...editForm, name: e.target.value })} /></div>
+            <div><Label>Name</Label><Input value={editForm.name} onChange={(e) => setEditForm({ ...editForm, name: e.target.value })} /></div>
             <div><Label>Slug (optional — leave empty to use the name as the model ID)</Label><Input value={editForm.slug} onChange={(e) => setEditForm({ ...editForm, slug: e.target.value })} placeholder="empty → gpt-5.5 · set → combo/gpt-5.5" /></div>
-            <ComboKindField value={editForm.comboKind} />
-            {editForm.comboKind === 'codex_native' && <div className="rounded border p-3 text-xs text-muted-foreground">Sign in inside Codex and set a separate gateway key scoped to this combo, without token limits. In the Codex client configuration from the Providers page, replace the model value with this saved public ID: <code className="font-mono">{combos.find((c) => c.id === editingId)?.publicModelId}</code>. Test using the signed-in client.</div>}
             <div className="flex items-center gap-2"><Switch checked={editForm.enabled} onCheckedChange={(v) => setEditForm({ ...editForm, enabled: v })} /><Label>Enabled</Label></div>
-               <ComboSettingsFields value={editForm} comboKind={editForm.comboKind} onChange={(patch) => setEditForm((current) => ({ ...current, ...patch }))} hardTimeouts={editForm.members.filter((m) => m.enabled).map((m) => models.find((x) => x.id === m.modelId)?.providerTotalTimeoutMs ?? null)} />
+               <ComboSettingsFields value={editForm} onChange={(patch) => setEditForm((current) => ({ ...current, ...patch }))} hardTimeouts={editForm.members.filter((m) => m.enabled).map((m) => models.find((x) => x.id === m.modelId)?.providerTotalTimeoutMs ?? null)} />
             <div>
               <Label>Members — priority order · drag to reorder</Label>
-              <MemberPicker comboKind={editForm.comboKind} models={models} addedIds={editForm.members.map((m) => m.modelId)} onAdd={addEditMember} />
-               <RoutePreview adaptive={editForm.slowResponseFallbackEnabled} members={editForm.members} modelFor={(m) => models.find((x) => x.id === m.modelId) ?? null} />
+              <MemberPicker models={models} addedIds={editForm.members.map((m) => m.modelId)} onAdd={addEditMember} />
+               <RoutePreview members={editForm.members} modelFor={(m) => models.find((x) => x.id === m.modelId) ?? null} />
               <MemberList
                 className="mt-2"
                 members={editForm.members}
@@ -308,30 +300,9 @@ export function Combos() {
   );
 }
 
-function editSettings(value: ComboSettings): ComboSettings {
-  return {
-    maxTotalAttempts: value.maxTotalAttempts, maxRequestDurationSeconds: value.maxRequestDurationSeconds,
-    fallbackOnConnection: value.fallbackOnConnection, fallbackOnConnectTimeout: value.fallbackOnConnectTimeout,
-    fallbackOnFirstTokenTimeout: value.fallbackOnFirstTokenTimeout, fallbackOnTotalTimeout: value.fallbackOnTotalTimeout,
-    fallbackOn408: value.fallbackOn408, fallbackOn429: value.fallbackOn429, fallbackOn5xx: value.fallbackOn5xx,
-    slowResponseFallbackEnabled: value.slowResponseFallbackEnabled, slowResponseThresholdSeconds: value.slowResponseThresholdSeconds,
-    slowResponseMaxCount: value.slowResponseMaxCount,
-  };
-}
+function editSettings(value: ComboSettings): ComboSettings { return value; }
 
-function ComboKindField({ value, onChange }: { value: ComboKind; onChange?: (kind: ComboKind) => void }) {
-  return <div className="space-y-1">
-    <Label>Combo type</Label>
-    <Select value={value} disabled={!onChange} onValueChange={(kind) => onChange?.(kind as ComboKind)}>
-      <SelectTrigger aria-label="Combo type"><SelectValue /></SelectTrigger>
-      <SelectContent><SelectItem value="standard">Standard</SelectItem><SelectItem value="codex_native">Codex native</SelectItem></SelectContent>
-    </Select>
-    <p className="text-xs text-muted-foreground">{value === 'codex_native' ? 'Codex Responses only. Members must be Codex models with distinct upstream model IDs, available to the signed-in account.' : 'Compatible API-key and Claude Code models.'} {onChange ? 'Changing the type clears selected members. Type cannot be changed after creation.' : 'Type is locked after creation.'}</p>
-  </div>;
-}
-
-function ComboSettingsFields({ value, comboKind, onChange, hardTimeouts }: { value: ComboSettings; comboKind: ComboKind; onChange: (patch: Partial<ComboSettings>) => void; hardTimeouts: Array<number | null> }) {
-  const native = comboKind === 'codex_native';
+function ComboSettingsFields({ value, onChange, hardTimeouts }: { value: ComboSettings; onChange: (patch: Partial<ComboSettings>) => void; hardTimeouts: Array<number | null> }) {
   const triggers: Array<[keyof ComboSettings, string]> = [
     ['fallbackOnConnection', 'Connection failure'], ['fallbackOnConnectTimeout', 'Connect timeout'], ['fallbackOnFirstTokenTimeout', 'First-token timeout'], ['fallbackOnTotalTimeout', 'Total timeout'], ['fallbackOn408', 'HTTP 408'], ['fallbackOn429', 'HTTP 429'], ['fallbackOn5xx', 'HTTP 5xx'],
   ];
@@ -340,16 +311,16 @@ function ComboSettingsFields({ value, comboKind, onChange, hardTimeouts }: { val
       <div className="mb-2 text-sm font-medium">Fallback policy</div>
       <div className="grid gap-3 sm:grid-cols-[12rem_1fr]">
         <div className="space-y-2"><div><Label>Max total attempts</Label><Input type="number" min={1} max={8} value={value.maxTotalAttempts} onChange={(e) => onChange({ maxTotalAttempts: Math.min(8, Math.max(1, Number(e.target.value) || 1)) })} /></div><div><Label>Overall deadline (seconds)</Label><Input type="number" min={1} max={3600} placeholder="No additional limit" value={value.maxRequestDurationSeconds ?? ''} onChange={(e) => onChange({ maxRequestDurationSeconds: e.target.value === '' ? null : Math.min(3600, Math.max(1, Math.round(Number(e.target.value) || 1))) })} /></div></div>
-        <div className="grid gap-2 sm:grid-cols-2">{triggers.map(([key, label]) => <label key={key} className="flex items-center gap-2 text-xs"><Switch aria-label={label} disabled={native && key === 'fallbackOn429'} checked={Boolean(value[key])} onCheckedChange={(checked) => onChange({ [key]: checked })} /><span>{label}</span></label>)}</div>
+        <div className="grid gap-2 sm:grid-cols-2">{triggers.map(([key, label]) => <label key={key} className="flex items-center gap-2 text-xs"><Switch checked={Boolean(value[key])} onCheckedChange={(checked) => onChange({ [key]: checked })} /><span>{label}</span></label>)}</div>
       </div>
     </div>
     <div className="border-t pt-3">
-      <label className="mb-2 flex items-center gap-2 text-sm font-medium"><Switch aria-label="Adaptive fallback and recovery" disabled={native} checked={value.slowResponseFallbackEnabled} onCheckedChange={(checked) => onChange({ slowResponseFallbackEnabled: checked })} />Adaptive fallback and recovery</label>
+      <label className="mb-2 flex items-center gap-2 text-sm font-medium"><Switch checked={value.slowResponseFallbackEnabled} onCheckedChange={(checked) => onChange({ slowResponseFallbackEnabled: checked })} />Adaptive fallback and recovery</label>
       <div className="grid gap-3 sm:grid-cols-2">
         <div><Label>Response threshold (seconds)</Label><Input type="number" min={1} max={600} disabled={!value.slowResponseFallbackEnabled} value={value.slowResponseThresholdSeconds} onChange={(e) => onChange({ slowResponseThresholdSeconds: Math.min(600, Math.max(1, Math.round(Number(e.target.value) || 1))) })} /></div>
         <div><Label>Slow responses before demotion</Label><Input type="number" min={1} max={20} disabled={!value.slowResponseFallbackEnabled} value={value.slowResponseMaxCount} onChange={(e) => onChange({ slowResponseMaxCount: Math.min(20, Math.max(1, Math.round(Number(e.target.value) || 1))) })} /></div>
       </div>
-      <p className="mt-2 text-xs text-muted-foreground">{native ? 'Codex native combos follow configured priority. Adaptive recovery and fallback on HTTP 429 are unavailable. All members use the same signed-in client credential.' : 'Streaming measures the first deliverable generated token, including supported reasoning; non-streaming measures full completion. Similar speeds preserve configured priority. Repeated slowness demotes a model to reserve; recovery probes can restore its priority. The final viable candidate may exceed the soft threshold, but hard timeouts always apply.'}</p>
+      <p className="mt-2 text-xs text-muted-foreground">Streaming measures the first deliverable generated token, including supported reasoning; non-streaming measures full completion. Similar speeds preserve configured priority. Repeated slowness demotes a model to reserve; recovery probes can restore its priority. The final viable candidate may exceed the soft threshold, but hard timeouts always apply.</p>
       {value.slowResponseFallbackEnabled && value.maxTotalAttempts < 3 && <p className="text-xs text-amber-600 dark:text-amber-400">A rescue replay may need 3 attempts. The configured cap is always enforced.</p>}
       {value.slowResponseFallbackEnabled && value.maxRequestDurationSeconds !== null && value.maxRequestDurationSeconds <= value.slowResponseThresholdSeconds && <p className="text-xs text-amber-600 dark:text-amber-400">The overall deadline may expire before a slow-response fallback can occur.</p>}
       {value.slowResponseFallbackEnabled && hardTimeouts.some((ms) => ms !== null && ms <= value.slowResponseThresholdSeconds * 1000) && <p className="text-xs text-amber-600 dark:text-amber-400">At least one provider has a hard total timeout at or below the soft threshold. Its hard timeout takes precedence.</p>}
@@ -357,13 +328,13 @@ function ComboSettingsFields({ value, comboKind, onChange, hardTimeouts }: { val
   </div>;
 }
 
-function RoutePreview({ members, modelFor, adaptive }: { members: MemberForm[]; modelFor: (member: MemberForm) => ModelRow | null; adaptive: boolean }) {
+function RoutePreview({ members, modelFor }: { members: MemberForm[]; modelFor: (member: MemberForm) => ModelRow | null }) {
   if (members.length === 0) return null;
   const selected = members.map(modelFor).filter((model): model is ModelRow => Boolean(model));
   const capabilityWarnings = ['chat', 'streaming', 'tools', 'structured_output', 'image_input', 'reasoning'].filter((key) => new Set(selected.map((model) => model.capabilities[key] === true ? 'yes' : model.capabilities[key] === false ? 'no' : 'unknown')).size > 1);
   return (
     <div className="rounded border bg-muted/20 p-2 text-xs">
-      <div className="mb-1 font-medium">Configured priority {adaptive && <span className="font-normal text-muted-foreground">(adaptive routing may temporarily demote a member)</span>}</div>
+      <div className="mb-1 font-medium">Configured priority <span className="font-normal text-muted-foreground">(adaptive routing may temporarily demote a member)</span></div>
       {capabilityWarnings.length > 0 && <div className="mb-2 flex items-center gap-1 text-amber-600"><AlertTriangle className="h-3.5 w-3.5" /> Members differ on: {capabilityWarnings.join(', ')}</div>}
       <div className="space-y-1">
         {members.map((member, index) => {
@@ -477,8 +448,7 @@ function MemberRow({ modelId, index, label, model, enabled, onMoveUp, onMoveDown
   onRemove: () => void;
 }) {
   const { attributes, listeners, setNodeRef, setActivatorNodeRef, transform, transition, isDragging } = useSortable({ id: modelId });
-  const native = model?.providerKind === 'codex';
-  const available = enabled && !!model && model.enabled && model.providerEnabled && !model.circuitOpen && model.upstreamAvailable && (native ? model.capabilities.responses !== false : model.capabilities.chat !== false);
+  const available = enabled && !!model && model.enabled && model.providerEnabled && !model.circuitOpen && model.upstreamAvailable && model.capabilities.chat !== false;
   return (
     <div
       ref={setNodeRef}
@@ -501,7 +471,7 @@ function MemberRow({ modelId, index, label, model, enabled, onMoveUp, onMoveDown
         <div className="truncate font-mono text-xs">{label}</div>
         <div className="truncate text-[11px] text-muted-foreground">{model?.providerSlug || "provider"} · upstream: {model?.upstreamModelId ?? "unknown"}</div>
       </div>
-      <Badge variant={available && !native ? 'success' : 'secondary'}>{!enabled ? 'Disabled' : available ? (native ? 'Account unverified' : model?.providerHealth === 'down' || model?.providerHealth === 'degraded' ? 'Ready · degraded provider' : 'Ready') : 'Unavailable'}</Badge>
+      <Badge variant={available ? 'success' : 'secondary'}>{!enabled ? 'Disabled' : available ? (model?.providerHealth === 'down' || model?.providerHealth === 'degraded' ? 'Ready · degraded provider' : 'Ready') : 'Unavailable'}</Badge>
       <div className="flex shrink-0 flex-col gap-0.5">
         <Button type="button" size="icon" variant="ghost" className="size-6" aria-label={`Move ${label} up`} title="Move up" disabled={!onMoveUp} onClick={onMoveUp}><ChevronUp /></Button>
         <Button type="button" size="icon" variant="ghost" className="size-6" aria-label={`Move ${label} down`} title="Move down" disabled={!onMoveDown} onClick={onMoveDown}><ChevronDown /></Button>
@@ -513,7 +483,7 @@ function MemberRow({ modelId, index, label, model, enabled, onMoveUp, onMoveDown
 }
 
 // Searchable model picker used to add members to a combo (create + edit).
-function MemberPicker({ models, addedIds, onAdd, comboKind }: { models: ModelRow[]; addedIds: string[]; onAdd: (modelId: string) => void; comboKind: ComboKind }) {
+function MemberPicker({ models, addedIds, onAdd }: { models: ModelRow[]; addedIds: string[]; onAdd: (modelId: string) => void }) {
   const [q, setQ] = useState('');
   const filtered = q
     ? models.filter((m) => {
@@ -521,12 +491,9 @@ function MemberPicker({ models, addedIds, onAdd, comboKind }: { models: ModelRow
       return m.publicModelId.toLowerCase().includes(s) || m.displayName.toLowerCase().includes(s);
     })
     : models;
-  const native = comboKind === 'codex_native';
-  const addedUpstreamIds = new Set(models.filter((m) => addedIds.includes(m.id)).map((m) => m.upstreamModelId));
-  const available = filtered.filter((m) => (m.providerKind === 'codex') === native && !addedIds.includes(m.id) && (!native || !addedUpstreamIds.has(m.upstreamModelId)));
+  const available = filtered.filter((m) => !addedIds.includes(m.id));
   return (
     <div className="space-y-1">
-      {native && <p className="text-xs text-muted-foreground">One member per upstream model ID. Duplicate IDs are excluded after selection.</p>}
       <div className="relative">
         <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
         <Input className="pl-8" placeholder="Search models…" value={q} onChange={(e) => setQ(e.target.value)} />
@@ -539,7 +506,7 @@ function MemberPicker({ models, addedIds, onAdd, comboKind }: { models: ModelRow
           {available.map((m) => (
             <div key={m.id} className="flex items-center justify-between rounded p-1 text-sm hover:bg-accent">
               <span className="font-mono text-xs">{m.publicModelId}</span>
-              <Button size="sm" variant="ghost" aria-label={`Add ${m.publicModelId}`} onClick={() => onAdd(m.id)}>+ Add</Button>
+              <Button size="sm" variant="ghost" onClick={() => onAdd(m.id)}>+ Add</Button>
             </div>
           ))}
         </div>

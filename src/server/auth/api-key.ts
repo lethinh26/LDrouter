@@ -102,10 +102,8 @@ export function keyIpAllowed(keyId: string, clientIp: string): boolean {
   return !hasAllow || allowMatch;
 }
 
-export function requireGatewayKey(req: FastifyRequest, credentialOnly?: 'x-api-key'): AuthenticatedKey {
-  // The dedicated Codex route consumes the gateway key separately from the
-  // caller's upstream Authorization. Other routes retain conflict detection.
-  const key = credentialOnly ? authenticateGatewayKey({ headers: { 'x-api-key': req.headers['x-api-key'] } }) : authenticateGatewayKey(req);
+export function requireGatewayKey(req: FastifyRequest): AuthenticatedKey {
+  const key = authenticateGatewayKey(req);
   if (!key) throw new GatewayError('authentication_error', 'Missing API key', { status: 401 });
   if (!key.enabled) throw new GatewayError('authentication_error', 'API key disabled', { status: 401 });
   if (!keyIsActive(key)) throw new GatewayError('authentication_error', 'API key expired', { status: 401 });

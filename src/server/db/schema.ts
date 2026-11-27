@@ -137,19 +137,6 @@ export const providers = sqliteTable(
 // Models
 // ============================================================================
 
-// Compatible providers have no integration row. Keep protocol and credentials
-// in providers; the integration is keyed exclusively by the provider UUID.
-export const providerIntegrations = sqliteTable('provider_integrations', {
-  providerId: text('provider_id').primaryKey().notNull().references(() => providers.id, { onDelete: 'cascade' }),
-  providerKind: text('provider_kind', { enum: ['codex', 'claude_code'] }).notNull(),
-  authMode: text('auth_mode', { enum: ['api_key', 'client_oauth'] }).notNull(),
-});
-
-export const providerConnections = sqliteTable('provider_connections', {
-  providerId: text('provider_id').primaryKey().notNull().references(() => providerIntegrations.providerId, { onDelete: 'cascade' }),
-  namespaceMode: text('namespace_mode', { enum: ['legacy', 'canonical'] }).notNull().default('legacy'),
-});
-
 export const models = sqliteTable(
   'models',
   {
@@ -189,7 +176,6 @@ export const combos = sqliteTable(
     name: text('name').notNull(),
     slug: text('slug').notNull().unique(),
     publicModelId: text('public_model_id').notNull().unique(),
-    comboKind: text('combo_kind', { enum: ['standard', 'codex_native'] }).notNull().default('standard'),
     mode: text('mode', { enum: ['fallback'] }).notNull(),
     enabled: integer('enabled', { mode: 'boolean' }).notNull().notNull().default(true),
     maxTotalAttempts: integer('max_total_attempts').notNull().default(3),
@@ -338,46 +324,6 @@ export const apiKeys = sqliteTable(
     prefixIdx: index('idx_key_prefix').on(t.keyPrefix),
   })
 );
-
-// OAuth grants are issued by LateDev itself, scoped to an existing gateway
-// key. Store one-way digests only; these are never provider access tokens.
-export const gatewayOAuthCodes = sqliteTable('gateway_oauth_codes', {
-  codeDigest: text('code_digest').primaryKey().notNull(),
-  keyId: text('key_id').notNull().references(() => apiKeys.id, { onDelete: 'cascade' }),
-  keyDigest: text('key_digest').notNull(),
-  challenge: text('challenge').notNull(),
-  redirectUri: text('redirect_uri').notNull(),
-  sessionId: text('session_id').notNull().references(() => adminSessions.id, { onDelete: 'cascade' }),
-  expiresAtMs: integer('expires_at_ms').notNull(),
-}, (t) => ({
-  keyIdx: index('idx_gateway_oauth_codes_key').on(t.keyId),
-  expiryIdx: index('idx_gateway_oauth_codes_expiry').on(t.expiresAtMs),
-  sessionIdx: index('idx_gateway_oauth_codes_session').on(t.sessionId),
-}));
-
-export const gatewayOAuthGrants = sqliteTable('gateway_oauth_grants', {
-  id: text('id').primaryKey().notNull(),
-  keyId: text('key_id').notNull().references(() => apiKeys.id, { onDelete: 'cascade' }),
-  keyDigest: text('key_digest').notNull(),
-  accessDigest: text('access_digest').notNull().unique(),
-  refreshDigest: text('refresh_digest').notNull().unique(),
-  accessExpiresAtMs: integer('access_expires_at_ms').notNull(),
-  refreshExpiresAtMs: integer('refresh_expires_at_ms').notNull(),
-  absoluteExpiresAtMs: integer('absolute_expires_at_ms').notNull(),
-  createdAtMs: integer('created_at_ms').notNull(),
-  lastRefreshedAtMs: integer('last_refreshed_at_ms'),
-  revokedAtMs: integer('revoked_at_ms'),
-}, (t) => ({
-  keyIdx: index('idx_gateway_oauth_grants_key').on(t.keyId),
-  expiryIdx: index('idx_gateway_oauth_grants_expiry').on(t.absoluteExpiresAtMs),
-}));
-
-export const gatewayOAuthUsedRefresh = sqliteTable('gateway_oauth_used_refresh', {
-  tokenDigest: text('token_digest').primaryKey().notNull(),
-  grantId: text('grant_id').notNull().references(() => gatewayOAuthGrants.id, { onDelete: 'cascade' }),
-}, (t) => ({
-  grantIdx: index('idx_gateway_oauth_used_refresh_grant').on(t.grantId),
-}));
 
 export const apiKeyModelPermissions = sqliteTable(
   'api_key_model_permissions',
@@ -629,23 +575,6 @@ export const csrfTokens = sqliteTable(
     expiresIdx: index('idx_csrf_expires').on(t.expiresAt),
   })
 );
-
-// ============================================================================
-// Subscription quota observations (not credential-bearing provider connections)
-// ============================================================================
-
-export const subscriptionQuotaAccounts = sqliteTable('subscription_quota_accounts', {
-  id: text('id').primaryKey(),
-  providerKind: text('provider_kind').notNull(),
-  name: text('name').notNull(),
-  accountFingerprint: text('account_fingerprint'),
-  snapshotJson: text('snapshot_json'),
-  createdAtMs: integer('created_at_ms').notNull(),
-  updatedAtMs: integer('updated_at_ms').notNull(),
-}, (t) => ({
-  nameIdx: uniqueIndex('idx_subscription_quota_name').on(t.providerKind, t.name),
-  fingerprintIdx: uniqueIndex('idx_subscription_quota_identity').on(t.providerKind, t.accountFingerprint),
-}));
 
 // ============================================================================
 // Schema version tracking (for backup compatibility checks)

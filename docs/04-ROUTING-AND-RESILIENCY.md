@@ -57,13 +57,6 @@ Do not fallback by default:
 
 The admin UI must allow toggling retry/fallback error categories per combo/provider where sensible.
 
-The above defaults apply to standard combos. Native Codex combos use only
-client-OAuth Codex members, an account-local model catalog checked before
-dispatch, and ordered fallback for configured transport/HTTP failures before
-stream commitment. They never fall back on authentication or rate-limit
-failures, unsuccessful SSE terminals or other malformed responses; adaptive
-learning is disabled. See [client integrations](14-CLIENT-INTEGRATIONS.md).
-
 ## Ordered fallback
 
 Saved `position` defines priority. With adaptive routing disabled, the first eligible member wins.

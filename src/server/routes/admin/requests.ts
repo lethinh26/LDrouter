@@ -8,7 +8,6 @@ import { isAdminIpAllowed } from '../../security/admin-ip-gate';
 import { redactJsonString } from '../../security/redact';
 import { onRequestLogged, offRequestLogged, onRequestStarted, offRequestStarted } from '../../gateway/events';
 import type { RequestLogSummary, AttemptLog } from '../../../shared/types';
-import { providerPublicPrefix } from '../../providers/builtin';
 
 type RequestRow = typeof schema.requests.$inferSelect;
 const REQUEST_STREAM_REPLAY_PAGE_SIZE = 100;
@@ -84,7 +83,7 @@ export function loadSummaryMaps(): SummaryMaps {
   return {
     keyMap: new Map(keys.map((k) => [k.id, k])),
     modelMap: new Map(models.map((m) => [m.id, m])),
-    providerMap: new Map(providers.map((p) => [p.id, { name: p.name, slug: providerPublicPrefix(db, p), type: p.type }])),
+    providerMap: new Map(providers.map((p) => [p.id, p])),
   };
 }
 

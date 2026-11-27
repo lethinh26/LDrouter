@@ -67,7 +67,7 @@ describe('supported provider API', () => {
     expect(JSON.stringify(body)).not.toContain('sk-test-');
   });
 
-  it.each(['codex', 'qoder'])('rejects retired type %s for create and update without mutating the database', async (type) => {
+  it.each(['codex', 'qoder', 'claude_code'])('rejects retired type %s for create and update without mutating the database', async (type) => {
     const { getRawDb } = await import('../../src/server/db');
     const raw = getRawDb();
     const before = raw.prepare('SELECT id, type, slug FROM providers ORDER BY id').all();
@@ -95,5 +95,19 @@ describe('supported provider API', () => {
     expect(app.hasRoute({ method: 'POST', url: '/api/admin/codex/oauth/start' })).toBe(false);
     expect(app.hasRoute({ method: 'POST', url: '/api/admin/codex/accounts/import' })).toBe(false);
     expect(app.hasRoute({ method: 'POST', url: '/api/admin/qoder/accounts/import' })).toBe(false);
+  });
+
+  it.each([
+    ['GET', '/api/admin/builtin-providers'],
+    ['GET', '/api/admin/subscription-quotas'],
+    ['GET', '/api/admin/gateway-oauth/grants'],
+    ['POST', '/api/admin/gateway-oauth/authorize'],
+    ['POST', '/api/oauth/token'],
+    ['POST', '/api/quota-sync/fixture'],
+    ['GET', '/backend-api/codex/models'],
+    ['POST', '/backend-api/codex/responses'],
+  ] as const)('does not expose removed integration route %s %s', async (method, url) => {
+    expect(app.hasRoute({ method, url })).toBe(false);
+    expect((await app.inject({ method, url, headers: { cookie } })).statusCode).toBe(404);
   });
 });

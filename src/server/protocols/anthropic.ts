@@ -21,7 +21,7 @@ export interface AnthropicRequest {
   tools?: Array<{ name: string; description?: string; input_schema: Record<string, unknown> }>;
   tool_choice?: { type: 'auto' | 'any' | 'tool'; name?: string };
   metadata?: { user_id?: string };
-  thinking?: { type: 'enabled'; budget_tokens: number } | { type: 'adaptive' | 'disabled' };
+  thinking?: { type: 'enabled'; budget_tokens: number };
 }
 
 export interface AnthropicResponse {
@@ -72,7 +72,7 @@ export function anthropicToCanonical(req: AnthropicRequest): CanonicalRequest {
     maxOutputTokens: req.max_tokens,
     stop: req.stop_sequences,
     stream: Boolean(req.stream),
-    reasoning: req.thinking?.type === 'enabled' ? { budgetTokens: req.thinking.budget_tokens } : undefined,
+    reasoning: req.thinking ? { budgetTokens: req.thinking.budget_tokens } : undefined,
   };
 }
 

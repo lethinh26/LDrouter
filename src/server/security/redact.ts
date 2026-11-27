@@ -52,8 +52,6 @@ const SECRET_KEY_REGEX = /(authorization|api[-_]?key|api[-_]?secret|password|pas
 
 const PLAINTEXT_PATTERNS: RegExp[] = [
   /\bld-[A-Za-z0-9_-]{20,}\b/g, // auto-generated gateway api keys (custom keys are covered by the Bearer/x-api-key patterns below)
-  /\bldo-[arc]-[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])/gi, // first-party OAuth credentials and authorization codes
-  /\bldq-[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])/gi, // temporary quota-sync capability
   /(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi,
   /sk-[A-Za-z0-9_-]{12,}/g, // OpenAI-style
   /anthropic[_-]?[A-Za-z0-9_-]{20,}/gi,

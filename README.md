@@ -12,7 +12,6 @@ Lightweight self-hosted LLM gateway with a polished admin UI. Presents stable Op
 - Per-key `ld-` bearer tokens (SHA-256 digest storage, displayed once)
 - IP allow/deny (IPv4 + IPv6 CIDR), trusted-proxy configuration
 - Rate limits: RPM, TPM, daily/monthly token quotas, concurrency, max output tokens
-- Built-in subscription quota monitoring with opt-in local Codex quota sync (`ldrouter-quota-sync`), separate from routing quotas; see [client integrations](docs/14-CLIENT-INTEGRATIONS.md#local-codex-quota-sync).
 - TTL-based gateway response cache (disabled by default) + provider prompt-cache accounting
 - Streaming end-to-end with strict "no fallback after stream content sent" rule
 - Request + attempt logs, statistics (Today / 7d / 30d), retention cleanup
@@ -71,9 +70,11 @@ Restore validates the container, checksum, gzip, SQLite integrity, schema versio
 
 ### Upgrade from retired provider integrations
 
-OpenAI-compatible and Anthropic-compatible providers remain supported. Migration 0014 permanently removes the retired Codex/Qoder account pools and their credentials; remaining routing restrictions and history are preserved. Migration 0017 adds separate client integration metadata for Codex client-owned sign-in and Claude Code API-key mode, without restoring those pools. Migration 0018 adds native Codex combos with same-account, catalog-verified ordered fallback. See [client integrations](docs/14-CLIENT-INTEGRATIONS.md) for configuration and limitations.
+Only OpenAI-compatible and Anthropic-compatible providers are supported. Schema migration 0014 permanently removes retired Codex/Qoder provider configuration and account credentials, removes invalid combo members, aliases and model permissions, and invalidates affected response-cache entries. Remaining combo priority and API-key restrictions are preserved; a combo with no surviving members is disabled. Generic request/attempt history and daily statistics are retained, although removed provider/model names may be shown as historical IDs.
 
 Take a full backup before upgrading and retain its passphrase. Older backups are migrated before activation, so restoring one in the new version does not bring retired integrations back. A downgrade requires the earlier application and a pre-upgrade backup; the upgraded schema cannot be downgraded in place.
+
+Version 2.2.1 also retires the client-specific integrations added in 2.1.0 and 2.2.0. Migration 0022 removes only explicitly integration-owned providers/models, native combos, their dependent targets, OAuth and subscription quota state. Compatible providers and keys, ordinary routing, and historical usage remain. Startup from schema 17–21 creates a private recovery snapshot beside the configured SQLite file (`data.sqlite.pre-0022/data.sqlite` for the default filename), before applying 0022. Treat this raw database as confidential and retain the existing master key separately. It is not an ordinary `.ldb` export. Do not start an older binary against schema 22; manual emergency recovery requires the matching pre-0022 snapshot and earlier binary. Remove the private recovery snapshot once it is no longer needed.
 
 ## Public API examples
 

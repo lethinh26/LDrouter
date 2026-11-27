@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
-export const CURRENT_SCHEMA_VERSION = 21;
+export const CURRENT_SCHEMA_VERSION = 22;
 
 interface MigrationFile {
   version: number;
@@ -13,7 +13,7 @@ interface MigrationFile {
   sql: string;
 }
 
-export function runMigrations(raw: Database.Database, log: Logger, migrationsDir: string, expectedVersion?: number): void {
+export function runMigrations(raw: Database.Database, log: Logger, migrationsDir: string, expectedVersion?: number, beforeIntegrationRemoval?: () => void): void {
   // Both fresh and existing databases use exactly the same migration assets.
   // Missing or partial assets must fail closed, never create an incompatible schema.
   if (!fs.existsSync(migrationsDir)) throw new Error('Database migrations directory missing');
@@ -47,14 +47,22 @@ export function runMigrations(raw: Database.Database, log: Logger, migrationsDir
   // Verify a claimed 0014 before any subsequent migration can change its DB.
   if (latest >= 14 && applied.includes(14)) assertRetiredProvidersRemoved(raw, parsed[13]!);
   if (latest >= 15 && applied.includes(15)) assertAdaptiveSchema(raw);
-  if (latest >= 17 && applied.includes(17)) assertIntegrationSchema(raw, parsed[16]!);
-  if (latest >= 18 && applied.includes(18)) assertComboKindSchema(raw, parsed[17]!);
-  if (latest >= 19 && applied.includes(19)) assertConnectionSchema(raw, parsed[18]!);
-  if (latest >= 20 && applied.includes(20)) assertGatewayOAuthSchema(raw, parsed[19]!);
-  if (latest >= 21 && applied.includes(21)) assertSubscriptionQuotaSchema(raw, parsed[20]!);
+  if (applied.includes(22)) {
+    assertClientIntegrationsRemoved(raw);
+  } else {
+    // Historical checks are only applicable before retirement.
+    if (latest >= 17 && applied.includes(17)) assertIntegrationSchema(raw, parsed[16]!);
+    if (latest >= 18 && applied.includes(18)) assertComboKindSchema(raw, parsed[17]!);
+    if (latest >= 19 && applied.includes(19)) assertConnectionSchema(raw, parsed[18]!);
+    if (latest >= 20 && applied.includes(20)) assertGatewayOAuthSchema(raw, parsed[19]!);
+    if (latest >= 21 && applied.includes(21)) assertSubscriptionQuotaSchema(raw, parsed[20]!);
+  }
 
   for (const migration of parsed.slice(applied.length)) {
     log.info({ version: migration.version, name: migration.name }, 'applying migration');
+    // A fresh database or one that never had integrations needs no extra copy.
+    // For a live upgraded database, snapshot outside the write transaction.
+    if (migration.version === 22 && applied.includes(17)) beforeIntegrationRemoval?.();
     const tx = raw.transaction(() => {
       raw.exec(migration.sql);
       // The destructive table rebuild must never be committed with invalid references.
@@ -75,6 +83,12 @@ export function runMigrations(raw: Database.Database, log: Logger, migrationsDir
       if (migration.version === 19) assertConnectionSchema(raw, migration);
       if (migration.version === 20) assertGatewayOAuthSchema(raw, migration);
       if (migration.version === 21) assertSubscriptionQuotaSchema(raw, migration);
+      if (migration.version === 22) {
+        assertClientIntegrationsRemoved(raw);
+        if (raw.prepare('PRAGMA foreign_key_check').all().length > 0) {
+          throw new Error('Database migration 0022 produced invalid foreign keys');
+        }
+      }
       raw.prepare('INSERT INTO schema_migrations (version, name) VALUES (?, ?)').run(migration.version, migration.name);
     });
     tx.immediate();
@@ -84,6 +98,16 @@ export function runMigrations(raw: Database.Database, log: Logger, migrationsDir
     ensureSettingsRow(raw, log);
     raw.prepare('UPDATE app_settings SET schema_version = ? WHERE id = 1').run(latest);
   })();
+}
+
+function assertClientIntegrationsRemoved(raw: Database.Database): void {
+  const remaining = raw.prepare(`SELECT 1 FROM sqlite_schema WHERE name COLLATE NOCASE IN (
+    'provider_integrations','provider_connections','provider_connection_default',
+    'gateway_oauth_codes','gateway_oauth_grants','gateway_oauth_used_refresh','subscription_quota_accounts'
+  ) LIMIT 1`).get();
+  if (remaining || raw.prepare("SELECT 1 FROM pragma_table_xinfo('combos') WHERE name COLLATE NOCASE='combo_kind'").get()) {
+    throw new Error('Database schema is inconsistent with client integration removal (0022)');
+  }
 }
 
 function assertSubscriptionQuotaSchema(raw: Database.Database, migration: MigrationFile): void {

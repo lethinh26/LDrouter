@@ -1,6 +1,6 @@
 {
   "name": "ldrouter",
-  "version": "2.2.0",
+  "version": "2.2.1",
   "description": "LateDev Router — lightweight self-hosted LLM gateway with admin UI",
   "type": "module",
   "license": "MIT",
@@ -15,8 +15,7 @@
   "main": "dist/server/app.js",
   "bin": {
     "latedev-router": "dist/cli.js",
-    "ldrouter": "dist/cli.js",
-    "ldrouter-quota-sync": "dist/quota-sync.js"
+    "ldrouter": "dist/cli.js"
   },
   "files": [
     "dist",

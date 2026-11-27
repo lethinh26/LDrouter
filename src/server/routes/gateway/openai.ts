@@ -48,8 +48,7 @@ export async function registerOpenAIRoutes(app: FastifyInstance): Promise<void> 
   app.get('/v1/models', async (req) => {
     const key = requireGatewayKey(req);
     const db = getDb();
-    const clientProviders = new Set(db.select().from(schema.providerIntegrations).all().filter(i => i.authMode === 'client_oauth').map(i => i.providerId));
-    const models = db.select().from(schema.models).all().filter((m) => m.enabled && m.upstreamAvailable && !clientProviders.has(m.providerId));
+    const models = db.select().from(schema.models).all().filter((m) => m.enabled && m.upstreamAvailable);
     const ids = listRoutableModelIds(models, key, db);
     return openAIModelList(ids.map((id) => ({ publicModelId: id, upstreamModelId: id })));
   });
@@ -252,7 +251,7 @@ export function listRoutableModelIds(models: ModelRow[], key: AuthenticatedKey, 
   const modelIds = new Set(models.map((m) => m.id));
   const modelById = new Map(models.map((m) => [m.id, m.publicModelId]));
 
-  let combos = db.select().from(schema.combos).where(eq(schema.combos.enabled, true)).all().filter(c => c.comboKind === 'standard');
+  let combos = db.select().from(schema.combos).where(eq(schema.combos.enabled, true)).all();
   const members = combos.length > 0
     ? db.select().from(schema.comboMembers).where(inArray(schema.comboMembers.comboId, combos.map((c) => c.id))).all()
     : [];

@@ -4,7 +4,6 @@ import { AuthProvider, useAuth } from './auth';
 import { Sidebar } from '../components/sidebar';
 import { TopBar } from '../components/top-bar';
 import { Login } from './pages/login';
-import { GatewayOAuthAuthorize } from './pages/gateway-oauth-authorize';
 import { Setup } from './pages/setup';
 import { Dashboard } from './pages/dashboard';
 import { Providers } from './pages/providers';
@@ -54,7 +53,6 @@ function Shell() {
             <Route path="/combos" element={<Combos />} />
             <Route path="/aliases" element={<Aliases />} />
             <Route path="/api-keys" element={<ApiKeys />} />
-            <Route path="/oauth/authorize" element={<GatewayOAuthAuthorize />} />
             <Route path="/requests" element={<Requests />} />
             <Route path="/statistics" element={<Statistics />} />
             <Route path="/audit" element={<AuditLogs />} />

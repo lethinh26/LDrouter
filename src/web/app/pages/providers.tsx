@@ -14,11 +14,9 @@ import { Switch } from '../../components/ui/switch';
 import { api } from '../../lib/api';
 import { toast } from 'sonner';
 import { Play, Trash2 } from 'lucide-react';
-import { BuiltinProviders } from './builtin-providers';
 
 interface Provider {
   id: string; name: string; slug: string; type: 'openai' | 'anthropic'; baseUrl: string;
-  providerKind: 'compatible' | 'codex' | 'claude_code'; authMode: 'api_key' | 'client_oauth';
   enabled: boolean; health: string; modelCount: number;
 }
 
@@ -36,21 +34,14 @@ export function Providers() {
   const [editForm, setEditForm] = useState(EMPTY);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [deleteSubmitting, setDeleteSubmitting] = useState(false);
-  const [builtinRevision, setBuiltinRevision] = useState(0);
-  const [loading, setLoading] = useState(true);
-  const [loadError, setLoadError] = useState('');
   const editingProvider = rows.find((row) => row.id === editingId);
   const slugLocked = (editingProvider?.modelCount ?? 0) > 0;
 
   const reload = async () => {
-    setLoading(true);
-    setLoadError('');
     try {
       const result = await api.get<{ providers: Provider[] }>('/api/admin/providers');
-      setRows(result.providers.filter((p) => p.providerKind === 'compatible'));
-    } catch (e) {
-      setLoadError((e as Error).message || 'Unable to load custom providers');
-    } finally { setLoading(false); }
+      setRows(result.providers);
+    } catch (e) { toast.error((e as Error).message || 'Unable to load providers'); }
   };
   // reload is intentionally stable for the page lifetime; mutations call it explicitly.
   useEffect(() => { void reload(); }, []);
@@ -62,11 +53,10 @@ export function Providers() {
         try { customHeaders = JSON.parse(form.customHeaders); }
         catch { throw new Error('Custom headers must be valid JSON object'); }
       }
-      await api.post('/api/admin/providers', { name: form.name.trim(), slug: form.slug || undefined, type: form.type, providerKind: 'compatible', baseUrl: form.baseUrl, apiKey: form.apiKey, customHeaders, enabled: form.enabled });
+      await api.post('/api/admin/providers', { name: form.name, slug: form.slug || undefined, type: form.type, baseUrl: form.baseUrl, apiKey: form.apiKey, customHeaders, enabled: form.enabled });
       toast.success('Provider created');
       setOpen(false);
       setForm(EMPTY);
-      setBuiltinRevision((revision) => revision + 1);
       void reload();
     } catch (e) { toast.error((e as Error).message); }
     finally { setSubmitting(false); }
@@ -76,8 +66,7 @@ export function Providers() {
     setTestingId(id);
     try {
       const r = await api.post<{ ok: boolean; detail: string }>(`/api/admin/providers/${id}/test`);
-      if (r.ok) toast.success(`Connection OK: ${r.detail}`);
-      else toast.error(`Failed: ${r.detail}`);
+      toast.success(r.ok ? `Connection OK: ${r.detail}` : `Failed: ${r.detail}`);
       void reload();
     } catch (e) { toast.error((e as Error).message); }
     finally { setTestingId(null); }
@@ -97,11 +86,10 @@ export function Providers() {
         try { customHeaders = JSON.parse(editForm.customHeaders); }
         catch { throw new Error('Custom headers must be valid JSON object'); }
       }
-      await api.patch('/api/admin/providers', { id: editingId, name: editForm.name.trim(), slug: editForm.slug || undefined, type: editForm.type, providerKind: 'compatible', baseUrl: editForm.baseUrl, apiKey: editForm.apiKey || undefined, customHeaders, enabled: editForm.enabled });
+      await api.patch('/api/admin/providers', { id: editingId, name: editForm.name, slug: editForm.slug || undefined, type: editForm.type, baseUrl: editForm.baseUrl, apiKey: editForm.apiKey || undefined, customHeaders, enabled: editForm.enabled });
       toast.success('Provider updated');
       setEditingId(null);
       setEditForm(EMPTY);
-      setBuiltinRevision((revision) => revision + 1);
       void reload();
     } catch (e) { toast.error((e as Error).message); }
     finally { setSubmitting(false); }
@@ -109,34 +97,27 @@ export function Providers() {
 
   const del = async (id: string) => {
     setDeleteSubmitting(true);
-    try { await api.del(`/api/admin/providers/${id}`); toast.success('Provider removed'); setBuiltinRevision((revision) => revision + 1); void reload(); }
+    try { await api.del(`/api/admin/providers/${id}`); toast.success('Provider removed'); void reload(); }
     catch (e) { toast.error((e as Error).message); }
     finally { setDeleteSubmitting(false); setDeletingId(null); }
   };
 
   return (
     <div>
-      <PageHeader title="Providers" description="Manage built-in integrations and custom upstream endpoints." />
-      <BuiltinProviders revision={builtinRevision} />
-      <section aria-label="Custom Providers" className="mt-8">
-      <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-        <div><h2 className="text-xl font-semibold tracking-tight">Custom Providers</h2><p className="text-sm text-muted-foreground">Connect an OpenAI-compatible or Anthropic-compatible endpoint.</p></div>
+      <PageHeader title="Providers" description="Upstream LLM providers and their credentials" actions={
         <div className="flex gap-2">
-          <Dialog open={open} onOpenChange={(next) => { if (!submitting) { setOpen(next); if (!next) setForm(EMPTY); } }}>
-            <DialogTrigger asChild><Button disabled={loading || !!loadError}>Add provider</Button></DialogTrigger>
-            <DialogContent className="max-h-[90vh] overflow-y-auto">
+          <Dialog open={open} onOpenChange={setOpen}>
+            <DialogTrigger asChild><Button>Add compatible provider</Button></DialogTrigger>
+            <DialogContent>
               <DialogHeader>
-                <DialogTitle>New custom provider</DialogTitle>
-                <DialogDescription>Configure a compatible API endpoint and its API key.</DialogDescription>
+                <DialogTitle>New provider</DialogTitle>
+                <DialogDescription>API-key or compatible endpoint.</DialogDescription>
               </DialogHeader>
               <div className="space-y-3">
                 <div><Label htmlFor="provider-name">Name</Label><Input id="provider-name" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></div>
-                <div><Label htmlFor="provider-slug">Slug (optional)</Label><Input id="provider-slug" value={form.slug} onChange={(e) => setForm({ ...form, slug: e.target.value })} /><p className="mt-1 text-xs text-muted-foreground">Unique model prefix. Defaults to the normalized name. Reserved prefixes: combo, cx, cc and builtin-connection-. The slug is locked after models are imported.</p></div>
+                <div><Label htmlFor="provider-slug">Slug (optional)</Label><Input id="provider-slug" value={form.slug} onChange={(e) => setForm({ ...form, slug: e.target.value })} /><p className="mt-1 text-xs text-muted-foreground">Unique model prefix. Defaults to the normalized name. Reserved prefix: combo. The slug is locked after models are imported.</p></div>
                 <div><Label>Type</Label>
-                  <Select value={form.type} onValueChange={(v) => setForm((current) => {
-                    const type = v === 'anthropic' ? 'anthropic' : 'openai';
-                    return { ...current, type, baseUrl: DEFAULT_BASE_URL[type], apiKey: '', customHeaders: '' };
-                  })}>
+                  <Select value={form.type} onValueChange={(v) => setForm((current) => ({ ...current, type: v as 'openai' | 'anthropic', baseUrl: DEFAULT_BASE_URL[v as 'openai' | 'anthropic'] }))}>
                     <SelectTrigger><SelectValue /></SelectTrigger>
                     <SelectContent>
                       <SelectItem value="openai">OpenAI-compatible</SelectItem>
@@ -145,22 +126,21 @@ export function Providers() {
                   </Select>
                 </div>
                 <div><Label htmlFor="provider-base-url">Base URL</Label><Input id="provider-base-url" value={form.baseUrl} onChange={(e) => setForm({ ...form, baseUrl: e.target.value })} /></div>
-                <div><Label htmlFor="provider-api-key">API key</Label><Input id="provider-api-key" type="password" autoComplete="off" value={form.apiKey} onChange={(e) => setForm({ ...form, apiKey: e.target.value })} /></div>
+                <div><Label htmlFor="provider-api-key">API key</Label><Input id="provider-api-key" type="password" value={form.apiKey} onChange={(e) => setForm({ ...form, apiKey: e.target.value })} /></div>
                 <div><Label htmlFor="provider-headers">Custom headers (JSON)</Label><Input id="provider-headers" value={form.customHeaders} onChange={(e) => setForm({ ...form, customHeaders: e.target.value })} placeholder='{"X-Org":"acme"}' /></div>
                 <div className="flex items-center gap-2"><Switch checked={form.enabled} onCheckedChange={(v) => setForm({ ...form, enabled: v })} /><Label>Enabled</Label></div>
               </div>
               <DialogFooter>
-                <Button variant="outline" disabled={submitting} onClick={() => { setOpen(false); setForm(EMPTY); }}>Cancel</Button>
-                <Button disabled={submitting || !form.name.trim() || !form.apiKey} onClick={submit}>{submitting ? 'Creating…' : 'Create'}</Button>
+                <Button variant="outline" onClick={() => setOpen(false)}>Cancel</Button>
+                <Button disabled={submitting || !form.name || !form.apiKey} onClick={submit}>{submitting ? 'Creating…' : 'Create'}</Button>
               </DialogFooter>
             </DialogContent>
           </Dialog>
         </div>
-      </div>
+      } />
       <Card>
-        <CardHeader><CardTitle className="text-base">Custom connections</CardTitle><CardDescription>{loading ? 'Loading…' : loadError ? 'Unable to load' : `${rows.length} total`}</CardDescription></CardHeader>
+        <CardHeader><CardTitle className="text-base">All providers</CardTitle><CardDescription>{rows.length} total</CardDescription></CardHeader>
         <CardContent>
-          {loadError ? <div role="alert" className="flex items-center justify-between gap-3 text-sm text-destructive">{loadError}<Button size="sm" variant="outline" onClick={() => void reload()}>Retry</Button></div> : (
           <Table>
             <TableHeader>
               <TableRow>
@@ -174,8 +154,7 @@ export function Providers() {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {loading && <TableRow><TableCell colSpan={7} className="text-center text-muted-foreground">Loading custom providers…</TableCell></TableRow>}
-              {!loading && rows.length === 0 && <TableRow><TableCell colSpan={7} className="text-center text-muted-foreground">No custom providers yet.</TableCell></TableRow>}
+              {rows.length === 0 && <TableRow><TableCell colSpan={7} className="text-center text-muted-foreground">No providers yet.</TableCell></TableRow>}
               {rows.map((p) => (
                 <TableRow key={p.id}>
                   <TableCell className="font-medium">{p.name} <span className="text-xs text-muted-foreground">{p.slug}</span></TableCell>
@@ -186,24 +165,24 @@ export function Providers() {
                   <TableCell>{p.enabled ? 'Yes' : 'No'}</TableCell>
                   <TableCell className="text-right">
                     <div className="flex justify-end gap-1">
-                      <Button size="sm" variant="outline" title="Test connection" aria-label={`Test ${p.name}`} disabled={loading || testingId !== null} onClick={() => test(p.id)}><Play className="h-3 w-3" /></Button>
-                      <Button size="sm" variant="outline" disabled={loading} onClick={() => startEdit(p)}>✎</Button>
-                      <Button size="sm" variant="outline" disabled={loading} aria-label={`Delete ${p.name}`} onClick={() => setDeletingId(p.id)}><Trash2 className="h-3 w-3" /></Button>
+                      <Button size="sm" variant="outline" disabled={testingId === p.id} onClick={() => test(p.id)}><Play className="h-3 w-3" /></Button>
+                      <Button size="sm" variant="outline" onClick={() => startEdit(p)}>✎</Button>
+                      <Button size="sm" variant="outline" onClick={() => setDeletingId(p.id)}><Trash2 className="h-3 w-3" /></Button>
                     </div>
                   </TableCell>
                 </TableRow>
               ))}
             </TableBody>
-          </Table>)}
+          </Table>
         </CardContent>
       </Card>
 
       {/* Edit Dialog */}
-      <Dialog open={!!editingId} onOpenChange={(open) => { if (!open && !submitting) { setEditingId(null); setEditForm(EMPTY); } }}>
-        <DialogContent className="max-h-[90vh] overflow-y-auto">
+      <Dialog open={!!editingId} onOpenChange={(open) => { if (!open) { setEditingId(null); setEditForm(EMPTY); } }}>
+        <DialogContent>
           <DialogHeader><DialogTitle>Edit provider</DialogTitle></DialogHeader>
           <div className="space-y-3">
-            <div><Label htmlFor="edit-provider-name">Name</Label><Input id="edit-provider-name" value={editForm.name} onChange={(e) => setEditForm({ ...editForm, name: e.target.value })} /></div>
+            <div><Label>Name</Label><Input value={editForm.name} onChange={(e) => setEditForm({ ...editForm, name: e.target.value })} /></div>
             <div><Label htmlFor="edit-provider-slug">Slug</Label><Input id="edit-provider-slug" value={editForm.slug} disabled={slugLocked} onChange={(e) => setEditForm({ ...editForm, slug: e.target.value })} /><p className="mt-1 text-xs text-muted-foreground">{slugLocked ? 'Locked to preserve existing public model IDs and client configurations.' : 'Unique model prefix; may be changed before importing models.'}</p></div>
             <div><Label>Type</Label>
               <Select value={editForm.type} disabled>
@@ -214,14 +193,14 @@ export function Providers() {
                   </SelectContent>
               </Select>
             </div>
-            <div><Label htmlFor="edit-provider-url">Base URL</Label><Input id="edit-provider-url" value={editForm.baseUrl} onChange={(e) => setEditForm({ ...editForm, baseUrl: e.target.value })} /></div>
-            <div><Label htmlFor="edit-provider-key">API key (leave empty to keep current)</Label><Input id="edit-provider-key" type="password" autoComplete="off" value={editForm.apiKey} onChange={(e) => setEditForm({ ...editForm, apiKey: e.target.value })} /></div>
-            <div><Label htmlFor="edit-provider-headers">Custom headers (JSON)</Label><Input id="edit-provider-headers" value={editForm.customHeaders} onChange={(e) => setEditForm({ ...editForm, customHeaders: e.target.value })} placeholder='{"X-Org":"acme"}' /></div>
+            <div><Label>Base URL</Label><Input value={editForm.baseUrl} onChange={(e) => setEditForm({ ...editForm, baseUrl: e.target.value })} /></div>
+            <div><Label>API key (leave empty to keep current)</Label><Input type="password" value={editForm.apiKey} onChange={(e) => setEditForm({ ...editForm, apiKey: e.target.value })} /></div>
+            <div><Label>Custom headers (JSON)</Label><Input value={editForm.customHeaders} onChange={(e) => setEditForm({ ...editForm, customHeaders: e.target.value })} placeholder='{"X-Org":"acme"}' /></div>
             <div className="flex items-center gap-2"><Switch checked={editForm.enabled} onCheckedChange={(v) => setEditForm({ ...editForm, enabled: v })} /><Label>Enabled</Label></div>
           </div>
           <DialogFooter>
-            <Button variant="outline" disabled={submitting} onClick={() => { setEditingId(null); setEditForm(EMPTY); }}>Cancel</Button>
-            <Button disabled={submitting || !editForm.name.trim()} onClick={editSubmit}>Save changes</Button>
+            <Button variant="outline" onClick={() => { setEditingId(null); setEditForm(EMPTY); }}>Cancel</Button>
+            <Button disabled={submitting || !editForm.name} onClick={editSubmit}>Save changes</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -247,7 +226,6 @@ export function Providers() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-      </section>
     </div>
   );
 }

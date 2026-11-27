@@ -14,7 +14,6 @@ import { parseMasterKey } from '../auth/crypto';
 import { getSettings } from '../db/repositories/settings';
 import { getAppVersion } from '../version';
 import { writeBackupContainer, type BackupManifestV2, type BackupProfile } from './container';
-import { GATEWAY_OAUTH_VOLATILE_TABLES, removeGatewayOAuthState } from './gateway-oauth-state';
 
 /** Forensic/volatile tables removed by a compact export; retained by a full export. */
 export const COMPACT_EXCLUDED_TABLES = [
@@ -25,7 +24,6 @@ export const COMPACT_EXCLUDED_TABLES = [
   'admin_sessions',
   'csrf_tokens',
   'backups',
-  ...GATEWAY_OAUTH_VOLATILE_TABLES,
 ] as const;
 
 export async function createBackupExport(input: {
@@ -48,21 +46,17 @@ export async function createBackupExport(input: {
       source.close();
     }
 
-    // 2. Neither profile contains OAuth authorization state. Compact also
-    // removes forensic tables and reclaims their pages.
-    {
+    // 2. Compact prunes the snapshot in place, then reclaims its pages. Full keeps every row.
+    if (profile === 'compact') {
       const staging = new Database(snapshotFile);
       try {
-        removeGatewayOAuthState(staging);
-        if (profile === 'compact') {
-          const present = new Set(
-            (staging.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as { name: string }[]).map((row) => row.name),
-          );
-          for (const table of COMPACT_EXCLUDED_TABLES) {
-            if (present.has(table)) staging.prepare(`DELETE FROM "${table}"`).run();
-          }
-          staging.exec('VACUUM');
+        const present = new Set(
+          (staging.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as { name: string }[]).map((row) => row.name),
+        );
+        for (const table of COMPACT_EXCLUDED_TABLES) {
+          if (present.has(table)) staging.prepare(`DELETE FROM "${table}"`).run();
         }
+        staging.exec('VACUUM');
       } finally {
         staging.close();
       }
@@ -100,7 +94,7 @@ export async function createBackupExport(input: {
       uncompressedBytes,
       checksum: checksum.digest('hex'),
       keyEnvelope: encryptBackupMasterKey(masterKey, passphrase),
-      excludedTables: profile === 'compact' ? [...COMPACT_EXCLUDED_TABLES] : [...GATEWAY_OAUTH_VOLATILE_TABLES],
+      excludedTables: profile === 'compact' ? [...COMPACT_EXCLUDED_TABLES] : [],
       statistics: { granularity: 'daily', dimensions: ['model', 'provider', 'api_key'], p95Available: false },
     };
 

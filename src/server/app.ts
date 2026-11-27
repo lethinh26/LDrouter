@@ -125,10 +125,9 @@ export async function buildApp(opts: AppOptions = {}): Promise<App> {
       cause: normalized instanceof Error ? (normalized as { cause?: unknown }).cause : undefined,
     };
     const safePath = redactString(req.url.split('?')[0] ?? '');
-    const oauthRoute = /^\/(?:oauth(?:\/|$)|api\/oauth(?:\/|$)|api\/admin\/gateway-oauth(?:\/|$))/.test(safePath);
-    const safeDetail = oauthRoute ? { message: 'Gateway OAuth request failed' } : redactValue(errDetail);
+    const safeDetail = redactValue(errDetail);
     if (status >= 500) log.error({ requestId, url: safePath, err: safeDetail }, 'request error');
-    else log.warn({ requestId, url: safePath, err: { type: (g?.type ?? 'error'), message: oauthRoute ? 'Gateway OAuth request rejected' : redactString(errMsg) } }, 'request rejected');
+    else log.warn({ requestId, url: safePath, err: { type: (g?.type ?? 'error'), message: redactString(errMsg) } }, 'request rejected');
 
     // docs/13 §19: server-side stack with request context (never to client).
     if (status >= 500) {
@@ -136,7 +135,7 @@ export async function buildApp(opts: AppOptions = {}): Promise<App> {
         `route=${req.routeOptions?.url ?? safePath}`,
         `method=${req.method}`,
         `statusCode=${status}`,
-        ...(oauthRoute ? ['Gateway OAuth request failed'] : formatError(normalized).map(line => redactString(line))),
+        ...formatError(normalized).map(line => redactString(line)),
       ]);
     }
 

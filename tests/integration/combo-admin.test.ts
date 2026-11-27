@@ -25,9 +25,6 @@ let baseUrl = '';
 let cookies = '';
 let modelA = '';
 let modelB = '';
-let codexA = '';
-let codexB = '';
-let codexDuplicate = '';
 type DB = ReturnType<(typeof import('../../src/server/db/index'))['getDb']>;
 let db: DB;
 let sch: typeof import('../../src/server/db/schema');
@@ -52,14 +49,6 @@ beforeAll(async () => {
   modelB = uuid();
   db.insert(sch.models).values({ id: modelA, providerId: 'p1', upstreamModelId: 'a', publicModelId: 'p1/a', displayName: 'A', enabled: true, upstreamAvailable: true, capabilitiesJson: '{}' }).run();
   db.insert(sch.models).values({ id: modelB, providerId: 'p1', upstreamModelId: 'b', publicModelId: 'p1/b', displayName: 'B', enabled: true, upstreamAvailable: true, capabilitiesJson: '{}' }).run();
-  for (const id of ['codex-one', 'codex-two']) {
-    db.insert(sch.providers).values({ id, name: id, slug: id, type: 'openai', baseUrl: 'https://chatgpt.com' }).run();
-    db.insert(sch.providerIntegrations).values({ providerId: id, providerKind: 'codex', authMode: 'client_oauth' }).run();
-  }
-  codexA = uuid(); codexB = uuid(); codexDuplicate = uuid();
-  for (const [id, providerId, upstreamModelId] of [[codexA, 'codex-one', 'a'], [codexB, 'codex-one', 'b'], [codexDuplicate, 'codex-two', 'a']] as const) {
-    db.insert(sch.models).values({ id, providerId, upstreamModelId, publicModelId: `${providerId}/${upstreamModelId}`, displayName: upstreamModelId, capabilitiesJson: '{"chat":false,"responses":true,"streaming":true}' }).run();
-  }
 });
 
 afterAll(async () => {
@@ -330,47 +319,5 @@ describe('admin combo edit', () => {
     const moved = await patch({ id: created.id, members: [member(modelB, 0), member(modelA, 1)] });
     expect(moved.status).toBe(200);
     expect((await detail(created.id)).members.map((m) => m.modelId)).toEqual([modelB, modelA]);
-  });
-});
-
-describe('native Codex combo admin', () => {
-  it('persists native kind, safe defaults and configured eligibility in list and detail', async () => {
-    const r = await create({ name: 'Native configured', comboKind: 'codex_native', members: [member(codexA), member(codexB, 1)] });
-    expect(r.status).toBe(200);
-    const { id } = await r.json();
-    expect(await detail(id)).toMatchObject({ comboKind: 'codex_native', fallbackOn429: false, slowResponseFallbackEnabled: false, members: [{ status: { state: 'ready' } }, { status: { state: 'ready' } }] });
-    expect((await list()).find(c => c.id === id)).toMatchObject({ comboKind: 'codex_native', status: 'ready', healthyMemberCount: 2, slowCooldownCount: 0, slowProbeCount: 0 });
-    const synthetic = await fetch(`${baseUrl}/api/admin/combos/${id}/test`, { method: 'POST', headers: { 'content-type': 'application/json', cookie: cookies }, body: '{}' });
-    expect(synthetic.status).toBe(400);
-    expect((await synthetic.json()).error.message).toMatch(/signed-in Codex/i);
-    expect(db.select().from(sch.requests).all().some(request => request.requestedModel === 'native-configured')).toBe(false);
-  });
-
-  it.each([
-    { name: 'standard rejects native', comboKind: 'standard', members: () => [member(codexA)] },
-    { name: 'native rejects standard', comboKind: 'codex_native', members: () => [member(modelA)] },
-    { name: 'native rejects mixed', comboKind: 'codex_native', members: () => [member(codexA), { ...member(modelA, 1), enabled: false }] },
-    { name: 'native rejects duplicate upstream', comboKind: 'codex_native', members: () => [member(codexA), { ...member(codexDuplicate, 1), enabled: false }] },
-  ])('$name without creating a combo row', async ({ name, comboKind, members }) => {
-    const before = db.select().from(sch.combos).all().length;
-    expect((await create({ name, comboKind, members: members() })).status).toBe(400);
-    expect(db.select().from(sch.combos).all()).toHaveLength(before);
-  });
-
-  it('rejects native 429 fallback and adaptive mode on create or update, and makes kind immutable', async () => {
-    for (const forbidden of [{ fallbackOn429: true }, { slowResponseFallbackEnabled: true }]) {
-      expect((await create({ name: 'Rejected native settings', comboKind: 'codex_native', members: [member(codexA)], ...forbidden })).status).toBe(400);
-    }
-    const response = await create({ name: 'Native immutable', comboKind: 'codex_native', members: [member(codexA)] });
-    expect(response.status).toBe(200);
-    const { id } = await response.json();
-    for (const forbidden of [{ fallbackOn429: true }, { slowResponseFallbackEnabled: true }, { comboKind: 'standard', members: [member(modelA)] }, { members: [member(codexA), member(codexDuplicate, 1)] }]) {
-      expect((await patch({ id, ...forbidden })).status).toBe(400);
-    }
-    expect((await patch({ id, comboKind: 'codex_native', members: [member(codexB), member(codexA, 1)] })).status).toBe(200);
-    expect(await detail(id)).toMatchObject({ comboKind: 'codex_native', fallbackOn429: false, slowResponseFallbackEnabled: false, members: [{ modelId: codexB }, { modelId: codexA }] });
-    const standard = await (await create({ name: 'Standard immutable', members: [member(modelA)] })).json();
-    expect(await detail(standard.id)).toMatchObject({ comboKind: 'standard', fallbackOn429: true, slowResponseFallbackEnabled: true });
-    expect((await patch({ id: standard.id, comboKind: 'codex_native', members: [member(codexA)] })).status).toBe(400);
   });
 });

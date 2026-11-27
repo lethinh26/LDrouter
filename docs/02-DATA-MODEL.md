@@ -63,23 +63,6 @@ Use secure, HttpOnly, SameSite cookies for the browser admin UI. Set Secure when
 - `created_at`
 - `updated_at`
 
-### `subscription_quota_accounts` (migration 0021)
-
-Independent monitoring records for Codex and Claude Code subscription accounts,
-not authentication or routing identities. Each row has a stable UUID, provider
-kind, operator-selected name, optional SHA-256 fingerprint of an imported Codex
-account identifier, one bounded normalized quota snapshot and UTC millisecond
-creation/update timestamps. Names are unique per provider (SQLite NOCASE);
-non-null identity fingerprints cannot be shared by two records of a provider.
-Snapshots are observations with explicit source and observation time, not
-enforceable limits. No upstream access/refresh token, session or raw provider
-response is stored. The table has no relationship to the routing namespace,
-models, API keys or provider connections. Codex client sync adds a distinct
-observation source, `codex_client_sync`, using the same snapshot structure.
-Its temporary per-record pairing digest and last upload time exist only in
-process memory, bound to the current database epoch; no new schema or backup
-state is needed.
-
 ### `models`
 
 - `id`
@@ -104,15 +87,14 @@ Unique constraint on `(provider_id, upstream_model_id)`.
 - `id`
 - `name`
 - `slug` unique
-- `public_model_id` unique; normalized name by default or `combo/<slug>` when a slug is explicitly supplied
-- `combo_kind`: immutable `standard` (default) or `codex_native` (migration 0018)
+- `public_model_id` unique, always `combo/<slug>`
 - `mode`: `fallback`
 - `enabled`
 - `max_total_attempts`
 - `max_request_duration_seconds` (nullable; additional overall combo deadline)
 - fallback-trigger policy
 - `fallback_on_total_timeout` (default true for new combos; migration 0012 copies the previous `fallback_on_connect_timeout` value for existing combos)
-- `slow_response_fallback_enabled` (default true for standard, false for native Codex)
+- `slow_response_fallback_enabled` (default true)
 - `slow_response_threshold_seconds` (default 60)
 - `slow_response_max_count` (default 3)
 - `slow_response_generation` (increments on routing/latency-affecting configuration changes, fencing stale outcomes)

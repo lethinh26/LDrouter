@@ -15,7 +15,6 @@ import { eq, sql } from 'drizzle-orm';
 import type { BackupMasterKeyEnvelope } from '../../auth/backup-crypto';
 import { resetMasterKeyCache } from '../../auth/crypto';
 import { createBackupExport } from '../../backup/export';
-import { removeGatewayOAuthState } from '../../backup/gateway-oauth-state';
 import type { BackupProfile } from '../../backup/container';
 import { receiveBackupUpload, validateUploadedBackup, writeLegacyEnvelopeUpload, type ValidatedBackup } from '../../backup/restore-upload';
 
@@ -114,10 +113,6 @@ export async function restoreValidatedDatabase(validated: ValidatedBackup, req: 
   const live = new Database(liveDb);
   try {
     await live.backup(snapshot);
-    // A rollback snapshot is not allowed to restore previously rotated or
-    // revoked OAuth grants either. A normal service restart keeps them.
-    const rollback = new Database(snapshot, { fileMustExist: true });
-    try { removeGatewayOAuthState(rollback); } finally { rollback.close(); }
   } catch {
     live.close();
     recordAudit({ action: 'db.restore', success: false, ip: req.ip, metadata: { reason: 'snapshot_failed' } });

@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [2.2.1] - 2026-11-27
+
+### Removed
+
+- Roll back the dedicated Codex and Claude Code integrations, built-in provider center, gateway OAuth, native combos, subscription quota registry and local quota sync to the pre-integration application behavior (`89221a3`). Keep the preceding API-key and namespace fixes, and independent build/HTTP safety fixes.
+- Migration 0022 removes integration-owned configurations and authorization/quota state, cleans dependent targets and invalidates affected caches, preserves compatible providers, remaining combo order, API-key restrictions and historical request/usage/statistics data. An existing database upgraded to schema 17–21 receives a private SQLite recovery copy before retirement; the active schema remains forward-only.
+
 ## [2.2.0] - 2026-11-27
 
 ### Added

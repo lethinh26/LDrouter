@@ -14,7 +14,6 @@ import { circuitBlocks, modelThrottleBlocks } from '../../routing/circuit';
 import { listAdaptiveStates } from '../../routing/combo-adaptive-state';
 import { freshSamples, median, SAMPLE_TTL_MS } from '../../routing/combo-policy';
 import { assertRoutingNameFree } from '../../routing/namespace';
-import { providerPublicPrefix } from '../../providers/builtin';
 
 const MemberSpec = z.object({ modelId: z.string(), position: z.number().int().min(0), enabled: z.boolean().default(true) });
 
@@ -26,7 +25,6 @@ const OptionalSlug = z.preprocess(
 const ComboCreate = z.object({
   name: z.string().min(1).max(128),
   slug: OptionalSlug,
-  comboKind: z.enum(['standard', 'codex_native']).optional(),
   mode: z.literal('fallback').default('fallback'),
   maxTotalAttempts: z.number().int().min(1).max(8).optional(),
   maxRequestDurationSeconds: z.number().int().min(1).max(3600).nullable().optional(),
@@ -93,21 +91,13 @@ function comboIds(name: string, slug?: string): { slug: string; publicModelId: s
  * are the payload of record, so two rows for one model collapse silently. Reject
  * that here: a member list is a set, and telling the operator beats a lost row.
  */
-function assertMembersUsable(db: ComboDb, members: Array<{ modelId: string }>, kind: ComboKind): void {
+function assertMembersUsable(db: ComboDb, members: Array<{ modelId: string }>): void {
   const ids = members.map((m) => m.modelId);
   const dupes = ids.filter((id, i) => ids.indexOf(id) !== i);
   if (dupes.length > 0) {
     throw new GatewayError('invalid_request_error', `Duplicate members: ${[...new Set(dupes)].join(', ')}`, { status: 400 });
   }
   assertModelsExist(db, members);
-  const oauthMembers = db.select({ id: schema.models.id, upstreamModelId: schema.models.upstreamModelId }).from(schema.models)
-    .innerJoin(schema.providerIntegrations, eq(schema.models.providerId, schema.providerIntegrations.providerId))
-    .where(sql`${schema.providerIntegrations.providerKind} = 'codex' AND ${schema.providerIntegrations.authMode} = 'client_oauth' AND ${schema.models.id} IN (${sql.join(ids.map(id => sql`${id}`), sql`, `)})`).all();
-  if (kind === 'standard' && oauthMembers.length) throw new GatewayError('invalid_request_error', 'Client OAuth models require a native Codex combo or direct route', { status: 400 });
-  if (kind === 'codex_native') {
-    if (oauthMembers.length !== members.length) throw new GatewayError('invalid_request_error', 'Native Codex combos require only Codex client OAuth models', { status: 400 });
-    if (new Set(oauthMembers.map(m => m.upstreamModelId)).size !== oauthMembers.length) throw new GatewayError('invalid_request_error', 'Native Codex combos require distinct upstream model IDs', { status: 400 });
-  }
 }
 
 function assertModelsExist(db: ComboDb, members: Array<{ modelId: string }>): void {
@@ -122,13 +112,6 @@ function assertModelsExist(db: ComboDb, members: Array<{ modelId: string }>): vo
 }
 
 type ComboDb = ReturnType<typeof getDb>;
-type ComboKind = typeof schema.combos.$inferSelect['comboKind'];
-
-function assertComboPolicy(kind: ComboKind, settings: { fallbackOn429?: boolean; slowResponseFallbackEnabled?: boolean }): void {
-  if (kind === 'codex_native' && (settings.fallbackOn429 === true || settings.slowResponseFallbackEnabled === true)) {
-    throw new GatewayError('invalid_request_error', 'Native Codex combos cannot enable 429 fallback or adaptive slow-response fallback', { status: 400 });
-  }
-}
 
 const capabilityKeys = ['chat', 'responses', 'streaming', 'tools', 'structured_output', 'image_input', 'audio_input', 'reasoning', 'embeddings'] as const;
 
@@ -136,20 +119,12 @@ function modelCapabilities(model: { capabilitiesJson: string }): Record<string, 
   try { return JSON.parse(model.capabilitiesJson) as Record<string, unknown>; } catch { return {}; }
 }
 
-function memberStatus(model: typeof schema.models.$inferSelect | undefined, provider: typeof schema.providers.$inferSelect | undefined, enabled: boolean, kind: ComboKind, nativeProvider: boolean): { state: 'ready' | 'unavailable'; reason: string } {
+function memberStatus(model: typeof schema.models.$inferSelect | undefined, provider: typeof schema.providers.$inferSelect | undefined, enabled: boolean): { state: 'ready' | 'unavailable'; reason: string } {
   if (!enabled) return { state: 'unavailable', reason: 'member_disabled' };
   if (!model) return { state: 'unavailable', reason: 'model_missing' };
   if (!provider?.enabled) return { state: 'unavailable', reason: 'provider_disabled' };
   if (!model.enabled) return { state: 'unavailable', reason: 'model_disabled' };
   if (!model.upstreamAvailable) return { state: 'unavailable', reason: 'upstream_unavailable' };
-  if ((kind === 'codex_native') !== nativeProvider) return { state: 'unavailable', reason: 'provider_integration_mismatch' };
-  if (kind === 'codex_native') {
-    const caps = modelCapabilities(model);
-    if (caps.responses !== true || caps.streaming !== true) return { state: 'unavailable', reason: 'responses_capability_unavailable' };
-    // Account availability is only established by the signed-in client. A
-    // configured member is eligible, not a globally authenticated provider.
-    return { state: 'ready', reason: 'codex_account_unverified' };
-  }
   if (circuitBlocks(model.providerId, provider.cbCooldownSeconds) || modelThrottleBlocks(model.id)) return { state: 'unavailable', reason: 'circuit_open' };
   if (modelCapabilities(model).chat === false) return { state: 'unavailable', reason: 'chat_capability_unavailable' };
   return { state: 'ready', reason: provider.healthState === 'degraded' || provider.healthState === 'down' ? 'provider_degraded' : 'ready' };
@@ -204,11 +179,10 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
     const models = db.select().from(schema.models).all();
     const modelMap = new Map(models.map((m) => [m.id, m]));
     const providerMap = new Map(db.select().from(schema.providers).all().map((p) => [p.id, p]));
-    const nativeProviders = new Set(db.select().from(schema.providerIntegrations).all().filter(i => i.providerKind === 'codex' && i.authMode === 'client_oauth').map(i => i.providerId));
     return {
       combos: combos.map((c) => {
         const members = allMembers.filter((m) => m.comboId === c.id);
-        const statuses = members.map((m) => memberStatus(modelMap.get(m.modelId), providerMap.get(modelMap.get(m.modelId)?.providerId ?? ''), m.enabled, c.comboKind, nativeProviders.has(modelMap.get(m.modelId)?.providerId ?? '')));
+        const statuses = members.map((m) => memberStatus(modelMap.get(m.modelId), providerMap.get(modelMap.get(m.modelId)?.providerId ?? ''), m.enabled));
         const readyCount = statuses.filter((status) => status.state === 'ready').length;
         const reasons = [...new Set(statuses.filter((status) => status.state === 'unavailable').map((status) => status.reason))];
         const comboModels = members.map((m) => modelMap.get(m.modelId)).filter((m): m is typeof models[number] => Boolean(m));
@@ -221,7 +195,6 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
           name: c.name,
           slug: c.slug,
           publicModelId: c.publicModelId,
-          comboKind: c.comboKind,
           mode: c.mode,
           enabled: c.enabled,
           memberCount: members.length,
@@ -249,18 +222,13 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
     const modelMap = new Map(models.map((m) => [m.id, m]));
     const providers = db.select().from(schema.providers).all();
     const providerMap = new Map(providers.map((p) => [p.id, p]));
-    const nativeProviders = new Set(db.select().from(schema.providerIntegrations).all().filter(i => i.providerKind === 'codex' && i.authMode === 'client_oauth').map(i => i.providerId));
-    const statuses = members.map(m => memberStatus(modelMap.get(m.modelId), providerMap.get(modelMap.get(m.modelId)?.providerId ?? ''), m.enabled, c.comboKind, nativeProviders.has(modelMap.get(m.modelId)?.providerId ?? '')));
-    const readyCount = statuses.filter(s => s.state === 'ready').length;
     const now = Date.now();
     const slowStates = c.slowResponseFallbackEnabled ? listAdaptiveStates(id).map((state) => adaptiveStateView(state, now)) : [];
      const comboModels = members.map((m) => modelMap.get(m.modelId));
      return {
       combo: {
         ...c,
-        status: !c.enabled ? 'disabled' : readyCount > 0 ? 'ready' : 'unavailable',
-        healthyMemberCount: readyCount,
-        members: members.map((m, index) => {
+        members: members.map((m) => {
           const adaptiveStates = slowStates.filter((state) => state.modelId === m.modelId);
           const latest = [...adaptiveStates].sort((a, b) => b.updatedAtMs - a.updatedAtMs)[0];
           return ({
@@ -269,15 +237,15 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
           publicModelId: modelMap.get(m.modelId)?.publicModelId ?? '',
           upstreamModelId: modelMap.get(m.modelId)?.upstreamModelId ?? '',
           displayName: modelMap.get(m.modelId)?.displayName ?? '',
-          providerSlug: providerMap.get(modelMap.get(m.modelId)?.providerId ?? '') ? providerPublicPrefix(db, providerMap.get(modelMap.get(m.modelId)?.providerId ?? '')!) : '',
+          providerSlug: providerMap.get(modelMap.get(m.modelId)?.providerId ?? '')?.slug ?? '',
           position: m.position,
           enabled: m.enabled,
            upstreamAvailable: modelMap.get(m.modelId)?.upstreamAvailable ?? false,
            providerEnabled: providerMap.get(modelMap.get(m.modelId)?.providerId ?? '')?.enabled ?? false,
-           providerHealth: c.comboKind === 'codex_native' ? 'unknown' : providerMap.get(modelMap.get(m.modelId)?.providerId ?? '')?.healthState ?? 'unknown',
-           circuitOpen: c.comboKind !== 'codex_native' && (circuitBlocks(modelMap.get(m.modelId)?.providerId ?? '', providerMap.get(modelMap.get(m.modelId)?.providerId ?? '')?.cbCooldownSeconds ?? 0) || modelThrottleBlocks(m.modelId)),
+           providerHealth: providerMap.get(modelMap.get(m.modelId)?.providerId ?? '')?.healthState ?? 'unknown',
+           circuitOpen: circuitBlocks(modelMap.get(m.modelId)?.providerId ?? '', providerMap.get(modelMap.get(m.modelId)?.providerId ?? '')?.cbCooldownSeconds ?? 0) || modelThrottleBlocks(m.modelId),
            capabilities: modelMap.get(m.modelId) ? modelCapabilities(modelMap.get(m.modelId)!) : {},
-           status: statuses[index],
+           status: memberStatus(modelMap.get(m.modelId), providerMap.get(modelMap.get(m.modelId)?.providerId ?? ''), m.enabled),
           adaptiveStates,
           // Compatibility snapshot for older admin clients. Decisions are scoped
           // to adaptiveStates; this is merely the most recently updated bucket.
@@ -298,7 +266,6 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
     const db = getDb();
     const combo = db.select().from(schema.combos).where(eq(schema.combos.id, id)).get();
     if (!combo) throw new GatewayError('invalid_request_error', 'Combo not found', { status: 404 });
-    if (combo.comboKind === 'codex_native') throw new GatewayError('invalid_request_error', 'Test native combos from the signed-in Codex client', { status: 400 });
 
     const { GatewayRunner } = await import('../../gateway/runner');
     const runner = new GatewayRunner();
@@ -342,7 +309,7 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
       selectedModel: selectedModel ? {
         publicModelId: selectedModel.publicModelId,
         upstreamModelId: selectedModel.upstreamModelId,
-        providerSlug: providerMap.get(selectedModel.providerId) ? providerPublicPrefix(db, providerMap.get(selectedModel.providerId)!) : '',
+        providerSlug: providerMap.get(selectedModel.providerId)?.slug ?? '',
       } : null,
       attempts: outcome.attempts.map((attempt) => {
         const model = modelMap.get(attempt.modelId);
@@ -362,14 +329,12 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
   app.post('/api/admin/combos', async (req) => {
     const body = ComboCreate.parse(req.body);
     const db = getDb();
-    const kind = body.comboKind ?? 'standard';
     // No slug given → the public id IS the normalized name (no "combo/" prefix).
     const { slug, publicModelId } = comboIds(body.name, body.slug);
     // The id must be globally unique across combos AND physical models — the
     // resolver treats every name as one routing surface.
     assertComboIdFree(db, slug, publicModelId);
-    assertComboPolicy(kind, body);
-    assertMembersUsable(db, body.members, kind);
+    assertMembersUsable(db, body.members);
 
     const id = uuid();
     // ponytail: one transaction — a combo row without its members is unroutable,
@@ -380,7 +345,6 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
         name: body.name,
         slug,
         publicModelId,
-        comboKind: kind,
         mode: body.mode,
         enabled: body.enabled ?? true,
         maxTotalAttempts: body.maxTotalAttempts ?? 3,
@@ -390,9 +354,9 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
         fallbackOnFirstTokenTimeout: body.fallbackOnFirstTokenTimeout ?? true,
         fallbackOnTotalTimeout: body.fallbackOnTotalTimeout ?? true,
         fallbackOn408: body.fallbackOn408 ?? true,
-        fallbackOn429: body.fallbackOn429 ?? (kind === 'standard'),
+        fallbackOn429: body.fallbackOn429 ?? true,
         fallbackOn5xx: body.fallbackOn5xx ?? true,
-        slowResponseFallbackEnabled: body.slowResponseFallbackEnabled ?? (kind === 'standard'),
+        slowResponseFallbackEnabled: body.slowResponseFallbackEnabled ?? true,
         slowResponseThresholdSeconds: body.slowResponseThresholdSeconds ?? 60,
         slowResponseMaxCount: body.slowResponseMaxCount ?? 3,
         configVersion: 1,
@@ -410,8 +374,6 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
     const db = getDb();
     const c = db.select().from(schema.combos).where(eq(schema.combos.id, body.id)).get();
     if (!c) throw new GatewayError('invalid_request_error', 'Combo not found', { status: 404 });
-    if (body.comboKind !== undefined && body.comboKind !== c.comboKind) throw new GatewayError('invalid_request_error', 'Combo kind is immutable; create a new combo', { status: 400 });
-    assertComboPolicy(c.comboKind, body);
     const update: Partial<typeof schema.combos.$inferInsert> = { updatedAt: new Date().toISOString(), configVersion: c.configVersion + 1 };
     if (body.name) update.name = body.name;
     // Same rule as creation: no slug → the id IS the (normalized) name, slug →
@@ -448,7 +410,7 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
     let reorderOnly = false;
     let currentMembers: Array<typeof schema.comboMembers.$inferSelect> = [];
     if (body.members) {
-      assertMembersUsable(db, body.members, c.comboKind);
+      assertMembersUsable(db, body.members);
       currentMembers = db.select().from(schema.comboMembers).where(eq(schema.comboMembers.comboId, body.id)).all()
         .sort((a, b) => a.position - b.position);
       const requestedByModel = new Map(body.members.map((m) => [m.modelId, m]));

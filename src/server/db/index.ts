@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 import * as schema from './schema';
 import { getLogger } from '../logging/logger';
 import { CURRENT_SCHEMA_VERSION, runMigrations } from './migrate';
+import { snapshotBeforeIntegrationRemoval } from './rollback-snapshot';
 import { resetCircuits } from '../routing/circuit';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -75,7 +76,10 @@ export function openDb(dbFile: string): DbHandle {
     raw.pragma('temp_store = MEMORY');
     raw.pragma('cache_size = -20000');
 
-    migrateDatabase(raw);
+    runMigrations(raw, getLogger(), resolveMigrationsDir(), CURRENT_SCHEMA_VERSION, () => {
+      snapshotBeforeIntegrationRemoval(raw);
+      getLogger().info('created private pre-0022 SQLite recovery snapshot');
+    });
     resetAdaptiveRuntime(raw, Date.now());
     resetCircuits();
     const db = drizzle(raw, { schema });
