@@ -7,6 +7,7 @@ No signed-in client or external provider endpoint is contacted.
 
 import base64
 import hashlib
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -610,6 +611,15 @@ def smoke(base, upstream):
         prior_grant_ids = {grant["id"] for grant in get(grants_path)["grants"]}
         callback_pattern = re.compile(r"^http://127\.0\.0\.1:43127/callback\?[^#]*$")
         intercepted = []
+        authorized_urls = []
+
+        def capture_authorize(route):
+            response = route.fetch()
+            assert response.ok, f"Gateway authorization: {response.status}"
+            authorized_urls.append(response.json()["redirectUrl"])
+            # Capture the real server response before the callback navigation
+            # can evict the browser's Network.getResponseBody resource.
+            route.fulfill(response=response)
 
         def intercept_callback(route):
             assert route.request.method == "GET" and route.request.is_navigation_request()
@@ -618,6 +628,7 @@ def smoke(base, upstream):
             route.fulfill(status=200, content_type="text/plain", body="Fixture callback received")
 
         page.route(callback_pattern, intercept_callback)
+        page.route(base + authorize_path, capture_authorize)
         try:
             navigation = page.goto("/oauth/authorize?" + urlencode({
                 "client_id": "ldrouter-codex", "response_type": "code",
@@ -634,13 +645,10 @@ def smoke(base, upstream):
             assert {grant["id"] for grant in get(grants_path)["grants"]} == prior_grant_ids
             selection.check()
             expect(approve).to_be_enabled()
-            with page.expect_response(lambda r: r.url == base + authorize_path
-                                      and r.request.method == "POST") as authorized:
-                approve.click()
-            assert authorized.value.ok, f"Gateway authorization: {authorized.value.status}"
+            approve.click()
             page.wait_for_url(callback_pattern, wait_until="domcontentloaded")
             assert len(intercepted) == 1
-            assert authorized.value.json()["redirectUrl"] == intercepted[0]
+            assert authorized_urls == intercepted
             parsed = urlsplit(intercepted[0])
             assert (parsed.scheme, parsed.netloc, parsed.path, parsed.fragment) == (
                 "http", "127.0.0.1:43127", "/callback", "",
@@ -651,6 +659,7 @@ def smoke(base, upstream):
             expect(page.get_by_text("Fixture callback received", exact=True)).to_be_visible()
         finally:
             page.unroute(callback_pattern, intercept_callback)
+            page.unroute(base + authorize_path, capture_authorize)
 
         # Use an independent unauthenticated HTTP context for the public token
         # endpoint, not the browser's admin session or a mocked token response.
@@ -736,6 +745,37 @@ def smoke(base, upstream):
         expect(claude_quota.get_by_text("75% used · 25% remaining", exact=True)).to_be_visible()
         expect(codex_quota.get_by_text("41% used · 59% remaining", exact=True)).to_be_visible()
         assert len(get("/api/admin/subscription-quotas")["accounts"]) == 2
+        codex_record = next(a for a in get("/api/admin/subscription-quotas")["accounts"] if a["providerKind"] == "codex")
+        expect(claude_quota.get_by_role("button", name="Set up sync", exact=True)).to_have_count(0)
+        codex_quota.get_by_role("button", name="Set up sync", exact=True).click()
+        dialog = page.get_by_role("dialog", name="Pair local Codex quota sync")
+        dialog.get_by_role("button", name="Generate sync token", exact=True).click()
+        token_input = dialog.get_by_label("Pairing token", exact=True)
+        expect(token_input).to_have_attribute("type", "password")
+        expect(token_input).to_have_value(re.compile(r"^ldq-[A-Za-z0-9_-]{43}$"))
+        sync_token = token_input.input_value()
+        expect(dialog.get_by_text("ldrouter-quota-sync --gateway " + base + " --account " + codex_record["id"] + " --interval 300", exact=True)).to_be_visible()
+        dialog.get_by_role("button", name="Done", exact=True).click()
+        expect(dialog).not_to_be_visible()
+        expect(codex_quota.get_by_text("Paired", exact=True)).to_be_visible()
+        sync_payload = {"observedAt": datetime.now(timezone.utc).isoformat(),
+                        "accountFingerprint": hashlib.sha256(b"quota-fixture-account").hexdigest(),
+                        "result": {"rateLimits": {"limitId": "codex", "primary": {"usedPercent": 64}}}}
+        quota_client = p.request.new_context(base_url=base, timeout=15000)
+        try:
+            sync_path = "/api/quota-sync/" + codex_record["id"]
+            sync_headers = {"Authorization": "Bearer " + sync_token}
+            response = quota_client.post(sync_path, headers=sync_headers, data=sync_payload)
+            assert response.ok, f"Quota client upload: {response.status}"
+            quota_card.get_by_role("button", name="Refresh records", exact=True).click()
+            expect(codex_quota.get_by_text("64% used · 36% remaining", exact=True)).to_be_visible()
+            expect(codex_quota.get_by_text("Synced from local Codex client", exact=False)).to_be_visible()
+            codex_quota.get_by_role("button", name="Revoke sync", exact=True).click()
+            expect(codex_quota.get_by_text("Not paired", exact=True)).to_be_visible()
+            assert quota_client.post(sync_path, headers=sync_headers, data=sync_payload).status == 401
+            expect(claude_quota.get_by_text("75% used · 25% remaining", exact=True)).to_be_visible()
+        finally:
+            quota_client.dispose()
         assert ProviderFixture.calls == ["fixture-a"]
         browser.close()
 

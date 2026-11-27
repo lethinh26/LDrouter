@@ -82,8 +82,60 @@ Only normalized observations are persisted, with no raw app-server response
 or subscription credential. Both backup profiles retain these monitoring
 records. Data may be stale; passing a reset time never proves that a limit
 has recovered. Update from the official client before relying on it.
-There is no automatic upstream quota polling, credential collection,
+There is no server-side upstream quota polling, credential collection,
 subscription pooling, quota aggregation, or quota-driven account selection.
+
+### Local Codex quota sync
+
+On your own machine, sign in to an eligible account using the official Codex
+CLI. In the Codex quota record, select **Set up sync**, generate its temporary
+pairing token, and copy the command. Use the matching LDrouter package, which
+includes the `ldrouter-quota-sync` executable (Node.js 22 or later):
+
+```sh
+ldrouter-quota-sync --gateway https://YOUR_GATEWAY --account YOUR_QUOTA_RECORD_UUID --interval 300
+```
+
+Paste the pairing token at the hidden terminal prompt. For a one-shot
+observation omit `--interval`; otherwise choose 300–3600 seconds and keep the
+foreground process running. Ctrl+C stops it. A non-interactive invocation can
+receive the pairing token from a secret manager via
+`LDROUTER_QUOTA_SYNC_TOKEN` instead of command-line arguments. The helper does
+not pass this environment variable to the Codex subprocess. If the installed
+Codex executable cannot be found, specify `--codex` with its absolute path
+(the native `.exe`, not a `.cmd` shim, on Windows).
+
+The helper starts the official local app-server over stdio, initializes it,
+checks `account/read` with `refreshToken: false`, and reads
+`account/rateLimits/read`. It never reads authentication files or requests
+login, token export, a quota reset, or account switching. The installed client
+owns authentication. Only bounded quota windows, plan/bucket metadata,
+observation time, the optional usage-allowed flag and a SHA-256 account
+identifier fingerprint are uploaded. No raw account identifier, email,
+upstream OAuth token or complete RPC response is sent. The helper fails closed
+if the client is not signed in with ChatGPT or does not report an account ID;
+use a supported client version or manual import in that case. If two
+subscriptions report the same identifier, separate records cannot be bound to
+that identifier. Observations remain client-reported, not independently
+verified account entitlement.
+
+The 24-hour `ldq-` pairing is shown only at creation. It authorizes writing
+one Codex quota record, not reading admin data or invoking models. Replace or
+revoke it in the same record; a replacement invalidates the old token. The
+server retains only a digest in memory, invalidates it on expiry, deletion,
+restart or database restore, and accepts at most one successful observation
+per minute per pairing. Pairings are not part of backups; the latest stored
+observation is. Pairing creation and revocation are audited. Use HTTPS (literal
+loopback HTTP is allowed for local testing), a correctly configured trusted
+proxy, and an allowed admin-site client IP. The UI reloads paired records
+every 30 seconds. Polling stops on errors; do not treat a stale snapshot or a
+passed reset time as quota recovery.
+
+This is an opt-in local reporting tool for the account owner's authorized use,
+not a hosted Codex authentication service or subscription relay. The helper
+uses the public app-server protocol, not private usage endpoints. Claude Code
+quota observations continue to be entered manually. The current acceptance
+tests use offline fixtures, not a real subscription login.
 
 ## Identity and credential boundary
 

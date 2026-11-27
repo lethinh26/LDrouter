@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Gauge, Plus, RefreshCw, Pencil, Trash2 } from 'lucide-react';
+import { Gauge, Plus, RefreshCw, Pencil, Trash2, Copy } from 'lucide-react';
 import { toast } from 'sonner';
 import { api } from '../../lib/api';
 import { Badge } from '../../components/ui/badge';
@@ -15,12 +15,13 @@ const inputClass = 'w-full rounded-md border bg-background px-3 py-2 text-sm';
 type Kind = 'codex' | 'claude_code';
 type Window = { label: string; usedPercent: number; windowDurationMins: number | null; resetsAt: string | null };
 type Snapshot = {
-  source: 'manual' | 'codex_app_server'; observedAt: string; plan: string | null;
+  source: 'manual' | 'codex_app_server' | 'codex_client_sync'; observedAt: string; plan: string | null;
   ordinaryUsageAllowed: boolean | null; windows: Window[];
 };
 type Account = {
   id: string; providerKind: Kind; name: string; createdAt: string; updatedAt: string;
   identityBound: boolean; snapshot: Snapshot | null;
+  sync: { expiresAt: string; lastSyncedAt: string | null } | null;
 };
 type DraftWindow = { label: string; used: string; duration: string; reset: string };
 type Editor = { kind: 'create' } | { kind: 'rename' | 'observe'; account: Account };
@@ -90,18 +91,20 @@ export function QuotaRegistry() {
   const [deleting, setDeleting] = useState<Account | null>(null);
   const [name, setName] = useState('');
   const [kind, setKind] = useState<Kind>('codex');
-  const [source, setSource] = useState<Snapshot['source']>('manual');
+  const [source, setSource] = useState<'manual' | 'codex_app_server'>('manual');
   const [observed, setObserved] = useState('');
   const [plan, setPlan] = useState('');
   const [windows, setWindows] = useState<DraftWindow[]>([newWindow()]);
   const [raw, setRaw] = useState('');
   const [error, setError] = useState('');
+  const [pairing, setPairing] = useState<Account | null>(null);
+  const [pairingToken, setPairingToken] = useState<{ token: string; expiresAt: string } | null>(null);
   const sequence = useRef(0);
   const locked = useRef(false);
   const invalidateLoad = useCallback(() => { ++sequence.current; }, []);
-  const reload = useCallback(async () => {
+  const reload = useCallback(async (background = false) => {
     const seq = ++sequence.current;
-    setLoading(true);
+    if (!background) setLoading(true);
     setLoadError(false);
     try {
       const data = await api.get<{ accounts: Account[] }>(endpoint);
@@ -117,6 +120,12 @@ export function QuotaRegistry() {
     const timer = setInterval(() => setNow(Date.now()), 30000);
     return () => { clearInterval(timer); invalidateLoad(); };
   }, [reload, invalidateLoad]);
+  const activeSync = accounts.some(a => a.sync && Date.parse(a.sync.expiresAt) > now);
+  useEffect(() => {
+    if (!activeSync) return;
+    const timer = setInterval(() => { if (!locked.current) void reload(true); }, 30000);
+    return () => clearInterval(timer);
+  }, [activeSync, reload]);
   const unavailable = loading || loadError || busy;
   function clearEditor() {
     setEditor(null); setRaw(''); setError('');
@@ -170,6 +179,34 @@ export function QuotaRegistry() {
     } catch { toast.error('Could not delete quota record'); }
     finally { locked.current = false; setBusy(false); }
   }
+  function closePairing() {
+    if (locked.current) return;
+    setPairing(null); setPairingToken(null);
+  }
+  async function generatePairing() {
+    if (!pairing || locked.current) return;
+    locked.current = true; setBusy(true);
+    try {
+      const result = await api.post<{ token: string; expiresAt: string }>(endpoint + '/' + pairing.id + '/sync', {});
+      setPairingToken(result);
+      await reload();
+    } catch { toast.error('Could not create a quota pairing. Use HTTPS or local loopback.'); }
+    finally { locked.current = false; setBusy(false); }
+  }
+  async function stopSync(account: Account) {
+    if (locked.current) return;
+    locked.current = true; setBusy(true);
+    try {
+      await api.del(endpoint + '/' + account.id + '/sync');
+      toast.success('Quota pairing revoked'); await reload();
+    } catch { toast.error('Could not revoke quota pairing'); }
+    finally { locked.current = false; setBusy(false); }
+  }
+  async function copy(value: string, message: string) {
+    try { await navigator.clipboard.writeText(value); toast.success(message); }
+    catch { toast.error('Clipboard unavailable; select and copy manually'); }
+  }
+  const syncCommand = pairing ? 'ldrouter-quota-sync --gateway ' + (window.location.protocol === 'http:' && window.location.hostname === 'localhost' ? window.location.origin.replace('localhost', '127.0.0.1') : window.location.origin) + ' --account ' + pairing.id + ' --interval 300' : '';
   return <Card aria-label="Subscription quotas">
     <CardHeader>
       <div className="flex flex-wrap items-start justify-between gap-3">
@@ -184,13 +221,14 @@ export function QuotaRegistry() {
       </div>
     </CardHeader>
     <CardContent className="space-y-3">
-      <p className="text-xs text-muted-foreground">No subscription login tokens are collected. Codex supports importing the official app-server rate-limit result; Claude Code uses manually recorded Usage observations. Refresh records reloads stored data, not provider quota.</p>
+      <p className="text-xs text-muted-foreground">No subscription login tokens are collected. Pair a signed-in local Codex client to sync quota observations automatically, or import them manually. Claude Code uses manually recorded Usage observations. Refresh records reloads stored data, not provider quota.</p>
       {loadError ? <p role="alert" className="text-sm text-destructive">Could not load quota records. Refresh to retry.</p> : loading ? <p role="status" className="text-sm text-muted-foreground">Loading quota accounts…</p> :
         accounts.length === 0 ? <p className="rounded-md border border-dashed p-4 text-center text-sm text-muted-foreground">No quota accounts yet.</p> :
         <div className="grid gap-3 xl:grid-cols-2">
           {accounts.map(account => {
             const snapshot = account.snapshot;
             const stale = snapshot !== null && quotaIsStale(snapshot, now);
+            const paired = account.sync && Date.parse(account.sync.expiresAt) > now;
             return <section key={account.id} aria-label={'Quota account ' + account.name} className="space-y-3 rounded-md border p-4">
               <div className="flex flex-wrap items-start justify-between gap-2">
                 <div className="min-w-0">
@@ -201,7 +239,7 @@ export function QuotaRegistry() {
               </div>
               <p className="text-xs text-muted-foreground">{account.identityBound ? 'Imported identifier bound (not independently verified)' : 'Operator-selected account identity'}</p>
               {snapshot ? <>
-                <p className="text-xs text-muted-foreground">{snapshot.source === 'manual' ? 'Manually recorded' : 'Imported Codex app-server result'} · Observed {dateLabel(snapshot.observedAt)}</p>
+                <p className="text-xs text-muted-foreground">{snapshot.source === 'manual' ? 'Manually recorded' : snapshot.source === 'codex_client_sync' ? 'Synced from local Codex client' : 'Imported Codex app-server result'} · Observed {dateLabel(snapshot.observedAt)}</p>
                 {snapshot.ordinaryUsageAllowed !== null && <p className="text-xs">Ordinary usage reported {snapshot.ordinaryUsageAllowed ? 'allowed' : 'not allowed'} at observation time.</p>}
                 {snapshot.windows.length === 0 && <p className="text-sm text-muted-foreground">No quota windows reported.</p>}
                 {snapshot.windows.map(w => <div key={w.label} className="space-y-1 rounded-md bg-muted/30 p-2">
@@ -213,6 +251,12 @@ export function QuotaRegistry() {
                 </div>)}
                 {stale && <p className="text-xs text-muted-foreground">Refresh from the official client. A passed reset time does not establish renewed quota.</p>}
               </> : <p className="text-sm text-muted-foreground">Usage and reset times are unknown.</p>}
+              {account.providerKind === 'codex' && <div className="rounded-md border p-2 text-xs space-y-1">
+                <div className="flex items-center justify-between gap-2"><span className="font-medium">Local quota sync</span><Badge variant="outline">{paired ? 'Paired' : 'Not paired'}</Badge></div>
+                {paired && account.sync && <><p>Pairing expires {dateLabel(account.sync.expiresAt)}</p><p className="text-muted-foreground">{account.sync.lastSyncedAt ? 'Last upload ' + dateLabel(account.sync.lastSyncedAt) : 'Waiting for first client upload'}</p></>}
+                <div className="flex flex-wrap gap-2"><Button size="sm" variant="outline" disabled={unavailable} onClick={() => { setPairing(account); setPairingToken(null); }}>{paired ? 'Replace sync token' : 'Set up sync'}</Button>
+                  {paired && <Button size="sm" variant="outline" disabled={unavailable} onClick={() => void stopSync(account)}>Revoke sync</Button>}</div>
+              </div>}
               <div className="flex flex-wrap gap-2">
                 <Button size="sm" variant="outline" disabled={unavailable} onClick={() => openEditor({ kind: 'observe', account })}>Update observation</Button>
                 <Button size="sm" variant="outline" disabled={unavailable} aria-label={'Rename quota account ' + account.name} onClick={() => openEditor({ kind: 'rename', account })}><Pencil className="h-4 w-4" /></Button>
@@ -233,7 +277,7 @@ export function QuotaRegistry() {
           <div className="space-y-1"><Label htmlFor="quota-name">Account name</Label><Input id="quota-name" value={name} maxLength={128} disabled={busy} onChange={e => setName(e.target.value)} placeholder="Personal subscription" /></div>
         </div> : <div className="space-y-3">
           <p className="break-all text-sm font-medium">{editor.account.name} · {providerLabel(editor.account.providerKind)}</p>
-          <div className="space-y-1"><Label htmlFor="quota-source">Observation source</Label><select id="quota-source" className={inputClass} value={source} disabled={busy} onChange={e => { setSource(e.target.value as Snapshot['source']); setRaw(''); }}>
+          <div className="space-y-1"><Label htmlFor="quota-source">Observation source</Label><select id="quota-source" className={inputClass} value={source} disabled={busy} onChange={e => { setSource(e.target.value as 'manual' | 'codex_app_server'); setRaw(''); }}>
             <option value="manual">Manual entry from official Usage</option>
             {editor.account.providerKind === 'codex' && <option value="codex_app_server">Import Codex app-server result</option>}
           </select></div>
@@ -260,6 +304,21 @@ export function QuotaRegistry() {
           <Button variant="outline" disabled={busy} onClick={clearEditor}>Cancel</Button>
           <Button disabled={busy || (editor?.kind === 'observe' ? !observed || (source === 'codex_app_server' && !raw.trim()) : !name.trim())} onClick={() => void submit()}>{busy ? 'Saving…' : 'Save quota record'}</Button>
         </DialogFooter>
+      </DialogContent>
+    </Dialog>
+    <Dialog open={pairing !== null} onOpenChange={open => { if (!open) closePairing(); }}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader><DialogTitle>Pair local Codex quota sync</DialogTitle><DialogDescription>Only quota observations are uploaded. Your Codex sign-in and provider credentials stay on your machine.</DialogDescription></DialogHeader>
+        <p className="text-sm font-medium break-all">{pairing?.name}</p>
+        {pairingToken ? <div className="space-y-3">
+          <p className="text-xs text-muted-foreground">Copy this one-time-displayed token. It can only update this quota record and expires {dateLabel(pairingToken.expiresAt)}. It is not a model API key.</p>
+          <div className="space-y-1"><Label htmlFor="quota-pairing-token">Pairing token</Label><div className="flex gap-2"><Input id="quota-pairing-token" readOnly type="password" autoComplete="off" value={pairingToken.token} /><Button variant="outline" size="icon" aria-label="Copy pairing token" onClick={() => void copy(pairingToken.token, 'Pairing token copied')}><Copy className="h-4 w-4" /></Button></div></div>
+          <p className="text-sm">On your own machine, use the matching LDrouter package and the signed-in official Codex CLI. Run this command, then paste the token at its hidden prompt.</p>
+          <div className="rounded-md bg-muted p-3 text-xs break-all font-mono select-all">{syncCommand}</div>
+          <Button variant="outline" size="sm" onClick={() => void copy(syncCommand, 'Command copied')}><Copy className="mr-2 h-4 w-4" />Copy command</Button>
+          <p className="text-xs text-muted-foreground">Uploads every five minutes while the command is running. Ctrl+C stops it. Server restart, restore, expiry or revocation requires a new pairing. For one upload, omit --interval 300.</p>
+        </div> : <div className="space-y-2 text-sm text-muted-foreground"><p>Generate a 24-hour, write-only token for this record. The first successful sync binds an unbound record to the account identifier reported by Codex. Use the intended account; identifiers are not independently verified by LDrouter.</p><p>Generating a new token immediately revokes the previous pairing. The client must report an account identifier; otherwise use manual import.</p></div>}
+        <DialogFooter><Button variant="outline" disabled={busy} onClick={closePairing}>{pairingToken ? 'Done' : 'Cancel'}</Button>{!pairingToken && <Button disabled={busy} onClick={() => void generatePairing()}>Generate sync token</Button>}</DialogFooter>
       </DialogContent>
     </Dialog>
     <AlertDialog open={deleting !== null} onOpenChange={open => { if (!open && !locked.current) setDeleting(null); }}>

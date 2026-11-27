@@ -15,7 +15,7 @@ describe('redactValue', () => {
   });
 
   it('redacts first-party OAuth codes, refresh/access tokens and the separate gateway header', () => {
-    const tokens = ['a', 'r', 'c'].map(kind => 'ldo-' + kind + '-' + 'x'.repeat(43));
+    const tokens = [...['a', 'r', 'c'].map(kind => 'ldo-' + kind + '-' + 'x'.repeat(43)), 'ldq-' + 'x'.repeat(43)];
     for (const token of tokens) expect(redactString('value=' + token)).toBe('value=[REDACTED]');
     expect(redactValue({ 'x-gateway-token': 'Bearer ' + tokens[0] })).toEqual({ 'x-gateway-token': '[REDACTED]' });
   });

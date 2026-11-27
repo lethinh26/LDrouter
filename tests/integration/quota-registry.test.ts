@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -101,5 +101,58 @@ describe('subscription quota observations', () => {
     expect(persisted).not.toContain('account-fixture-a');
     expect(persisted).not.toContain('secret-fixture-not-to-persist');
     expect(JSON.stringify((await list()).json())).not.toContain('account_fingerprint');
+  });
+
+  it('pairs a write-only local client, enforces identity, transport, rotation, rate and revocation', async () => {
+    const a = (await mutate('POST', '', { providerKind: 'codex', name: 'Synced account' })).json().id;
+    const b = (await mutate('POST', '', { providerKind: 'codex', name: 'Another synced account' })).json().id;
+    const c = (await mutate('POST', '', { providerKind: 'claude_code', name: 'Manual only account' })).json().id;
+    const pair = (id: string) => mutate('POST', '/' + id + '/sync', {});
+    const { sha256Hex } = await import('../../src/server/auth/ids');
+    const { getRawDb } = await import('../../src/server/db/index');
+    const fingerprint = sha256Hex('sync-fixture-identity');
+    const report = () => ({ observedAt: new Date().toISOString(), accountFingerprint: fingerprint,
+      result: { ordinaryUsageAllowed: true, rateLimits: { limitId: 'codex', planType: 'pro', primary: { usedPercent: 53, windowDurationMins: 300 } } } });
+    const upload = (id: string, token?: string, body: unknown = report(), remoteAddress = '127.0.0.1') => app.inject({
+      method: 'POST', url: '/api/quota-sync/' + id, remoteAddress,
+      headers: { host: '127.0.0.1', 'content-type': 'application/json', ...(token ? { authorization: 'Bearer ' + token } : {}) }, payload: JSON.stringify(body),
+    });
+    const account = async (id: string) => (await list()).json().accounts.find((x: { id: string }) => x.id === id);
+    expect((await app.inject({ method: 'POST', url: endpoint + '/' + a + '/sync', payload: {} })).statusCode).toBe(401);
+    expect((await app.inject({ method: 'POST', url: endpoint + '/' + a + '/sync', headers: { cookie }, payload: {} })).statusCode).toBe(403);
+    expect((await pair(c)).statusCode).toBe(409);
+    const paired = await pair(a);
+    expect(paired.statusCode).toBe(200);
+    const { token } = paired.json();
+    expect(token).toMatch(/^ldq-[A-Za-z0-9_-]{43}$/);
+    expect(paired.headers['cache-control']).toBe('no-store');
+    expect(JSON.stringify(await account(a))).not.toContain(token);
+    expect((await upload(a)).statusCode).toBe(401);
+    expect((await upload(b, token)).statusCode).toBe(401);
+    expect((await upload(a, token, report(), '192.0.2.1')).statusCode).toBe(401);
+    expect((await upload(a, token, { ...report(), accessToken: 'not-allowed' })).statusCode).toBe(400);
+    expect((await upload(a, token, { ...report(), accountFingerprint: null })).statusCode).toBe(400);
+    expect((await upload(a, token, { ...report(), observedAt: '2020-01-01T00:00:00Z' })).statusCode).toBe(400);
+    expect((await upload(a, token)).statusCode).toBe(200);
+    expect(await account(a)).toMatchObject({ identityBound: true, snapshot: { source: 'codex_client_sync', windows: [{ usedPercent: 53 }] }, sync: { lastSyncedAt: expect.any(String) } });
+    expect((await upload(a, token)).statusCode).toBe(429);
+    const second = (await pair(b)).json().token;
+    expect((await upload(b, second)).statusCode).toBe(409);
+    const rotated = (await pair(a)).json().token;
+    expect(rotated).not.toBe(token);
+    expect((await upload(a, token)).statusCode).toBe(401);
+    expect((await upload(a, rotated, { ...report(), accountFingerprint: sha256Hex('different-identity') })).statusCode).toBe(409);
+    expect((await upload(a, rotated)).statusCode).toBe(200);
+    expect((await mutate('DELETE', '/' + a + '/sync')).statusCode).toBe(200);
+    expect((await upload(a, rotated)).statusCode).toBe(401);
+    expect((await account(a)).sync).toBeNull();
+    const expired = (await pair(a)).json().token;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 25 * 60 * 60_000);
+    try { expect((await upload(a, expired)).statusCode).toBe(401); } finally { clock.mockRestore(); }
+    const deleted = (await pair(a)).json().token;
+    expect((await mutate('DELETE', '/' + a)).statusCode).toBe(200);
+    expect((await upload(a, deleted)).statusCode).toBe(401);
+    expect(JSON.stringify(getRawDb().prepare('SELECT * FROM subscription_quota_accounts').all())).not.toContain(token);
+    expect(getRawDb().prepare("SELECT count(*) AS n FROM audit_logs WHERE action='subscription_quota.sync_revoke' AND target_id=?").get(a)).toEqual({ n: 1 });
   });
 });

@@ -1,9 +1,11 @@
 // Subscription observations are an admin-only monitoring registry, not
 // provider credentials, live entitlement, routing inputs or local token caps.
 import type { FastifyInstance, FastifyRequest } from 'fastify';
+import { randomBytes } from 'node:crypto';
 import { z } from 'zod';
-import { getRawDb } from '../../db/index';
-import { sha256Hex, uuid } from '../../auth/ids';
+import { getDatabaseEpoch, getRawDb } from '../../db/index';
+import { sha256Hex, timingSafeEqualHex, uuid } from '../../auth/ids';
+import { gatewayOAuthSecureTransport } from '../../auth/gateway-oauth';
 import { GatewayError, toOpenAIError } from '../../errors';
 import { redactString } from '../../security/redact';
 
@@ -26,7 +28,7 @@ const windowSchema = z.object({
   windowDurationMins: minutes.nullable(), resetsAt: timestamp.nullable(),
 }).strict();
 const snapshotSchema = z.object({
-  source: z.enum(['manual', 'codex_app_server']),
+  source: z.enum(['manual', 'codex_app_server', 'codex_client_sync']),
   observedAt: timestamp, plan,
   ordinaryUsageAllowed: z.boolean().nullable(),
   windows: z.array(windowSchema).max(MAX_WINDOWS),
@@ -55,6 +57,10 @@ const nativeResult = z.object({
 const importSchema = z.object({
   source: z.literal('codex_app_server'), observedAt: timestamp, result: nativeResult,
 }).strict();
+const syncSchema = z.object({
+  observedAt: timestamp, accountFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+  result: nativeResult.omit({ accountId: true }).strict(),
+}).strict();
 type Snapshot = z.infer<typeof snapshotSchema>;
 type Row = {
   id: string; provider_kind: 'codex' | 'claude_code'; name: string;
@@ -77,7 +83,7 @@ function readSnapshot(row: Row): Snapshot | null {
   } catch { throw new GatewayError('gateway_error', 'Stored quota snapshot is invalid', { status: 500 }); }
 }
 
-function normalize(value: unknown, row: Row): { snapshot: Snapshot; fingerprint: string | null } {
+function normalize(value: unknown, row: Row, clientFingerprint?: string): { snapshot: Snapshot; fingerprint: string | null } {
   const source = (value as { source?: unknown } | null)?.source;
   let fingerprint = row.account_fingerprint;
   let snapshot: Snapshot;
@@ -86,7 +92,7 @@ function normalize(value: unknown, row: Row): { snapshot: Snapshot; fingerprint:
     snapshot = { ...input, ordinaryUsageAllowed: null };
   } else if (source === 'codex_app_server' && row.provider_kind === 'codex') {
     const { observedAt, result } = validated(importSchema, value);
-    const imported = result.accountId ? sha256Hex(result.accountId) : null;
+    const imported = clientFingerprint ?? (result.accountId ? sha256Hex(result.accountId) : null);
     if (fingerprint !== null && fingerprint !== imported) throw fail('Imported account does not match this record', 409);
     fingerprint = imported;
     const buckets = Object.entries(result.rateLimitsByLimitId ?? {});
@@ -107,7 +113,7 @@ function normalize(value: unknown, row: Row): { snapshot: Snapshot; fingerprint:
         });
       }
     }
-    snapshot = { source, observedAt, plan: plans.size === 1 ? [...plans][0]! : null,
+    snapshot = { source: clientFingerprint ? 'codex_client_sync' : source, observedAt, plan: plans.size === 1 ? [...plans][0]! : null,
       ordinaryUsageAllowed: result.ordinaryUsageAllowed ?? null, windows };
   } else { throw fail(); }
   if (new Set(snapshot.windows.map(w => w.label.toLowerCase())).size !== snapshot.windows.length) throw fail('Duplicate quota window labels');
@@ -133,9 +139,77 @@ function assertUnique(db: Db, kind: string, label: string, id = '', fingerprint:
   }
 }
 
-function audit(db: Db, operation: 'create' | 'rename' | 'observe' | 'delete', id: string, req: FastifyRequest) {
+function audit(db: Db, operation: 'create' | 'rename' | 'observe' | 'delete' | 'sync_pair' | 'sync_revoke', id: string, req: FastifyRequest) {
   db.prepare("INSERT INTO audit_logs(id,action,actor,ip,success,target_type,target_id) VALUES (?,?, 'admin', ?,1,'subscription_quota',?)")
     .run(uuid(), 'subscription_quota.' + operation, req.ip, id);
+}
+
+// A pairing is a temporary, write-only capability, not provider authorization.
+// Keep digests in process memory only: no secret in SQLite, backups or logs.
+const SYNC_TTL = 24 * 60 * 60_000;
+const SYNC_MIN_INTERVAL = 60_000;
+type SyncGrant = { digest: string; epoch: string; expiresAt: number; lastSyncedAt: number | null };
+const syncGrants = new Map<string, SyncGrant>();
+
+function pruneSyncGrants() {
+  const epoch = getDatabaseEpoch(), now = Date.now();
+  for (const [id, grant] of syncGrants) {
+    if (!epoch || grant.epoch !== epoch || grant.expiresAt <= now) syncGrants.delete(id);
+  }
+}
+
+function syncMetadata(id: string) {
+  const grant = syncGrants.get(id);
+  return grant ? { expiresAt: new Date(grant.expiresAt).toISOString(),
+    lastSyncedAt: grant.lastSyncedAt === null ? null : new Date(grant.lastSyncedAt).toISOString() } : null;
+}
+
+function requireSyncGrant(req: FastifyRequest): SyncGrant {
+  pruneSyncGrants();
+  const id = (req.params as { id?: string }).id;
+  const header = req.headers.authorization;
+  const grant = id ? syncGrants.get(id) : undefined;
+  const match = typeof header === 'string' ? /^Bearer (ldq-[A-Za-z0-9_-]{43})$/.exec(header) : null;
+  if (!gatewayOAuthSecureTransport(req) || !grant || !match || !timingSafeEqualHex(sha256Hex(match[1]!), grant.digest)) {
+    throw new GatewayError('authentication_error', 'Invalid or expired quota pairing', { status: 401 });
+  }
+  return grant;
+}
+
+/** Public transport, authenticated solely by the account-scoped pairing.
+ * No admin cookie, gateway key or upstream credential grants this capability. */
+export async function registerQuotaSyncRoutes(app: FastifyInstance): Promise<void> {
+  await app.register(async scope => {
+    scope.addHook('onRequest', async (_req, reply) => { reply.header('Cache-Control', 'no-store'); });
+    scope.setErrorHandler((err, req, reply) => {
+      const status = err instanceof GatewayError ? err.status : (err as { statusCode?: number }).statusCode;
+      const safe = err instanceof GatewayError ? err : status && status >= 400 && status < 500 ? fail('Invalid quota sync request', status) :
+        new GatewayError('gateway_error', 'Quota sync failed', { status: 500 });
+      return reply.code(safe.status).send(toOpenAIError(safe, req.id));
+    });
+    scope.post('/api/quota-sync/:id', { bodyLimit: BODY_LIMIT, onRequest: async req => { requireSyncGrant(req); } }, async req => {
+      // Check again after parsing: revocation/rotation/restore may have happened.
+      const grant = requireSyncGrant(req);
+      const now = Date.now();
+      if (grant.lastSyncedAt !== null && now - grant.lastSyncedAt < SYNC_MIN_INTERVAL) {
+        throw new GatewayError('rate_limit_error', 'Quota sync is limited to one observation per minute', { status: 429 });
+      }
+      const input = validated(syncSchema, req.body);
+      const observed = Date.parse(input.observedAt);
+      if (observed < now - 10 * 60_000 || observed > now + 60_000) throw fail('Quota sync observation is outside the allowed time window');
+      const db = getRawDb();
+      db.transaction(() => {
+        const row = lookup(db, (req.params as { id: string }).id);
+        if (row.provider_kind !== 'codex') throw fail('Quota sync is only supported for Codex', 409);
+        const { snapshot, fingerprint } = normalize({ source: 'codex_app_server', observedAt: input.observedAt, result: input.result }, row, input.accountFingerprint);
+        assertUnique(db, row.provider_kind, row.name, row.id, fingerprint);
+        db.prepare('UPDATE subscription_quota_accounts SET account_fingerprint=?,snapshot_json=?,updated_at_ms=max(created_at_ms,?) WHERE id=?')
+          .run(fingerprint, JSON.stringify(snapshot), now, row.id);
+      }).immediate();
+      grant.lastSyncedAt = now;
+      return { ok: true };
+    });
+  });
 }
 
 export async function registerQuotaRegistryRoutes(app: FastifyInstance): Promise<void> {
@@ -151,11 +225,12 @@ export async function registerQuotaRegistryRoutes(app: FastifyInstance): Promise
       return reply.code(safe.status).send(toOpenAIError(safe, req.id));
     });
     scope.get(path, async () => {
+      pruneSyncGrants();
       const rows = getRawDb().prepare('SELECT * FROM subscription_quota_accounts ORDER BY provider_kind,name,id LIMIT ?').all(MAX_ACCOUNTS) as Row[];
       return { accounts: rows.map(r => ({
         id: r.id, providerKind: r.provider_kind, name: r.name,
         createdAt: new Date(r.created_at_ms).toISOString(), updatedAt: new Date(r.updated_at_ms).toISOString(),
-        identityBound: r.account_fingerprint !== null, snapshot: readSnapshot(r),
+        identityBound: r.account_fingerprint !== null, snapshot: readSnapshot(r), sync: syncMetadata(r.id),
       })) };
     });
     scope.post(path, { bodyLimit: BODY_LIMIT }, async req => {
@@ -195,14 +270,36 @@ export async function registerQuotaRegistryRoutes(app: FastifyInstance): Promise
         return { ok: true };
       }).immediate();
     });
+    scope.post(path + '/:id/sync', { bodyLimit: 1024 }, async req => {
+      if (!gatewayOAuthSecureTransport(req)) throw fail('Secure transport is required for pairing', 403);
+      const db = getRawDb();
+      const row = lookup(db, (req.params as { id: string }).id);
+      if (row.provider_kind !== 'codex') throw fail('Quota sync is only supported for Codex', 409);
+      pruneSyncGrants();
+      if (!syncGrants.has(row.id) && syncGrants.size >= MAX_ACCOUNTS) throw fail('Quota pairing limit reached', 409);
+      const token = 'ldq-' + randomBytes(32).toString('base64url');
+      const expiresAt = Date.now() + SYNC_TTL;
+      audit(db, 'sync_pair', row.id, req);
+      syncGrants.set(row.id, { digest: sha256Hex(token), epoch: getDatabaseEpoch(), expiresAt, lastSyncedAt: null });
+      return { token, expiresAt: new Date(expiresAt).toISOString() };
+    });
+    scope.delete(path + '/:id/sync', async req => {
+      const db = getRawDb();
+      const row = lookup(db, (req.params as { id: string }).id);
+      audit(db, 'sync_revoke', row.id, req);
+      syncGrants.delete(row.id);
+      return { ok: true };
+    });
     scope.delete(path + '/:id', async req => {
       const db = getRawDb();
-      return db.transaction(() => {
+      const result = db.transaction(() => {
         const row = lookup(db, (req.params as { id: string }).id);
         db.prepare('DELETE FROM subscription_quota_accounts WHERE id=?').run(row.id);
         audit(db, 'delete', row.id, req);
         return { ok: true };
       }).immediate();
+      syncGrants.delete((req.params as { id: string }).id);
+      return result;
     });
   });
 }

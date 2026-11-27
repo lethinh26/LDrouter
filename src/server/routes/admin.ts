@@ -16,7 +16,7 @@ import { registerSettingsRoutes } from './admin/settings';
 import { registerBackupRoutes } from './admin/backup';
 import { registerDashboardRoutes } from './admin/dashboard';
 import { registerGatewayOAuthAdminRoutes } from './gateway-oauth';
-import { registerQuotaRegistryRoutes } from './admin/quota-registry';
+import { registerQuotaRegistryRoutes, registerQuotaSyncRoutes } from './admin/quota-registry';
 
 export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
   // Setup routes are always reachable (used on first run).
@@ -29,6 +29,9 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
   await app.register(async (instance) => {
     await registerAuthRoutes(instance);
   });
+
+  // Explicitly scoped, write-only quota client pairing; not admin-session auth.
+  await registerQuotaSyncRoutes(app);
 
   // Authenticated admin routes
   await app.register(async (instance) => {

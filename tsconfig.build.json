@@ -7,5 +7,5 @@
     "declaration": false,
     "sourceMap": false
   },
-  "include": ["src/server/**/*", "src/shared/**/*", "src/cli.ts"]
+  "include": ["src/server/**/*", "src/shared/**/*", "src/cli.ts", "src/quota-sync.ts"]
 }

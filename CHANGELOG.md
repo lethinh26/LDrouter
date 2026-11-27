@@ -13,6 +13,7 @@ All notable changes to this project are documented here. The format follows
 - First-party Codex Gateway OAuth (migration 0020): admin consent, fixed loopback callback with PKCE, expiring access tokens, refresh rotation and replay revocation, scoped gateway key authorization, grant inspection and revocation. No upstream account tokens are collected.
 - Both backup profiles exclude gateway OAuth sessions; restore invalidates them without changing the underlying API-key identities.
 - Subscription quota monitoring (migration 0021): separate named account records for Codex and Claude Code, manually recorded quota windows and imported Codex app-server rate-limit snapshots, with source, observation/reset times and stale-data warnings. No upstream credentials or routing changes.
+- Local Codex quota sync: a dedicated `ldrouter-quota-sync` command reads the official signed-in client's rate limits, uploads only normalized observations and a hashed account identifier, and supports five-minute or slower foreground polling. Per-record, write-only pairing tokens expire after 24 hours and can be rotated or revoked. No new database migration or stored subscription credential.
 
 ### Fixed
 
@@ -20,7 +21,7 @@ All notable changes to this project are documented here. The format follows
 
 ### Limitations
 
-- Codex upstream authentication remains client-held; no managed subscription OAuth, upstream callback import, automatic remote subscription quota refresh or cross-account rotation is implemented. Quota monitoring uses operator-supplied observations, not live authorization. Claude Code routing remains API-key based. First-party Gateway OAuth is independent of upstream login.
+- Codex upstream authentication remains client-held; no managed subscription OAuth, upstream callback import, server-side subscription quota polling or cross-account rotation is implemented. Quota monitoring uses operator-supplied or paired local-client observations, not live authorization. Claude Code quota remains manual and routing remains API-key based. First-party Gateway OAuth is independent of upstream login.
 
 ## [2.1.0] - 2026-11-27
 

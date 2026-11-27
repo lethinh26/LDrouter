@@ -12,6 +12,7 @@ Lightweight self-hosted LLM gateway with a polished admin UI. Presents stable Op
 - Per-key `ld-` bearer tokens (SHA-256 digest storage, displayed once)
 - IP allow/deny (IPv4 + IPv6 CIDR), trusted-proxy configuration
 - Rate limits: RPM, TPM, daily/monthly token quotas, concurrency, max output tokens
+- Built-in subscription quota monitoring with opt-in local Codex quota sync (`ldrouter-quota-sync`), separate from routing quotas; see [client integrations](docs/14-CLIENT-INTEGRATIONS.md#local-codex-quota-sync).
 - TTL-based gateway response cache (disabled by default) + provider prompt-cache accounting
 - Streaming end-to-end with strict "no fallback after stream content sent" rule
 - Request + attempt logs, statistics (Today / 7d / 30d), retention cleanup

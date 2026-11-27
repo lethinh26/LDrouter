@@ -74,7 +74,11 @@ non-null identity fingerprints cannot be shared by two records of a provider.
 Snapshots are observations with explicit source and observation time, not
 enforceable limits. No upstream access/refresh token, session or raw provider
 response is stored. The table has no relationship to the routing namespace,
-models, API keys or provider connections.
+models, API keys or provider connections. Codex client sync adds a distinct
+observation source, `codex_client_sync`, using the same snapshot structure.
+Its temporary per-record pairing digest and last upload time exist only in
+process memory, bound to the current database epoch; no new schema or backup
+state is needed.
 
 ### `models`
 

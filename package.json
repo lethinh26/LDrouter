@@ -15,7 +15,8 @@
   "main": "dist/server/app.js",
   "bin": {
     "latedev-router": "dist/cli.js",
-    "ldrouter": "dist/cli.js"
+    "ldrouter": "dist/cli.js",
+    "ldrouter-quota-sync": "dist/quota-sync.js"
   },
   "files": [
     "dist",
