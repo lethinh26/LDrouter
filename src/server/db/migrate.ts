@@ -86,9 +86,11 @@ function assertIntegrationSchema(raw: Database.Database, migration: MigrationFil
       raw.prepare('PRAGMA foreign_key_check(provider_integrations)').all().length > 0 ||
       raw.prepare(`SELECT 1 FROM provider_integrations i JOIN providers p ON p.id=i.provider_id
         WHERE NOT ((i.provider_kind='codex' AND i.auth_mode='client_oauth' AND p.type='openai'
-          AND p.base_url='https://api.openai.com' AND p.encrypted_api_key IS NULL AND p.api_key_nonce IS NULL
+          AND p.base_url='https://chatgpt.com' AND p.encrypted_api_key IS NULL AND p.api_key_nonce IS NULL
           AND p.custom_headers_encrypted IS NULL AND p.custom_headers_nonce IS NULL)
-          OR (i.provider_kind='claude_code' AND i.auth_mode='api_key' AND p.type='anthropic')) LIMIT 1`).get()) {
+          OR (i.provider_kind='claude_code' AND i.auth_mode='api_key' AND p.type='anthropic'
+          AND p.base_url='https://api.anthropic.com' AND p.encrypted_api_key IS NOT NULL AND p.api_key_nonce IS NOT NULL
+          AND p.custom_headers_encrypted IS NULL AND p.custom_headers_nonce IS NULL)) LIMIT 1`).get()) {
     throw new Error('Database schema is inconsistent with provider integration migration (0017)');
   }
 }

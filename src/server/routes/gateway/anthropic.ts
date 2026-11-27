@@ -2,12 +2,17 @@
 
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
+import { eq } from 'drizzle-orm';
+import { getDb, schema } from '../../db';
 import { requireGatewayKey, keyAllowedForTarget } from '../../auth/api-key';
 import { resolveRequestedModel } from '../../routing/resolver';
 import { resolveClientIp } from '../../util/client-ip';
 import { anthropicToCanonical, type AnthropicRequest } from '../../protocols/anthropic';
 import { GatewayError, toAnthropicError, outcomeError } from '../../errors';
 import { GatewayRunner, type GatewayContext } from '../../gateway/runner';
+import { providerIntegration } from '../../providers/integration';
+import { providerToUpstreamConfig, callUpstreamNonStreaming, upstreamHttpError, retryAfterMs } from '../../upstream/client';
+import { checkRpm, acquireConcurrent, releaseConcurrent } from '../../routing/ratelimit';
 import { uuid } from '../../auth/ids';
 import { lifecycle, debugHttp, debugBody, getDebugFlags, summarizeMessages, summarizeTools, summarizeHeaders, sanitizeJson, truncate } from '../../logging/debug';
 
@@ -22,11 +27,20 @@ const MessagesBody = z.object({
   stream: z.boolean().optional(),
   tools: z.array(z.any()).optional(),
   tool_choice: z.any().optional(),
-  thinking: z.object({ type: z.literal('enabled'), budget_tokens: z.number().int().min(1) }).optional(),
+  thinking: z.union([z.object({ type: z.literal('enabled'), budget_tokens: z.number().int().min(1) }).passthrough(), z.object({ type: z.enum(['adaptive', 'disabled']) }).passthrough()]).optional(),
   // Accept additional fields
 }).passthrough();
 
 const CountTokensBody = MessagesBody.omit({ stream: true });
+
+function nativeHeaders(headers: Record<string, unknown>): Record<string, string> {
+  const result: Record<string, string> = {};
+  const version = headers['anthropic-version'];
+  const beta = headers['anthropic-beta'];
+  if (typeof version === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(version)) result['anthropic-version'] = version;
+  if (typeof beta === 'string' && beta.length <= 1024 && /^[a-zA-Z0-9_, -]+$/.test(beta)) result['anthropic-beta'] = beta;
+  return result;
+}
 
 export async function registerAnthropicRoutes(app: FastifyInstance): Promise<void> {
   const runner = new GatewayRunner();
@@ -59,7 +73,7 @@ export async function registerAnthropicRoutes(app: FastifyInstance): Promise<voi
       reply,
     };
     try {
-      const outcome = await runner.execute({ canonical, protocol: 'anthropic', endpoint: 'messages' }, ctx);
+      const outcome = await runner.execute({ canonical, protocol: 'anthropic', endpoint: 'messages', nativeMessages: body, anthropicHeaders: nativeHeaders(req.headers) }, ctx);
       if (body.stream) {
         if (reply.raw.headersSent || reply.raw.writableEnded) {
           reply.hijack();
@@ -81,6 +95,7 @@ export async function registerAnthropicRoutes(app: FastifyInstance): Promise<voi
       }
       lifecycle(requestId, 'DONE', [`status=200 durationMs=${outcome.latencyMs} finishReason=${outcome.finishReason ?? 'null'}`]);
       reply.header('x-request-id', ctx.requestId);
+      if (outcome.nativeMessage) return reply.send({ ...outcome.nativeMessage, model: body.model });
       reply.send({
         id: `msg_${ctx.requestId}`,
         type: 'message',
@@ -111,7 +126,29 @@ export async function registerAnthropicRoutes(app: FastifyInstance): Promise<voi
   app.post('/v1/messages/count_tokens', async (req, reply) => {
     const key = requireGatewayKey(req);
     const body = CountTokensBody.parse(req.body);
-    if (!keyAllowedForTarget(key, resolveRequestedModel(body.model))) throw new GatewayError('permission_error', 'Model not permitted for this API key', { status: 403 });
+    const target = resolveRequestedModel(body.model);
+    if (!keyAllowedForTarget(key, target)) throw new GatewayError('permission_error', 'Model not permitted for this API key', { status: 403 });
+    const resolved = target.kind === 'alias' ? target.resolved : target;
+    if (resolved.kind === 'model') {
+      const db = getDb();
+      const model = db.select().from(schema.models).where(eq(schema.models.id, resolved.modelId)).get();
+      const provider = model && db.select().from(schema.providers).where(eq(schema.providers.id, model.providerId)).get();
+      if (model && provider && providerIntegration(provider).providerKind === 'claude_code') {
+        if (!model.enabled || !model.upstreamAvailable || !provider.enabled) throw new GatewayError('upstream_unavailable', 'Claude model is unavailable', { status: 503 });
+        if (!checkRpm(key.id, key.rpmLimit).allowed) throw new GatewayError('rate_limit_error', 'Rate limit exceeded (RPM)', { status: 429 });
+        if (!acquireConcurrent(key.id, key.maxConcurrent)) throw new GatewayError('rate_limit_error', 'Too many concurrent requests', { status: 429 });
+        try {
+          const cfg = providerToUpstreamConfig(provider);
+          if (!cfg.apiKey || !/^sk-ant-api[A-Za-z0-9_-]+$/.test(cfg.apiKey)) throw new GatewayError('authentication_error', 'Claude Code requires an Anthropic API key', { status: 400 });
+          const payload: Record<string, unknown> = { ...body, model: model.upstreamModelId };
+          delete payload.stream; delete payload.max_tokens;
+          const call = await callUpstreamNonStreaming({ ...cfg, nativeClaude: true, customHeaders: { 'anthropic-version': '2023-06-01', ...nativeHeaders(req.headers) } }, 'https://api.anthropic.com/v1/messages/count_tokens', payload, String(req.id));
+          if (!call.ok) throw upstreamHttpError(call.status, '', { status: call.status, retryAfterMs: retryAfterMs(call.headers['retry-after']) });
+          const result = z.object({ input_tokens: z.number().int().nonnegative() }).parse(JSON.parse(call.text));
+          return reply.send(result);
+        } finally { releaseConcurrent(key.id); }
+      }
+    }
     const ar: AnthropicRequest = body as never;
     const canonical = anthropicToCanonical(ar);
     // Estimate: 1 token per 4 chars, conservative for v1 without provider call.

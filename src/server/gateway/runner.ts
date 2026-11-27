@@ -26,6 +26,8 @@ import { emitRequestLogged, emitRequestStarted } from './events';
 import { nextRequestCompletionTimestamp } from './request-timestamps';
 import { watchDownstreamDisconnect } from './downstream';
 import { debugHttp, debugBody, debugUpstream, debugStream, errorLine, getDebugFlags } from '../logging/debug';
+import { providerIntegration, CODEX_ORIGIN } from '../providers/integration';
+import { hasCodexTokenCap, runCodexStreaming, validateCodexRequest } from './codex';
 
 export interface GatewayContext {
   requestId: string;
@@ -37,12 +39,16 @@ export interface GatewayContext {
   reply: FastifyReply;
   /** Admin diagnostics exercise real routing without training user workload or caching. */
   synthetic?: boolean;
+  codexAuth?: { authorization: string; accountId?: string };
 }
 
 export interface GatewayRequest {
   canonical: CanonicalRequest;
   protocol: 'openai' | 'anthropic';
   endpoint: 'chat/completions' | 'responses' | 'messages';
+  nativeCodex?: Record<string, unknown>;
+  nativeMessages?: Record<string, unknown>;
+  anthropicHeaders?: Record<string, string>;
 }
 
 export interface UsageSummary {
@@ -62,6 +68,7 @@ interface GenerationResult {
   refusal?: string;
   legacyFunctionCall?: { name: string; arguments: string };
   thinkingBlocks?: Array<{ type: 'thinking'; thinking: string; signature?: string }>;
+  nativeMessage?: Record<string, unknown>;
 }
 
 interface AttemptResult {
@@ -106,6 +113,7 @@ export interface GatewayOutcome {
   refusal?: string;
   legacyFunctionCall?: GenerationResult['legacyFunctionCall'];
   thinkingBlocks?: GenerationResult['thinkingBlocks'];
+  nativeMessage?: Record<string, unknown>;
   toolCalls: Array<{ id: string; name: string; input: unknown }> | null;
   finishReason: string | null;
   usage: UsageSummary;
@@ -170,6 +178,18 @@ export class GatewayRunner {
       throw error;
     };
 
+    // A client-owned credential may only travel through a direct Codex model
+    // (or its alias). Never use it for a generic provider, cache hit or combo.
+    if (req.nativeCodex) {
+      if (!ctx.codexAuth || !ctx.key || resolved.kind !== 'model') throw new GatewayError('permission_error', 'Codex requires a client credential and a direct model or alias', { status: 403 });
+      validateCodexRequest(req.nativeCodex);
+      if (hasCodexTokenCap(ctx.key)) return rejectLimit(new GatewayError('capability_not_supported', 'Codex does not support an enforceable output token cap; use an explicitly uncapped key or an API-key provider', { status: 400, code: 'codex_token_cap_unsupported' }));
+    } else if (resolved.kind === 'model') {
+      const model = getDb().select().from(schema.models).where(eq(schema.models.id, resolved.modelId)).get();
+      const provider = model && getDb().select().from(schema.providers).where(eq(schema.providers.id, model.providerId)).get();
+      if (provider && providerIntegration(provider).authMode === 'client_oauth') throw new GatewayError('authentication_error', 'Use the dedicated Codex gateway with the signed-in client credential', { status: 401, code: 'codex_client_auth_required' });
+    }
+
     // --- Limits: RPM / TPM / concurrency / quota ---
     if (ctx.key) {
       const rpm = checkRpm(ctx.key.id, ctx.key.rpmLimit);
@@ -181,7 +201,7 @@ export class GatewayRunner {
       }
       // Apply the cap before caching, admission and conversion to either upstream
       // protocol. A finite token budget must also bound an omitted output limit.
-      estimatedInput = estimateTokens(JSON.stringify({ messages: req.canonical.messages, system: req.canonical.system, tools: req.canonical.tools, responseFormat: req.canonical.responseFormat }));
+      estimatedInput = estimateTokens(JSON.stringify(req.nativeCodex ?? req.nativeMessages ?? { messages: req.canonical.messages, system: req.canonical.system, tools: req.canonical.tools, responseFormat: req.canonical.responseFormat }));
       const outputCap = ctx.key.maxOutputTokensPerRequest ?? Infinity;
       estimatedOutput = Math.min(req.canonical.maxOutputTokens ?? 1024, outputCap);
       if (req.canonical.maxOutputTokens !== undefined || [ctx.key.maxOutputTokensPerRequest, ctx.key.tpmLimit, ctx.key.dailyTokenLimit, ctx.key.monthlyTokenLimit, ctx.key.totalTokenLimit].some((limit) => limit != null)) {
@@ -244,7 +264,7 @@ export class GatewayRunner {
     };
     try {
       // --- Capability requirements ---
-      const required = deriveRequiredCapabilities(req.canonical);
+      const required = { ...deriveRequiredCapabilities(req.canonical), ...(req.nativeCodex ? { responses: true } : {}) };
       debugHttp(ctx.requestId, 'CAPABILITIES REQUIRED', [
         `tools=${required.tools}`,
         `stream=${required.streaming}`,
@@ -304,7 +324,8 @@ export class GatewayRunner {
       const settings = getSettings();
       const keyCacheOverride = ctx.key?.cacheOverrideEnabled ?? null;
       const targetCacheOverride = this.getTargetCacheOverride(resolved);
-      const allowed = !ctx.synthetic && cacheAllowed({
+      const nativeProviderIds = new Set(getDb().select().from(schema.providerIntegrations).all().filter(i => i.providerKind === 'claude_code').map(i => i.providerId));
+      const allowed = !ctx.synthetic && !req.nativeCodex && !(req.nativeMessages && candidates.some(c => nativeProviderIds.has(c.providerId))) && cacheAllowed({
         globalEnabled: settings.gatewayCacheEnabled,
         keyAllowed: keyCacheOverride,
         targetAllowed: targetCacheOverride,
@@ -357,7 +378,7 @@ export class GatewayRunner {
       let resultText = '';
       let resultToolCalls: Array<{ id: string; name: string; input: unknown }> = [];
       let resultFinishReason: string | null = null;
-      let resultExtensions: Pick<GenerationResult, 'reasoning' | 'refusal' | 'thinkingBlocks' | 'legacyFunctionCall'> = {};
+      let resultExtensions: Pick<GenerationResult, 'reasoning' | 'refusal' | 'thinkingBlocks' | 'legacyFunctionCall' | 'nativeMessage'> = {};
       let finalModelId: string | null = null;
       let completedSuccessfully = false;
 
@@ -404,6 +425,10 @@ export class GatewayRunner {
             || (target.kind === 'alias' && (!currentAlias?.enabled || currentAlias.targetKind !== resolved.kind || currentAlias.targetId !== this.resolvedId(resolved)))
             || !keyAllowedForTarget({ ...ctx.key, allowAllModels: currentKey.allowAllModels }, target)) {
             lastError = new GatewayError('permission_error', 'Model no longer permitted for this API key', { status: 403 });
+            break;
+          }
+          if (req.nativeCodex && hasCodexTokenCap(currentKey)) {
+            lastError = new GatewayError('capability_not_supported', 'Codex cannot enforce the configured token cap', { status: 400, code: 'codex_token_cap_unsupported' });
             break;
           }
           // A retry/fallback is another upstream attempt. Include already spent
@@ -461,7 +486,23 @@ export class GatewayRunner {
           continue;
         }
         let baseCfg: ReturnType<typeof providerToUpstreamConfig>;
-        try { baseCfg = providerToUpstreamConfig(provider); }
+        try {
+          const integration = providerIntegration(provider);
+          if (req.nativeCodex) {
+            if (integration.authMode !== 'client_oauth' || !ctx.codexAuth) throw new GatewayError('permission_error', 'Codex credentials are not permitted for this provider', { status: 403 });
+            maxAttempts = 1;
+            baseCfg = { type: 'openai', baseUrl: CODEX_ORIGIN, customHeaders: {}, codexAuth: ctx.codexAuth,
+              connectTimeoutMs: provider.connectTimeoutMs, firstTokenTimeoutMs: provider.firstTokenTimeoutMs,
+              streamIdleTimeoutMs: provider.streamIdleTimeoutMs, totalTimeoutMs: provider.totalTimeoutMs };
+          } else {
+            if (integration.authMode === 'client_oauth') throw new GatewayError('authentication_error', 'Client OAuth provider requires the dedicated Codex route', { status: 401 });
+            baseCfg = providerToUpstreamConfig(provider);
+            if (integration.providerKind === 'claude_code') {
+              if (!baseCfg.apiKey || !/^sk-ant-api[A-Za-z0-9_-]+$/.test(baseCfg.apiKey)) throw new GatewayError('authentication_error', 'Claude Code requires an Anthropic API key', { status: 400 });
+              baseCfg = { ...baseCfg, nativeClaude: true, customHeaders: { 'anthropic-version': '2023-06-01', ...req.anthropicHeaders } };
+            }
+          }
+        }
         catch (e) {
           const error = e instanceof GatewayError ? e : new GatewayError('upstream_error', (e as Error).message, { cause: e });
           // Credential/configuration failures before any upstream dispatch are
@@ -544,7 +585,7 @@ export class GatewayRunner {
           `baseUrl=${cfg.baseUrl}`,
           `stream=${req.canonical.stream}`,
           `slowResponseTimeoutMs=${cfg.slowResponseTimeoutMs ?? 'disabled'}`,
-          `providerKeyFingerprint=${apiKeyFingerprint(cfg.apiKey ?? '')}`,
+          `providerKeyFingerprint=${cfg.codexAuth ? 'client-owned' : apiKeyFingerprint(cfg.apiKey ?? '')}`,
         ]);
         const attempt: AttemptOutcome = {
           attemptNumber,
@@ -617,7 +658,7 @@ export class GatewayRunner {
           resultText = out.result.text;
           resultToolCalls = out.result.toolCalls;
           resultFinishReason = out.result.finishReason;
-          resultExtensions = { reasoning: out.result.reasoning, refusal: out.result.refusal, thinkingBlocks: out.result.thinkingBlocks, legacyFunctionCall: out.result.legacyFunctionCall };
+          resultExtensions = { reasoning: out.result.reasoning, refusal: out.result.refusal, thinkingBlocks: out.result.thinkingBlocks, legacyFunctionCall: out.result.legacyFunctionCall, nativeMessage: out.result.nativeMessage };
           // A streaming TTFT is a successful sample only after the stream has
           // completed; non-streaming samples measure the entire valid response.
           learnOutcome('success', req.canonical.stream ? out.ttftMs : attemptLatencyMs);
@@ -673,13 +714,13 @@ export class GatewayRunner {
             usage.total += normalizedFailedUsage.total;
           }
           if (ctx.key) accountQuota(attempt.usage, attempt.streamStarted, cfg.type === 'anthropic');
-          if (isUpstreamHealthFailure(err) && recordFailure(provider.id, provider.cbFailureThreshold, provider.cbCooldownSeconds, circuitPermit)) {
+          if (!req.nativeCodex && isUpstreamHealthFailure(err) && recordFailure(provider.id, provider.cbFailureThreshold, provider.cbCooldownSeconds, circuitPermit)) {
             try {
               getDb().update(schema.providers).set({ healthState: 'down', updatedAt: new Date().toISOString() }).where(eq(schema.providers.id, provider.id)).run();
             } catch (e) { errorLine(ctx.requestId, 'PROVIDER HEALTH UPDATE ERROR', [redactString((e as Error).message)]); }
           }
           const retryAfter = (err.cause as { retryAfterMs?: number } | undefined)?.retryAfterMs;
-          if (typeof retryAfter === 'number' && classifyFailure(err) === 'http_status'
+          if (!req.nativeCodex && typeof retryAfter === 'number' && classifyFailure(err) === 'http_status'
             && (err.cause as { status?: number } | undefined)?.status === 429) {
             if (isModelScopedFailure(err)) recordModelThrottle(candidate.modelId, retryAfter, { providerId: provider.id, permit: circuitPermit });
             else recordThrottle(provider.id, retryAfter, circuitPermit);
@@ -773,7 +814,7 @@ export class GatewayRunner {
       // The legacy cache stores text/tool calls only. Do not cache a response
       // whose reasoning/refusal extensions would be lost on replay.
       if (!ctx.synthetic && outcome.success && cacheMeta._cacheKey && !req.canonical.stream && !hasTools(req.canonical)
-        && !outcome.reasoning && !outcome.refusal && !outcome.legacyFunctionCall && !outcome.thinkingBlocks?.length) {
+        && !outcome.reasoning && !outcome.refusal && !outcome.legacyFunctionCall && !outcome.thinkingBlocks?.length && !outcome.nativeMessage) {
         const payload = this.buildCachedPayload(req, ctx, outcome);
         storeCache({
           cacheKey: cacheMeta._cacheKey,
@@ -866,6 +907,7 @@ export class GatewayRunner {
     const models = db.select().from(schema.models).all();
     const providers = db.select().from(schema.providers).all();
     const providerEnabled = new Map(providers.map((p) => [p.id, p.enabled]));
+    for (const integration of db.select().from(schema.providerIntegrations).all()) if (integration.authMode === 'client_oauth') providerEnabled.set(integration.providerId, false);
     const providerCooldown = new Map(providers.map((p) => [p.id, p.cbCooldownSeconds]));
     // Deliberately unfiltered: every combo member must reach selectCandidates so
     // it can report WHY it was skipped. Pre-filtering here erased the model rows
@@ -894,6 +936,7 @@ export class GatewayRunner {
     onStreamStart: (started: boolean) => void,
     onFirstToken: (ttftMs: number) => void
   ): Promise<AttemptResult> {
+    if (req.nativeCodex) return runCodexStreaming(req.nativeCodex, candidate.upstreamModelId, cfg, ctx, onStreamStart, onFirstToken);
     if (req.canonical.stream) {
       return this.runStreamingAttempt(req, ctx, candidate, cfg, onStreamStart, onFirstToken);
     }
@@ -933,7 +976,7 @@ export class GatewayRunner {
       logUpstreamRequest(ctx.requestId, cfg, upstreamUrl(cfg, '/v1/chat/completions'), payload, req.canonical.stream);
       call = await callUpstreamNonStreaming(cfg, upstreamUrl(cfg, '/v1/chat/completions'), payload, ctx.requestId);
     } else {
-      const payload = canonicalToAnthropicRequest(req.canonical, upstreamModel);
+      const payload = cfg.nativeClaude && req.nativeMessages ? { ...req.nativeMessages, model: upstreamModel, max_tokens: req.canonical.maxOutputTokens ?? 1024, stream: false } : canonicalToAnthropicRequest(req.canonical, upstreamModel);
       logUpstreamRequest(ctx.requestId, cfg, upstreamUrl(cfg, '/v1/messages'), payload, req.canonical.stream);
       call = await callUpstreamNonStreaming(cfg, upstreamUrl(cfg, '/v1/messages'), payload, ctx.requestId);
     }
@@ -971,7 +1014,7 @@ export class GatewayRunner {
       usage = conv.usage;
     } else {
       const conv = anthropicResponseToCanonical(parsed as never, req.canonical.model);
-      result = { text: conv.text, toolCalls: conv.toolCalls, finishReason: conv.finishReason, thinkingBlocks: conv.thinkingBlocks };
+      result = { text: conv.text, toolCalls: conv.toolCalls, finishReason: conv.finishReason, thinkingBlocks: conv.thinkingBlocks, ...(cfg.nativeClaude && req.nativeMessages ? { nativeMessage: parsed as Record<string, unknown> } : {}) };
       usage = conv.usage;
     }
     return { statusCode: call.status, ttftMs: call.ttftMs, upstreamRequestId: call.upstreamRequestId, usage, result };
@@ -1247,7 +1290,7 @@ export class GatewayRunner {
 
     try {
       const url = cfg.type === 'openai' ? upstreamUrl(cfg, '/v1/chat/completions') : upstreamUrl(cfg, '/v1/messages');
-      const payload = cfg.type === 'openai' ? canonicalToOpenAIRequest(req.canonical, upstreamModel) : canonicalToAnthropicRequest(req.canonical, upstreamModel);
+      const payload = cfg.type === 'openai' ? canonicalToOpenAIRequest(req.canonical, upstreamModel) : cfg.nativeClaude && req.nativeMessages ? { ...req.nativeMessages, model: upstreamModel, max_tokens: req.canonical.maxOutputTokens ?? 1024, stream: true } : canonicalToAnthropicRequest(req.canonical, upstreamModel);
       logUpstreamRequest(ctx.requestId, cfg, url, payload, true);
       debugStream(ctx.requestId, 'STREAM START', [`upstreamConnected=true`]);
       streamStartTs = Date.now();
@@ -1464,10 +1507,10 @@ export class GatewayRunner {
     const now = new Date().toISOString();
     let requestPayload: string | null = null;
     let responsePayload: string | null = null;
-    if (settings.contentLogMode === 'prompt' || settings.contentLogMode === 'prompt_and_response') {
+    if (!req.nativeCodex && (settings.contentLogMode === 'prompt' || settings.contentLogMode === 'prompt_and_response')) {
       requestPayload = JSON.stringify(redactValue(req.canonical));
     }
-    if (settings.contentLogMode === 'prompt_and_response') {
+    if (!req.nativeCodex && settings.contentLogMode === 'prompt_and_response') {
       responsePayload = JSON.stringify(redactValue({ text: outcome.text, toolCalls: outcome.toolCalls, finishReason: outcome.finishReason }));
     }
     const persistedAttempts = attempts.map((a) => ({

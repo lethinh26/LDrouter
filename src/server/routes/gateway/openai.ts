@@ -48,7 +48,8 @@ export async function registerOpenAIRoutes(app: FastifyInstance): Promise<void> 
   app.get('/v1/models', async (req) => {
     const key = requireGatewayKey(req);
     const db = getDb();
-    const models = db.select().from(schema.models).all().filter((m) => m.enabled && m.upstreamAvailable);
+    const clientProviders = new Set(db.select().from(schema.providerIntegrations).all().filter(i => i.authMode === 'client_oauth').map(i => i.providerId));
+    const models = db.select().from(schema.models).all().filter((m) => m.enabled && m.upstreamAvailable && !clientProviders.has(m.providerId));
     const ids = listRoutableModelIds(models, key, db);
     return openAIModelList(ids.map((id) => ({ publicModelId: id, upstreamModelId: id })));
   });

@@ -36,7 +36,7 @@ describe('provider integration identity migration 0017', () => {
     const db = new Database(':memory:');
     try {
       runMigrations(db, MIGRATION_LOG, MIGRATIONS_DIR, CURRENT_SCHEMA_VERSION);
-      db.exec("INSERT INTO providers(id,name,slug,type,base_url) VALUES ('c','Codex','codex','openai','https://api.openai.com')");
+      db.exec("INSERT INTO providers(id,name,slug,type,base_url) VALUES ('c','Codex','codex','openai','https://chatgpt.com')");
       const insert = db.prepare('INSERT INTO provider_integrations VALUES (?,?,?)');
       expect(() => insert.run('c','codex','api_key')).toThrow(/CHECK/);
       expect(() => insert.run('c','claude_code','client_oauth')).toThrow(/CHECK/);
@@ -53,7 +53,7 @@ describe('provider integration identity migration 0017', () => {
     const db = new Database(':memory:');
     try {
       runMigrations(db, MIGRATION_LOG, MIGRATIONS_DIR, CURRENT_SCHEMA_VERSION);
-      db.exec("INSERT INTO providers(id,name,slug,type,base_url) VALUES ('c','Codex','codex','openai','https://api.openai.com'); INSERT INTO provider_integrations VALUES ('c','codex','client_oauth')");
+      db.exec("INSERT INTO providers(id,name,slug,type,base_url) VALUES ('c','Codex','codex','openai','https://chatgpt.com'); INSERT INTO provider_integrations VALUES ('c','codex','client_oauth')");
       if (damage === 'missing-table') db.exec('DROP TABLE provider_integrations');
       if (damage === 'credential') db.exec("UPDATE providers SET encrypted_api_key='unexpected',api_key_nonce='unexpected' WHERE id='c'");
       if (damage === 'origin') db.exec("UPDATE providers SET base_url='https://example.test' WHERE id='c'");

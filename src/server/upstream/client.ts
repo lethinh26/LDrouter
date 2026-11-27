@@ -7,6 +7,7 @@ import { buildHeaders, stripSlash } from '../providers/index';
 import { redactString } from '../security/redact';
 import { debugUpstream, errorLine, formatError, truncate } from '../logging/debug';
 import { SseFrameError, SseParser, type SseEvent } from './sse';
+import { CODEX_ORIGIN, CODEX_API_PATH } from '../providers/integration';
 
 export interface UpstreamConfig {
   type: 'openai' | 'anthropic';
@@ -21,6 +22,9 @@ export interface UpstreamConfig {
   slowResponseTimeoutMs?: number;
   /** Request-wide abort (client disconnect or combo overall deadline). */
   requestSignal?: AbortSignal;
+  /** Request-local credentials for the documented Codex gateway transport. */
+  codexAuth?: { authorization: string; accountId?: string };
+  nativeClaude?: boolean;
 }
 
 export interface UpstreamResult {
@@ -189,6 +193,7 @@ export async function callUpstreamNonStreaming(cfg: UpstreamConfig, url: string,
     const res = await fetch(url, {
       method: 'POST',
       headers: { ...buildHeaders({ ...cfg, apiKey: cfg.apiKey ?? '' }), 'content-type': 'application/json', accept: 'application/json' },
+      ...(cfg.nativeClaude ? { redirect: 'error' as const } : {}),
       body: JSON.stringify(payload),
       signal: ctl.signal,
     });
@@ -285,6 +290,9 @@ export async function callUpstreamStreaming(
   requestStartMs = Date.now(),
   downstreamSignal?: AbortSignal,
 ): Promise<UpstreamStreamResult> {
+  if (cfg.codexAuth && (cfg.type !== 'openai' || url !== `${CODEX_ORIGIN}${CODEX_API_PATH}/responses`)) {
+    throw new GatewayError('permission_error', 'Codex credential destination is not permitted', { status: 403 });
+  }
   const ctl = new AbortController();
   // Keep the caller's dispatch origin for compatibility, then measure elapsed
   // time on a monotonic clock (wall-clock corrections cannot extend deadlines).
@@ -348,7 +356,12 @@ export async function callUpstreamStreaming(
   try {
     const res = await fetch(url, {
       method: 'POST',
-      headers: { ...buildHeaders({ ...cfg, apiKey: cfg.apiKey ?? '' }), 'content-type': 'application/json', accept: 'text/event-stream' },
+      headers: cfg.codexAuth ? {
+        authorization: cfg.codexAuth.authorization,
+        ...(cfg.codexAuth.accountId ? { 'ChatGPT-Account-ID': cfg.codexAuth.accountId } : {}),
+        'content-type': 'application/json', accept: 'text/event-stream',
+      } : { ...buildHeaders({ ...cfg, apiKey: cfg.apiKey ?? '' }), 'content-type': 'application/json', accept: 'text/event-stream' },
+      ...(cfg.codexAuth || cfg.nativeClaude ? { redirect: 'error' as const } : {}),
       body: JSON.stringify(payload),
       signal: ctl.signal,
     });
@@ -366,14 +379,15 @@ export async function callUpstreamStreaming(
       stage = 'http_status';
       if (firstTokenTimer) clearTimeout(firstTokenTimer);
       if (slowResponseTimer) clearTimeout(slowResponseTimer);
-      const text = await res.text();
-      logUpstreamResponse(requestId, res.status, res.statusText, res.headers, Math.round(performance.now() - start), text);
-      throw new UpstreamHttpError(res.status, text, upstreamRequestId, responseRetryAfter);
+      const text = cfg.codexAuth ? '' : await res.text();
+      if (cfg.codexAuth) void res.body?.cancel().catch(() => undefined);
+      if (!cfg.codexAuth) logUpstreamResponse(requestId, res.status, res.statusText, res.headers, Math.round(performance.now() - start), text);
+      throw new UpstreamHttpError(res.status, cfg.codexAuth ? '' : text, upstreamRequestId, responseRetryAfter);
     }
-    logUpstreamResponse(requestId, res.status, res.statusText, res.headers, Math.round(performance.now() - start), '');
+    if (!cfg.codexAuth) logUpstreamResponse(requestId, res.status, res.statusText, res.headers, Math.round(performance.now() - start), '');
     reader = res.body?.getReader() ?? null;
     const mediaType = contentType?.split(';', 1)[0]?.trim().toLowerCase();
-    const jsonCompletion = cfg.type === 'openai' && (mediaType === 'application/json' || Boolean(mediaType?.startsWith('application/') && mediaType.endsWith('+json')));
+    const jsonCompletion = !cfg.codexAuth && cfg.type === 'openai' && (mediaType === 'application/json' || Boolean(mediaType?.startsWith('application/') && mediaType.endsWith('+json')));
     if (mediaType !== 'text/event-stream' && !jsonCompletion) {
       stage = 'unexpected_content_type';
       throw new GatewayError('upstream_error', 'Upstream returned a non-SSE response for a streaming request', { status: 502, code: 'upstream_bad_response' });
@@ -400,7 +414,7 @@ export async function callUpstreamStreaming(
     };
     const processEvent = (event: SseEvent) => {
       checkDeadlines();
-      if (cfg.type === 'openai' && event.event !== 'json' && event.data === '[DONE]') {
+      if (!cfg.codexAuth && cfg.type === 'openai' && event.event !== 'json' && event.data === '[DONE]') {
         terminalSeen = true;
         return;
       }
@@ -408,6 +422,9 @@ export async function callUpstreamStreaming(
         // Some compatible servers omit event:; require the actual typed JSON
         // message_stop, not an unverified event label, before terminating.
         try { terminalSeen = JSON.parse(event.data)?.type === 'message_stop'; } catch { /* callback validates JSON */ }
+      }
+      if (cfg.codexAuth) {
+        try { terminalSeen = ['response.completed', 'response.incomplete', 'response.failed', 'error'].includes(JSON.parse(event.data)?.type); } catch { /* callback validates JSON */ }
       }
       stage = 'chunk_callback';
       const meaningfulOutput = onChunk(event, isFirst);
@@ -491,6 +508,9 @@ export async function callUpstreamStreaming(
       }), 'downstream');
     }
     if (e instanceof UpstreamHttpError) {
+      if (cfg.codexAuth && (e.status === 401 || e.status === 403)) {
+        throw enrichError(new GatewayError('upstream_auth_error', `Codex upstream rejected the signed-in account (HTTP ${e.status})`, { status: e.status, code: `upstream_http_${e.status}` }), 'http_status');
+      }
       throw enrichError(upstreamHttpError(e.status, e.bodyExcerpt, e), 'http_status');
     }
     // Preserve a known HTTP error status when the provider stalls while sending
@@ -504,7 +524,7 @@ export async function callUpstreamStreaming(
     }
     if (e instanceof GatewayError) throw enrichError(e);
     const err = e as Error;
-    errorLine(requestId, 'UPSTREAM FETCH ERROR', [
+    if (!cfg.codexAuth) errorLine(requestId, 'UPSTREAM FETCH ERROR', [
       `url=${url}`,
       `afterMs=${Math.round(performance.now() - start)}`,
       `ttftKnown=${ttft !== null}`,
@@ -528,7 +548,7 @@ export async function callUpstreamStreaming(
       }
       throw enrichError(new GatewayError('timeout_error', 'Upstream stream idle timeout', { status: 504, code: 'upstream_stream_idle_timeout', cause: e }), 'idle');
     }
-    throw enrichError(new GatewayError('upstream_unavailable', `Upstream connection failed: ${err.message}`, { status: 502, cause: e }));
+    throw enrichError(new GatewayError('upstream_unavailable', cfg.codexAuth ? 'Codex upstream connection failed' : `Upstream connection failed: ${err.message}`, { status: 502, ...(cfg.codexAuth ? {} : { cause: e }) }));
   } finally {
     cfg.requestSignal?.removeEventListener('abort', handleRequestAbort);
     downstreamSignal?.removeEventListener('abort', handleDownstreamAbort);

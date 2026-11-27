@@ -98,6 +98,10 @@ function assertMembersUsable(db: ComboDb, members: Array<{ modelId: string }>): 
     throw new GatewayError('invalid_request_error', `Duplicate members: ${[...new Set(dupes)].join(', ')}`, { status: 400 });
   }
   assertModelsExist(db, members);
+  const oauthMembers = db.select({ id: schema.models.id }).from(schema.models)
+    .innerJoin(schema.providerIntegrations, eq(schema.models.providerId, schema.providerIntegrations.providerId))
+    .where(sql`${schema.providerIntegrations.authMode} = 'client_oauth' AND ${schema.models.id} IN (${sql.join(ids.map(id => sql`${id}`), sql`, `)})`).all();
+  if (oauthMembers.length) throw new GatewayError('invalid_request_error', 'Client OAuth models require a direct route or alias and cannot be combo members', { status: 400 });
 }
 
 function assertModelsExist(db: ComboDb, members: Array<{ modelId: string }>): void {
