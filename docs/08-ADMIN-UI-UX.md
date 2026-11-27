@@ -155,6 +155,7 @@ Create/edit form:
 - name
 - slug
 - mode
+- immutable combo type (standard or native Codex)
 - max total attempts
 - optional overall combo deadline in seconds (blank means no additional limit)
 - fallback trigger policy
@@ -175,6 +176,12 @@ reserves from hard unavailability and never imply one globally preferred model. 
 reset of adaptive history. Warn when the attempt cap or overall deadline limits fallback/rescue.
 
 Warn when member capability sets differ.
+
+Native Codex shows configured eligibility rather than account-verified health.
+Only distinct upstream Codex model IDs can be added. The 429/adaptive controls
+and synthetic admin Test are disabled; direct the operator to the signed-in
+client configuration. Warn about finite token caps when selecting a native
+Codex model, combo or alias in API Keys.
 
 ## API Keys page
 

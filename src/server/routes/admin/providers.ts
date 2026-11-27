@@ -6,16 +6,20 @@ import { getDb, schema } from '../../db/index';
 import { requireAdminAuth } from '../../auth/middleware';
 import { recordAudit } from '../../db/repositories/audit';
 import { encryptSecret, decryptSecret, encryptCustomHeaders, decryptCustomHeaders, isMasterKeyConfigured } from '../../auth/crypto';
-import { uuid, slugify } from '../../auth/ids';
+import { uuid } from '../../auth/ids';
+import { normalizeProviderSlug, assertProviderSlugFree } from '../../routing/namespace';
 import { GatewayError } from '../../errors';
 import type { Provider } from '../../db/schema';
 import { probeProvider, discoverProviderModels, type DiscoveredModel, type ProbeResult } from '../../providers/index';
+import { CODEX_ORIGIN, CLAUDE_CODE_ORIGIN, providerIntegration } from '../../providers/integration';
 
 const ProviderCreate = z.object({
   // Providers use one encrypted API key and a compatible HTTP endpoint.
   name: z.string().min(1).max(128).optional(),
   slug: z.string().min(1).max(64).optional(),
   type: z.enum(['openai', 'anthropic']),
+  providerKind: z.enum(['compatible', 'codex', 'claude_code']).optional(),
+  authMode: z.enum(['api_key', 'client_oauth']).optional(),
   baseUrl: z.string().url().max(512).optional(),
   apiKey: z.string().min(1).max(20000).optional(),
   customHeaders: z.record(z.string(), z.string()).optional(),
@@ -43,6 +47,7 @@ function providerToSummary(p: Provider, modelCount: number, recentErrorRate: num
     name: p.name,
     slug: p.slug,
     type: p.type,
+    ...providerIntegration(p),
     baseUrl: p.baseUrl,
     enabled: p.enabled,
     health: p.healthState,
@@ -74,25 +79,35 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
   app.post('/api/admin/providers', async (req) => {
     const body = ProviderCreate.parse(req.body);
     const name = body.name;
-    const baseUrl = body.baseUrl;
+    const providerKind = body.providerKind ?? 'compatible';
+    const authMode = providerKind === 'codex' ? 'client_oauth' : 'api_key';
+    const codex = providerKind === 'codex';
+    if ((body.authMode !== undefined && body.authMode !== authMode) || (codex && body.type !== 'openai') || (providerKind === 'claude_code' && body.type !== 'anthropic')) {
+      throw new GatewayError('invalid_request_error', 'Invalid provider kind, protocol or authentication mode', { status: 400 });
+    }
+    if (codex && (body.apiKey !== undefined || body.customHeaders !== undefined || (body.baseUrl !== undefined && body.baseUrl !== CODEX_ORIGIN))) {
+      throw new GatewayError('invalid_request_error', 'Codex uses the signed-in client credential and a fixed OpenAI destination; stored credentials and custom headers are forbidden', { status: 400 });
+    }
+    if (providerKind === 'claude_code' && (body.customHeaders !== undefined || (body.baseUrl !== undefined && body.baseUrl !== CLAUDE_CODE_ORIGIN) || (body.apiKey !== undefined && !/^sk-ant-api[A-Za-z0-9_-]+$/.test(body.apiKey)))) {
+      throw new GatewayError('invalid_request_error', 'Claude Code requires an Anthropic API key and the official Anthropic destination; subscription OAuth and custom headers are not supported', { status: 400 });
+    }
+    const baseUrl = codex ? CODEX_ORIGIN : providerKind === 'claude_code' ? CLAUDE_CODE_ORIGIN : body.baseUrl;
     if (!name) throw new GatewayError('invalid_request_error', 'Provider name is required', { status: 400 });
     // apiKey before baseUrl: a compatible provider created without either must be told the
     // credential is missing (the UI always supplies baseUrl from its dialog default).
-    if (!body.apiKey) {
+    if (!codex && !body.apiKey) {
       throw new GatewayError('invalid_request_error', 'API key is required for this provider type', { status: 400 });
     }
     if (!baseUrl) throw new GatewayError('invalid_request_error', 'Base URL is required', { status: 400 });
-    requireMasterKey(); // Need master key to encrypt new credentials
+    if (!codex) requireMasterKey(); // Need master key to encrypt new credentials
     const db = getDb();
-    const slug = slugify(body.slug ?? name);
-    const dup = db.select().from(schema.providers).where(eq(schema.providers.slug, slug)).get();
-    if (dup) {
-      throw new GatewayError('invalid_request_error', `Provider slug '${slug}' is already in use`, { status: 400 });
-    }
-    const enc = encryptSecret(body.apiKey);
+    const slug = normalizeProviderSlug(body.slug ?? name);
+    assertProviderSlugFree(db, slug);
+    const enc = body.apiKey ? encryptSecret(body.apiKey) : null;
     const headersEnc = body.customHeaders ? encryptCustomHeaders(body.customHeaders) : null;
     const id = uuid();
-    db.insert(schema.providers).values({
+    db.transaction(tx => {
+    tx.insert(schema.providers).values({
       id,
       name,
       slug,
@@ -112,19 +127,46 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
       cbFailureThreshold: body.cbFailureThreshold ?? 5,
       cbCooldownSeconds: body.cbCooldownSeconds ?? 60,
     }).run();
+    if (providerKind !== 'compatible') tx.insert(schema.providerIntegrations).values({ providerId: id, providerKind, authMode }).run();
+    });
     recordAudit({ action: 'provider.create', success: true, targetType: 'provider', targetId: id, targetName: name, ip: req.ip });
     return { id, slug };
   });
 
   app.patch('/api/admin/providers', async (req) => {
     const body = ProviderUpdate.parse(req.body);
-    requireMasterKey(); // Need master key to encrypt/decrypt credentials
     const db = getDb();
     const p = db.select().from(schema.providers).where(eq(schema.providers.id, body.id)).get();
     if (!p) throw new GatewayError('invalid_request_error', 'Provider not found', { status: 404 });
+    const integration = providerIntegration(p);
+    if ((body.providerKind !== undefined && body.providerKind !== integration.providerKind) || (body.authMode !== undefined && body.authMode !== integration.authMode)) {
+      throw new GatewayError('invalid_request_error', 'Provider integration and authentication mode are immutable; create a new provider', { status: 400 });
+    }
+    if (integration.authMode === 'client_oauth') {
+      if (body.apiKey !== undefined || body.customHeaders !== undefined || (body.baseUrl !== undefined && body.baseUrl !== CODEX_ORIGIN)) {
+        throw new GatewayError('invalid_request_error', 'Codex destination and credential mode cannot be overridden', { status: 400 });
+      }
+    } else {
+      if (integration.providerKind === 'claude_code' && (body.customHeaders !== undefined || (body.baseUrl !== undefined && body.baseUrl !== CLAUDE_CODE_ORIGIN) || (body.apiKey !== undefined && !/^sk-ant-api[A-Za-z0-9_-]+$/.test(body.apiKey)))) {
+        throw new GatewayError('invalid_request_error', 'Claude Code requires an Anthropic API key and the official Anthropic destination', { status: 400 });
+      }
+      requireMasterKey();
+    }
     const update: Partial<typeof schema.providers.$inferInsert> = { updatedAt: new Date().toISOString() };
     if (body.name) update.name = body.name;
-    if (body.slug) update.slug = slugify(body.slug);
+    if (body.slug !== undefined && body.slug !== p.slug) {
+      const slug = normalizeProviderSlug(body.slug);
+      if (slug !== p.slug) {
+        if (db.select({ id: schema.models.id }).from(schema.models).where(eq(schema.models.providerId, p.id)).get()) {
+          throw new GatewayError('invalid_request_error', 'Provider slug cannot be changed after importing models; existing public model IDs must remain stable', { status: 409, code: 'provider_slug_locked' });
+        }
+        assertProviderSlugFree(db, slug, p.id);
+        update.slug = slug;
+      }
+    }
+    if (body.type !== undefined && body.type !== p.type) {
+      throw new GatewayError('invalid_request_error', 'Provider protocol is immutable; create a new provider instead', { status: 400 });
+    }
     if (body.baseUrl) update.baseUrl = body.baseUrl;
     if (body.enabled !== undefined) update.enabled = body.enabled;
     if (body.connectTimeoutMs !== undefined) update.connectTimeoutMs = body.connectTimeoutMs;
@@ -176,11 +218,13 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
     const db = getDb();
     const p = db.select().from(schema.providers).where(eq(schema.providers.id, id)).get();
     if (!p) throw new GatewayError('invalid_request_error', 'Provider not found', { status: 404 });
+    if (providerIntegration(p).authMode === 'client_oauth') return { ok: false, detail: 'Connect with a signed-in Codex client to verify this provider. No server credential is stored.', latencyMs: 0 };
     if (!p.encryptedApiKey || !p.apiKeyNonce) throw new GatewayError('invalid_request_error', 'Provider credentials are missing', { status: 501 });
     const apiKey = decryptSecret({ ciphertext: p.encryptedApiKey, nonce: p.apiKeyNonce, version: p.apiKeyVersion });
     const headers = decryptCustomHeaders(p.customHeadersEncrypted && p.customHeadersNonce ? { ciphertext: p.customHeadersEncrypted, nonce: p.customHeadersNonce, version: 1 } : null);
     const result: ProbeResult = await probeProvider({
       type: p.type,
+      providerKind: providerIntegration(p).providerKind,
       baseUrl: p.baseUrl,
       apiKey,
       customHeaders: headers,
@@ -201,12 +245,14 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
     const db = getDb();
     const p = db.select().from(schema.providers).where(eq(schema.providers.id, id)).get();
     if (!p) throw new GatewayError('invalid_request_error', 'Provider not found', { status: 404 });
+    if (providerIntegration(p).authMode === 'client_oauth') throw new GatewayError('invalid_request_error', 'Codex discovery requires the signed-in client. Import approved model IDs manually, then use the authenticated client catalog.', { status: 400, code: 'client_catalog_required' });
     let discovered: DiscoveredModel[];
     if (!p.encryptedApiKey || !p.apiKeyNonce) throw new GatewayError('invalid_request_error', 'Provider credentials are missing', { status: 501 });
     const apiKey = decryptSecret({ ciphertext: p.encryptedApiKey, nonce: p.apiKeyNonce, version: p.apiKeyVersion });
     const headers = decryptCustomHeaders(p.customHeadersEncrypted && p.customHeadersNonce ? { ciphertext: p.customHeadersEncrypted, nonce: p.customHeadersNonce, version: 1 } : null);
     discovered = await discoverProviderModels({
       type: p.type,
+      providerKind: providerIntegration(p).providerKind,
       baseUrl: p.baseUrl,
       apiKey,
       customHeaders: headers,

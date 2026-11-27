@@ -75,6 +75,8 @@ Cover:
 - backup creation
 - invalid restore rejection
 - valid restore and rollback safety
+- native Claude/Codex terminal integrity, partial-stream usage and no replay after output
+- native combo migration, homogeneous membership, immutable kind, alias ACL, account-catalog compatibility, same-identity fallback, no quota/auth fallback, and database epoch fencing
 - `/health`, `/ready`, `/metrics`
 
 ### E2E browser tests
@@ -93,6 +95,11 @@ Critical flows:
 10. Configure TOTP 2FA.
 11. Download backup.
 12. Upload valid backup through restore validation UI.
+
+The CI browser smoke also exercises provider identity/slug collision, selective
+and manual model import, native combo editing, token-cap guidance, scoped ACL
+and request/statistics views with isolated fixtures. It does not perform live
+provider OAuth or consume a subscription.
 
 ## Routing acceptance scenarios
 

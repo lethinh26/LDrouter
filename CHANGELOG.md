@@ -6,6 +6,26 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-11-27
+
+### Added
+
+- Client-owned Codex authentication through the dedicated native HTTP Responses gateway and Claude Code support with an authorized Anthropic API key, without restoring legacy account pools or persisting client OAuth credentials.
+- Native Codex ordered-fallback combos with account-local catalog checks, homogeneous members, alias permissions and no authentication/rate-limit fallback.
+- API-key lifetime token budgets, custom keys, editable scopes and limits, IP rule validation, and clearer native Codex limit guidance.
+- Isolated browser, official CLI fixture, migration and compiled ESM regression coverage.
+
+### Fixed
+
+- Preserve provider, model, combo and alias namespaces during discovery and configuration; reject ambiguous names and duplicate upstream members in native combos.
+- Require genuine native SSE completion, record partial-stream usage and enforce native model capabilities without rewriting native payloads.
+- Resolve emitted Node ESM directory imports correctly and serve the API Keys UI on direct navigation while keeping API namespaces separate.
+
+### Upgrade notes
+
+- Migrations 0016–0018 are forward-only. Keep a full backup and its matching key material before upgrading. A downgrade may require restoring that backup.
+- Codex client sign-in and token refresh stay with the client; centralized OAuth login, account pooling and managed refresh are not included. Native client smoke uses synthetic credentials and mock upstreams, not real account eligibility tests.
+
 ## [2.0.1] - 2026-11-26
 
 ### Fixed

@@ -1,6 +1,6 @@
 // Gateway execution pipeline: auth -> resolve -> ACL -> limits -> route -> attempt -> persist.
 
-import { getDb, getRawDb, schema } from '../db/index';
+import { getDb, getRawDb, getDatabaseEpoch, schema } from '../db/index';
 import { desc, eq } from 'drizzle-orm';
 import { GatewayError, clientDisconnectedError } from '../errors';
 import { resolveRequestedModel, unwrapAlias } from '../routing/resolver';
@@ -9,9 +9,9 @@ import { loadCombo, selectCandidates, orderCandidates, shouldFallback, type Comb
 import { classifyWorkload, pickAdaptiveCandidate, type AdaptiveDecision } from '../routing/combo-policy';
 import { beginAdaptiveAttempt, listAdaptiveStates, claimAdaptiveProbe, claimAdaptiveExploration, recordAdaptiveOutcome, releaseAdaptiveProbe } from '../routing/combo-adaptive-state';
 import { claimCircuitAttempt, releaseCircuitAttempt, recordSuccess, recordFailure, recordThrottle, recordModelThrottle, modelThrottleBlocks, circuitBlocks } from '../routing/circuit';
-import { checkRpm, checkTpm, acquireConcurrent, releaseConcurrent } from '../routing/ratelimit';
-import { checkDailyMonthly, consumeUsage } from '../routing/quota';
-import { keyAllowedFor, type AuthenticatedKey } from '../auth/api-key';
+import { checkRpm, checkTpm, acquireConcurrent, releaseConcurrent, reconcileTpm } from '../routing/ratelimit';
+import { reserveQuota, consumeUsage, type QuotaReservation } from '../routing/quota';
+import { keyAllowedForTarget, keyIpAllowed, keyIsActive, type AuthenticatedKey } from '../auth/api-key';
 import { providerToUpstreamConfig, callUpstreamNonStreaming, callUpstreamStreaming, upstreamUrl, upstreamHttpError, retryAfterMs, type UpstreamCall } from '../upstream/client';
 import { canonicalToOpenAIRequest, openAIResponseToCanonical, extractAssistantText, tokenCount } from '../protocols/canonical';
 import { canonicalToAnthropicRequest, anthropicResponseToCanonical } from '../protocols/anthropic';
@@ -26,6 +26,9 @@ import { emitRequestLogged, emitRequestStarted } from './events';
 import { nextRequestCompletionTimestamp } from './request-timestamps';
 import { watchDownstreamDisconnect } from './downstream';
 import { debugHttp, debugBody, debugUpstream, debugStream, errorLine, getDebugFlags } from '../logging/debug';
+import { providerIntegration, CODEX_ORIGIN } from '../providers/integration';
+import { hasCodexTokenCap, nativeCodexRequirements, runCodexStreaming, validateCodexRequest } from './codex';
+import { compatibleCodexEntries, fetchCodexCatalog, validateCodexComboHistory } from './codex-catalog';
 
 export interface GatewayContext {
   requestId: string;
@@ -37,12 +40,17 @@ export interface GatewayContext {
   reply: FastifyReply;
   /** Admin diagnostics exercise real routing without training user workload or caching. */
   synthetic?: boolean;
+  codexAuth?: { authorization: string; accountId?: string };
+  codexClientVersion?: string;
 }
 
 export interface GatewayRequest {
   canonical: CanonicalRequest;
   protocol: 'openai' | 'anthropic';
   endpoint: 'chat/completions' | 'responses' | 'messages';
+  nativeCodex?: Record<string, unknown>;
+  nativeMessages?: Record<string, unknown>;
+  anthropicHeaders?: Record<string, string>;
 }
 
 export interface UsageSummary {
@@ -62,6 +70,7 @@ interface GenerationResult {
   refusal?: string;
   legacyFunctionCall?: { name: string; arguments: string };
   thinkingBlocks?: Array<{ type: 'thinking'; thinking: string; signature?: string }>;
+  nativeMessage?: Record<string, unknown>;
 }
 
 interface AttemptResult {
@@ -106,6 +115,7 @@ export interface GatewayOutcome {
   refusal?: string;
   legacyFunctionCall?: GenerationResult['legacyFunctionCall'];
   thinkingBlocks?: GenerationResult['thinkingBlocks'];
+  nativeMessage?: Record<string, unknown>;
   toolCalls: Array<{ id: string; name: string; input: unknown }> | null;
   finishReason: string | null;
   usage: UsageSummary;
@@ -124,6 +134,17 @@ export class GatewayRunner {
     const start = Date.now();
     const startMono = performance.now();
     let concurrencyAcquired = false;
+    let quotaReservation: QuotaReservation | undefined;
+    const databaseEpoch = getDatabaseEpoch();
+    let estimatedInput = 0;
+    let estimatedOutput = 0;
+    let tpmReserved = 0;
+    let quotaInput = 0;
+    let quotaOutput = 0;
+    const accountQuota = (reported: UsageSummary, generated: boolean, anthropic = false) => {
+      quotaInput += reported.input + (anthropic ? reported.cacheRead + reported.cacheWrite : 0) || (generated ? estimatedInput : 0);
+      quotaOutput += reported.output || (generated ? estimatedOutput : 0);
+    };
 
     const usage: UsageSummary = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, total: 0 };
     const attempts: AttemptOutcome[] = [];
@@ -143,12 +164,36 @@ export class GatewayRunner {
     }
 
     // --- ACL check ---
-    if (ctx.key) {
-      if (resolved.kind === 'model') {
-        if (!keyAllowedFor(ctx.key, 'model', resolved.modelId)) throw new GatewayError('permission_error', 'Model not permitted for this API key', { status: 403 });
-      } else if (resolved.kind === 'combo') {
-        if (!keyAllowedFor(ctx.key, 'combo', resolved.comboId)) throw new GatewayError('permission_error', 'Combo not permitted for this API key', { status: 403 });
-      }
+    if (ctx.key && !keyAllowedForTarget(ctx.key, target)) throw new GatewayError('permission_error', 'Model not permitted for this API key', { status: 403 });
+
+    const rejectLimit = async (error: GatewayError): Promise<never> => {
+      const outcome: GatewayOutcome = {
+        success: false, httpStatus: error.status, errorType: error.type,
+        errorMessage: error.message, errorCode: error.code, text: null, toolCalls: null,
+        finishReason: null, usage, ttftMs: null, latencyMs: Math.round(performance.now() - startMono),
+        attempts, finalModelId: null, resolvedTargetKind: resolved.kind,
+        resolvedTargetId: this.resolvedId(resolved), gatewayCacheHit: false, streamEvents: null,
+      };
+      await this.persistRequest(req, ctx, resolved, outcome, usage, attempts, false);
+      metrics.requestsTotal.inc({ protocol: req.protocol, status: String(error.status) });
+      metrics.requestDuration.observe(outcome.latencyMs, { protocol: req.protocol });
+      throw error;
+    };
+
+    // Client-owned credentials stay on the dedicated native Codex transport.
+    const nativeCombo = comboPlan?.comboKind === 'codex_native';
+    const initialComboVersion = comboPlan?.configVersion;
+    if (req.nativeCodex) {
+      if (!ctx.codexAuth || !ctx.key || (resolved.kind !== 'model' && !nativeCombo)) throw new GatewayError('permission_error', 'Codex requires a client credential and a native Codex target', { status: 403 });
+      validateCodexRequest(req.nativeCodex);
+      if (nativeCombo) validateCodexComboHistory(req.nativeCodex);
+      if (hasCodexTokenCap(ctx.key)) return rejectLimit(new GatewayError('capability_not_supported', 'Codex does not support an enforceable output token cap; use an explicitly uncapped key or an API-key provider', { status: 400, code: 'codex_token_cap_unsupported' }));
+    } else if (nativeCombo) {
+      throw new GatewayError('authentication_error', 'Use the dedicated Codex gateway with the signed-in client credential', { status: 401, code: 'codex_client_auth_required' });
+    } else if (resolved.kind === 'model') {
+      const model = getDb().select().from(schema.models).where(eq(schema.models.id, resolved.modelId)).get();
+      const provider = model && getDb().select().from(schema.providers).where(eq(schema.providers.id, model.providerId)).get();
+      if (provider && providerIntegration(provider).authMode === 'client_oauth') throw new GatewayError('authentication_error', 'Use the dedicated Codex gateway with the signed-in client credential', { status: 401, code: 'codex_client_auth_required' });
     }
 
     // --- Limits: RPM / TPM / concurrency / quota ---
@@ -157,28 +202,42 @@ export class GatewayRunner {
       if (!rpm.allowed) {
         metrics.rateLimited.inc({ reason: 'rpm' });
         const err = new GatewayError('rate_limit_error', 'Rate limit exceeded (RPM)', { status: 429, code: 'rpm_limit' });
-        (err as { retryAfter?: number }).retryAfter = rpm.retryAfterSeconds;
-        throw err;
+        if (rpm.retryAfterSeconds && typeof ctx.reply.header === 'function') ctx.reply.header('retry-after', String(rpm.retryAfterSeconds));
+        return rejectLimit(err);
       }
-      // Estimate input tokens for TPM: conservative approximation (4 chars/token)
-      const estimatedInput = estimateTokens(JSON.stringify(req.canonical.messages));
-      const tpm = checkTpm(ctx.key.id, ctx.key.tpmLimit, estimatedInput + (req.canonical.maxOutputTokens ?? 1024));
-      if (!tpm.allowed) {
-        metrics.rateLimited.inc({ reason: 'tpm' });
-        const err = new GatewayError('rate_limit_error', 'Rate limit exceeded (TPM)', { status: 429, code: 'tpm_limit' });
-        (err as { retryAfter?: number }).retryAfter = tpm.retryAfterSeconds;
-        throw err;
+      // Apply the cap before caching, admission and conversion to either upstream
+      // protocol. A finite token budget must also bound an omitted output limit.
+      estimatedInput = estimateTokens(JSON.stringify(req.nativeCodex ?? req.nativeMessages ?? { messages: req.canonical.messages, system: req.canonical.system, tools: req.canonical.tools, responseFormat: req.canonical.responseFormat }));
+      const outputCap = ctx.key.maxOutputTokensPerRequest ?? Infinity;
+      estimatedOutput = Math.min(req.canonical.maxOutputTokens ?? 1024, outputCap);
+      if (req.canonical.maxOutputTokens !== undefined || [ctx.key.maxOutputTokensPerRequest, ctx.key.tpmLimit, ctx.key.dailyTokenLimit, ctx.key.monthlyTokenLimit, ctx.key.totalTokenLimit].some((limit) => limit != null)) {
+        req = { ...req, canonical: { ...req.canonical, maxOutputTokens: estimatedOutput } };
       }
-      const quota = checkDailyMonthly(ctx.key.id, ctx.key.dailyTokenLimit, ctx.key.monthlyTokenLimit, estimatedInput + (req.canonical.maxOutputTokens ?? 1024));
-      if (!quota.allowed) {
-        metrics.rateLimited.inc({ reason: quota.reason ?? 'quota' });
-        throw new GatewayError('rate_limit_error', `Quota exceeded (${quota.reason})`, { status: 429, code: 'quota_limit' });
+      if (req.canonical.reasoning?.budgetTokens && req.canonical.maxOutputTokens !== undefined && req.canonical.reasoning.budgetTokens >= req.canonical.maxOutputTokens) {
+        throw new GatewayError('invalid_request_error', 'Thinking budget must be smaller than the effective output token limit', { status: 400 });
       }
+      const estimate = estimatedInput + estimatedOutput;
+      const quota = reserveQuota(ctx.key.id, ctx.key, estimate);
+      if (!quota.result.allowed) {
+        metrics.rateLimited.inc({ reason: quota.result.reason ?? 'quota' });
+        return rejectLimit(new GatewayError('rate_limit_error', `Quota exceeded (${quota.result.reason})`, { status: 429, code: 'quota_limit' }));
+      }
+      quotaReservation = quota.reservation;
       if (!acquireConcurrent(ctx.key.id, ctx.key.maxConcurrent)) {
+        quotaReservation?.release();
         metrics.rateLimited.inc({ reason: 'concurrency' });
-        throw new GatewayError('rate_limit_error', 'Too many concurrent requests', { status: 429, code: 'concurrency_limit' });
+        return rejectLimit(new GatewayError('rate_limit_error', 'Too many concurrent requests', { status: 429, code: 'concurrency_limit' }));
       }
       concurrencyAcquired = true;
+      const tpm = checkTpm(ctx.key.id, ctx.key.tpmLimit, estimate);
+      if (!tpm.allowed) {
+        quotaReservation?.release();
+        releaseConcurrent(ctx.key.id);
+        metrics.rateLimited.inc({ reason: 'tpm' });
+        if (tpm.retryAfterSeconds && typeof ctx.reply.header === 'function') ctx.reply.header('retry-after', String(tpm.retryAfterSeconds));
+        return rejectLimit(new GatewayError('rate_limit_error', 'Rate limit exceeded (TPM)', { status: 429, code: 'tpm_limit' }));
+      }
+      tpmReserved = estimate;
     }
 
     metrics.activeRequests.inc();
@@ -201,6 +260,11 @@ export class GatewayRunner {
       ? watchDownstreamDisconnect(response, () => requestAbort.abort(clientDisconnectedError()))
       : undefined;
     const abortError = (): GatewayError | null => {
+      if (databaseEpoch !== getDatabaseEpoch()) {
+        const error = new GatewayError('permission_error', 'Database changed during request', { status: 409, code: 'database_changed' });
+        requestAbort.abort(error);
+        return error;
+      }
       if (requestAbort.signal.aborted) return requestAbort.signal.reason as GatewayError;
       if (performance.now() >= deadlineAt) {
         const error = overallDeadlineError();
@@ -211,7 +275,7 @@ export class GatewayRunner {
     };
     try {
       // --- Capability requirements ---
-      const required = deriveRequiredCapabilities(req.canonical);
+      const required = req.nativeCodex ? nativeCodexRequirements(req.nativeCodex) : deriveRequiredCapabilities(req.canonical);
       debugHttp(ctx.requestId, 'CAPABILITIES REQUIRED', [
         `tools=${required.tools}`,
         `stream=${required.streaming}`,
@@ -225,6 +289,7 @@ export class GatewayRunner {
 
       // --- Determine candidates ---
       let candidates: CandidateModel[] = [];
+      let verifiedNativeModels: Map<string, string> | undefined;
       const rejected: RejectedMember[] = [];
       if (resolved.kind === 'model') {
         const loaded = this.loadModelCandidate(resolved.modelId, required, ctx.requestId);
@@ -237,7 +302,7 @@ export class GatewayRunner {
           const s = describeRejections({ kind: 'combo', publicModelId: resolved.publicModelId }, [{ publicModelId: resolved.publicModelId, reason: 'combo_disabled' }]);
           throw new GatewayError(s.type, s.message, { status: s.status, code: s.type });
         }
-        const all = this.loadAllModels();
+        const all = this.loadAllModels(nativeCombo);
         const filtered = selectCandidates(comboPlan, all, required, (c, reason) => {
           rejected.push({ publicModelId: c.publicModelId, reason });
           debugHttp(ctx.requestId, 'CAPABILITY REJECT', [`model=${c.publicModelId}`, `reason=${reason}`]);
@@ -256,6 +321,15 @@ export class GatewayRunner {
           throw new GatewayError(s.type, s.message, { status: comboPlan.slowResponseFallbackEnabled && s.type === 'upstream_unavailable' ? 503 : s.status, code: s.type });
         }
         candidates = orderCandidates(comboPlan, eligibleFiltered);
+        if (nativeCombo) {
+          const catalog = await fetchCodexCatalog(ctx.codexAuth!, ctx.codexClientVersion, requestAbort.signal);
+          const cancelled = abortError();
+          if (cancelled) throw cancelled;
+          if (!compatibleCodexEntries(catalog, candidates.map(c => c.upstreamModelId))) {
+            throw new GatewayError('capability_not_supported', 'Native combo members must have compatible metadata in the signed-in account catalog', { status: 400, code: 'codex_combo_catalog_incompatible' });
+          }
+          verifiedNativeModels = new Map(candidates.map(c => [c.modelId, c.upstreamModelId]));
+        }
         debugHttp(ctx.requestId, 'CANDIDATES ORDERED', [
           `mode=${comboPlan.mode}`,
           ...candidates.map((c, i) => `candidate[${i}]: providerModelId=${c.modelId} publicModelId=${c.publicModelId}`),
@@ -271,7 +345,8 @@ export class GatewayRunner {
       const settings = getSettings();
       const keyCacheOverride = ctx.key?.cacheOverrideEnabled ?? null;
       const targetCacheOverride = this.getTargetCacheOverride(resolved);
-      const allowed = !ctx.synthetic && cacheAllowed({
+      const nativeProviderIds = new Set(getDb().select().from(schema.providerIntegrations).all().filter(i => i.providerKind === 'claude_code').map(i => i.providerId));
+      const allowed = !ctx.synthetic && !req.nativeCodex && !(req.nativeMessages && candidates.some(c => nativeProviderIds.has(c.providerId))) && cacheAllowed({
         globalEnabled: settings.gatewayCacheEnabled,
         keyAllowed: keyCacheOverride,
         targetAllowed: targetCacheOverride,
@@ -296,6 +371,17 @@ export class GatewayRunner {
             // Evict that stale entry so the live provider can retry/fallback normally.
             getDb().delete(schema.responseCache).where(eq(schema.responseCache.cacheKey, cacheKey)).run();
           } else {
+            if (ctx.key) {
+              const cachedInput = g.usage.input || estimatedInput;
+              const cachedOutput = g.usage.output || estimatedOutput;
+              const quota = quotaReservation?.resize(ctx.key, cachedInput + cachedOutput);
+              if (quota && !quota.allowed) {
+                metrics.rateLimited.inc({ reason: quota.reason ?? 'quota' });
+                return await rejectLimit(new GatewayError('rate_limit_error', `Quota exceeded (${quota.reason})`, { status: 429, code: 'quota_limit' }));
+              }
+              quotaInput = cachedInput;
+              quotaOutput = cachedOutput;
+            }
             metrics.cacheHits.inc();
             await this.persistRequest(req, ctx, resolved, g, usageFromCache(cached.usage), attempts, true);
             return g;
@@ -313,7 +399,7 @@ export class GatewayRunner {
       let resultText = '';
       let resultToolCalls: Array<{ id: string; name: string; input: unknown }> = [];
       let resultFinishReason: string | null = null;
-      let resultExtensions: Pick<GenerationResult, 'reasoning' | 'refusal' | 'thinkingBlocks' | 'legacyFunctionCall'> = {};
+      let resultExtensions: Pick<GenerationResult, 'reasoning' | 'refusal' | 'thinkingBlocks' | 'legacyFunctionCall' | 'nativeMessage'> = {};
       let finalModelId: string | null = null;
       let completedSuccessfully = false;
 
@@ -340,12 +426,17 @@ export class GatewayRunner {
             lastError = new GatewayError('upstream_unavailable', 'Combo is no longer available', { status: 503 });
             break;
           }
+          if (fresh.comboKind !== comboPlan?.comboKind || (nativeCombo && fresh.configVersion !== initialComboVersion)) {
+            lastError = new GatewayError('permission_error', 'Combo configuration changed during request', { status: 409 });
+            break;
+          }
           comboPlan = fresh;
           maxAttempts = Math.min(maxAttempts, fresh.maxTotalAttempts);
           tightenDeadline(fresh);
           if (attemptNumber >= maxAttempts) break;
           if (lastError && !shouldRetryAttempt(fresh, lastError)) break;
-          candidates = orderCandidates(fresh, selectCandidates(fresh, this.loadAllModels(), required));
+          candidates = orderCandidates(fresh, selectCandidates(fresh, this.loadAllModels(nativeCombo), required));
+          if (verifiedNativeModels) candidates = candidates.filter(c => verifiedNativeModels.get(c.modelId) === c.upstreamModelId);
           // A deleted/re-added membership cannot inherit a prior soft timeout.
           for (const [modelId, memberId] of softTimedOutMembers) {
             if (!fresh.members.some((m) => m.modelId === modelId && m.id === memberId && m.enabled)) softTimedOut.delete(modelId);
@@ -355,10 +446,39 @@ export class GatewayRunner {
         }
         if (ctx.key) {
           const currentKey = getDb().select().from(schema.apiKeys).where(eq(schema.apiKeys.id, ctx.key.id)).get();
-          if (!currentKey || !currentKey.enabled || (currentKey.expiresAt && Date.parse(currentKey.expiresAt) <= Date.now())
-            || !keyAllowedFor({ ...ctx.key, allowAllModels: currentKey.allowAllModels }, resolved.kind, this.resolvedId(resolved))) {
+          const currentAlias = target.kind === 'alias' ? getDb().select().from(schema.modelAliases).where(eq(schema.modelAliases.id, target.aliasId)).get() : null;
+          if (!currentKey || !keyIsActive(currentKey) || !keyIpAllowed(ctx.key.id, ctx.clientIp)
+            || (target.kind === 'alias' && (!currentAlias?.enabled || currentAlias.targetKind !== resolved.kind || currentAlias.targetId !== this.resolvedId(resolved)))
+            || !keyAllowedForTarget({ ...ctx.key, allowAllModels: currentKey.allowAllModels }, target)) {
             lastError = new GatewayError('permission_error', 'Model no longer permitted for this API key', { status: 403 });
             break;
+          }
+          if (req.nativeCodex && hasCodexTokenCap(currentKey)) {
+            lastError = new GatewayError('capability_not_supported', 'Codex cannot enforce the configured token cap', { status: 400, code: 'codex_token_cap_unsupported' });
+            break;
+          }
+          if (currentKey.maxOutputTokensPerRequest !== ctx.key.maxOutputTokensPerRequest || currentKey.tpmLimit !== ctx.key.tpmLimit) {
+            lastError = new GatewayError('permission_error', 'API key limits changed during request', { status: 409 });
+            break;
+          }
+          // A retry/fallback is another upstream attempt. Include already spent
+          // tokens in its reservation so known failed usage cannot bypass quota.
+          const requiredTokens = quotaInput + quotaOutput + estimatedInput + estimatedOutput;
+          const quota = quotaReservation?.resize(currentKey, requiredTokens);
+          if (quota && !quota.allowed) {
+            metrics.rateLimited.inc({ reason: quota.reason ?? 'quota' });
+            lastError = new GatewayError('rate_limit_error', `Quota exceeded (${quota.reason})`, { status: 429, code: 'quota_limit' });
+            break;
+          }
+          if (requiredTokens > tpmReserved) {
+            const extra = checkTpm(ctx.key.id, ctx.key.tpmLimit, requiredTokens - tpmReserved);
+            if (!extra.allowed) {
+              metrics.rateLimited.inc({ reason: 'tpm' });
+              lastError = new GatewayError('rate_limit_error', 'Rate limit exceeded (TPM)', { status: 429, code: 'tpm_limit' });
+              if (extra.retryAfterSeconds && typeof ctx.reply.header === 'function') ctx.reply.header('retry-after', String(extra.retryAfterSeconds));
+              break;
+            }
+            tpmReserved = requiredTokens;
           }
         }
         const afterRefresh = abortError();
@@ -396,7 +516,23 @@ export class GatewayRunner {
           continue;
         }
         let baseCfg: ReturnType<typeof providerToUpstreamConfig>;
-        try { baseCfg = providerToUpstreamConfig(provider); }
+        try {
+          const integration = providerIntegration(provider);
+          if (req.nativeCodex) {
+            if (integration.authMode !== 'client_oauth' || !ctx.codexAuth) throw new GatewayError('permission_error', 'Codex credentials are not permitted for this provider', { status: 403 });
+            if (!nativeCombo) maxAttempts = 1;
+            baseCfg = { type: 'openai', baseUrl: CODEX_ORIGIN, customHeaders: {}, codexAuth: ctx.codexAuth,
+              connectTimeoutMs: provider.connectTimeoutMs, firstTokenTimeoutMs: provider.firstTokenTimeoutMs,
+              streamIdleTimeoutMs: provider.streamIdleTimeoutMs, totalTimeoutMs: provider.totalTimeoutMs };
+          } else {
+            if (integration.authMode === 'client_oauth') throw new GatewayError('authentication_error', 'Client OAuth provider requires the dedicated Codex route', { status: 401 });
+            baseCfg = providerToUpstreamConfig(provider);
+            if (integration.providerKind === 'claude_code') {
+              if (!baseCfg.apiKey || !/^sk-ant-api[A-Za-z0-9_-]+$/.test(baseCfg.apiKey)) throw new GatewayError('authentication_error', 'Claude Code requires an Anthropic API key', { status: 400 });
+              baseCfg = { ...baseCfg, nativeClaude: true, customHeaders: { 'anthropic-version': '2023-06-01', ...req.anthropicHeaders } };
+            }
+          }
+        }
         catch (e) {
           const error = e instanceof GatewayError ? e : new GatewayError('upstream_error', (e as Error).message, { cause: e });
           // Credential/configuration failures before any upstream dispatch are
@@ -479,7 +615,7 @@ export class GatewayRunner {
           `baseUrl=${cfg.baseUrl}`,
           `stream=${req.canonical.stream}`,
           `slowResponseTimeoutMs=${cfg.slowResponseTimeoutMs ?? 'disabled'}`,
-          `providerKeyFingerprint=${apiKeyFingerprint(cfg.apiKey ?? '')}`,
+          `providerKeyFingerprint=${cfg.codexAuth ? 'client-owned' : apiKeyFingerprint(cfg.apiKey ?? '')}`,
         ]);
         const attempt: AttemptOutcome = {
           attemptNumber,
@@ -502,7 +638,7 @@ export class GatewayRunner {
         };
 
         const learnOutcome = (kind: 'success' | 'soft_timeout' | 'error' | 'cancel', latencyMs: number | null) => {
-          if (!adaptive || !attemptPlan || !attemptFence || ctx.synthetic) return;
+          if (!adaptive || !attemptPlan || !attemptFence || ctx.synthetic || databaseEpoch !== getDatabaseEpoch()) return;
           metrics.adaptiveOutcomes.inc({ role, result: kind });
           try {
             const currentlyComparable = selectCandidates(attemptPlan, this.loadAllModels(), required)
@@ -525,10 +661,10 @@ export class GatewayRunner {
             // Live signal for the monitoring dashboard: the request is now
             // being served by this provider (lit up from TTFT until the
             // completion event fires on persist).
-            emitRequestStarted(ctx.requestId, provider.id, candidate.modelId, ctx.requestedModel, ttftMs);
+            if (databaseEpoch === getDatabaseEpoch()) emitRequestStarted(ctx.requestId, provider.id, candidate.modelId, ctx.requestedModel, ttftMs);
           });
           const attemptLatencyMs = Math.round(performance.now() - attemptStartMono);
-          const cancelled = req.canonical.stream && attempt.streamStarted ? null : abortError();
+          const cancelled = req.canonical.stream && attempt.streamStarted && databaseEpoch === getDatabaseEpoch() ? null : abortError();
           if (cancelled) throw new GatewayError(cancelled.type, cancelled.message, { status: cancelled.status, code: cancelled.code, cause: { usage: out.usage } });
           attempt.statusCode = (out as { statusCode?: number | null }).statusCode ?? null;
           attempt.success = true;
@@ -539,7 +675,9 @@ export class GatewayRunner {
           attempt.latencyMs = attemptLatencyMs;
           attempt.ttftMs = out.ttftMs;
           attempt.usage = out.usage;
-          attempt.upstreamRequestId = out.upstreamRequestId;
+          // Native client auth is never persisted, including opaque headers
+          // supplied by an upstream in response to that credential.
+          attempt.upstreamRequestId = req.nativeCodex ? null : out.upstreamRequestId;
           attempt.completedAt = new Date().toISOString();
           attempt.result = out.result;
           usage.input += out.usage.input;
@@ -548,14 +686,15 @@ export class GatewayRunner {
           usage.cacheWrite += out.usage.cacheWrite;
           usage.reasoning += out.usage.reasoning;
           usage.total += out.usage.total;
+          if (ctx.key) accountQuota(out.usage, true, cfg.type === 'anthropic');
           resultText = out.result.text;
           resultToolCalls = out.result.toolCalls;
           resultFinishReason = out.result.finishReason;
-          resultExtensions = { reasoning: out.result.reasoning, refusal: out.result.refusal, thinkingBlocks: out.result.thinkingBlocks, legacyFunctionCall: out.result.legacyFunctionCall };
+          resultExtensions = { reasoning: out.result.reasoning, refusal: out.result.refusal, thinkingBlocks: out.result.thinkingBlocks, legacyFunctionCall: out.result.legacyFunctionCall, nativeMessage: out.result.nativeMessage };
           // A streaming TTFT is a successful sample only after the stream has
           // completed; non-streaming samples measure the entire valid response.
           learnOutcome('success', req.canonical.stream ? out.ttftMs : attemptLatencyMs);
-          if (recordSuccess(provider.id, circuitPermit)) {
+          if (!req.nativeCodex && databaseEpoch === getDatabaseEpoch() && recordSuccess(provider.id, circuitPermit)) {
             try {
               getDb().update(schema.providers).set({ healthState: 'healthy', updatedAt: new Date().toISOString() }).where(eq(schema.providers.id, provider.id)).run();
             } catch (e) { errorLine(ctx.requestId, 'PROVIDER HEALTH UPDATE ERROR', [redactString((e as Error).message)]); }
@@ -564,7 +703,7 @@ export class GatewayRunner {
           break;
         } catch (e) {
           const err = e instanceof GatewayError ? e : new GatewayError('upstream_error', (e as Error).message, { cause: e });
-          const cancelled = err.code === 'client_disconnected' || err.code === 'combo_overall_timeout';
+          const cancelled = err.code === 'client_disconnected' || err.code === 'combo_overall_timeout' || databaseEpoch !== getDatabaseEpoch();
           if (err.code === 'combo_slow_response_timeout') {
             softTimedOut.add(candidate.modelId);
             softTimedOutMembers.set(candidate.modelId, candidate.comboMemberId);
@@ -589,7 +728,7 @@ export class GatewayRunner {
           attempt.failureReason = classifyFailure(err);
           attempt.sanitizedError = redactString(err.message);
           const failedRequestId = (err.cause as { upstreamRequestId?: unknown } | undefined)?.upstreamRequestId;
-          if (typeof failedRequestId === 'string') attempt.upstreamRequestId = failedRequestId;
+          if (!req.nativeCodex && typeof failedRequestId === 'string') attempt.upstreamRequestId = failedRequestId;
           // A malformed 200 response may still report real input tokens. Preserve that
           // usage on the failed attempt and request instead of discarding it on throw.
           const failedUsage = (err.cause as { usage?: UsageSummary } | undefined)?.usage;
@@ -606,13 +745,14 @@ export class GatewayRunner {
             usage.reasoning += normalizedFailedUsage.reasoning;
             usage.total += normalizedFailedUsage.total;
           }
-          if (isUpstreamHealthFailure(err) && recordFailure(provider.id, provider.cbFailureThreshold, provider.cbCooldownSeconds, circuitPermit)) {
+          if (ctx.key) accountQuota(attempt.usage, attempt.streamStarted, cfg.type === 'anthropic');
+          if (!req.nativeCodex && databaseEpoch === getDatabaseEpoch() && isUpstreamHealthFailure(err) && recordFailure(provider.id, provider.cbFailureThreshold, provider.cbCooldownSeconds, circuitPermit)) {
             try {
               getDb().update(schema.providers).set({ healthState: 'down', updatedAt: new Date().toISOString() }).where(eq(schema.providers.id, provider.id)).run();
             } catch (e) { errorLine(ctx.requestId, 'PROVIDER HEALTH UPDATE ERROR', [redactString((e as Error).message)]); }
           }
           const retryAfter = (err.cause as { retryAfterMs?: number } | undefined)?.retryAfterMs;
-          if (typeof retryAfter === 'number' && classifyFailure(err) === 'http_status'
+          if (!req.nativeCodex && databaseEpoch === getDatabaseEpoch() && typeof retryAfter === 'number' && classifyFailure(err) === 'http_status'
             && (err.cause as { status?: number } | undefined)?.status === 429) {
             if (isModelScopedFailure(err)) recordModelThrottle(candidate.modelId, retryAfter, { providerId: provider.id, permit: circuitPermit });
             else recordThrottle(provider.id, retryAfter, circuitPermit);
@@ -638,7 +778,7 @@ export class GatewayRunner {
           // Reserve one attempt for a combo's next member whenever possible.
           const reserveFallback = comboPlan && eligible.some((c) => !attempted.has(c.modelId)) ? 1 : 0;
           const candidateRetries = retriesByModel.get(candidate.modelId) ?? 0;
-          if (err.code === 'upstream_empty_response'
+          if (!req.nativeCodex && err.code === 'upstream_empty_response'
             && (!comboPlan || shouldRetry)
             && candidateRetries < provider.maxRetries
             && attemptNumber + reserveFallback < maxAttempts) {
@@ -658,7 +798,7 @@ export class GatewayRunner {
           if (shouldRetry && attemptNumber < maxAttempts) continue;
         } finally {
           try {
-            if (probeToken && attemptPlan) releaseAdaptiveProbe(attemptPlan, candidate, workload, probeToken);
+            if (probeToken && attemptPlan && databaseEpoch === getDatabaseEpoch()) releaseAdaptiveProbe(attemptPlan, candidate, workload, probeToken);
           } catch (e) {
             errorLine(ctx.requestId, 'ADAPTIVE LEASE RELEASE ERROR', [redactString((e as Error).message)]);
           } finally {
@@ -705,8 +845,8 @@ export class GatewayRunner {
       const cacheMeta = (req as unknown as { _cacheKey?: string; _cacheConfigVersion?: number });
       // The legacy cache stores text/tool calls only. Do not cache a response
       // whose reasoning/refusal extensions would be lost on replay.
-      if (!ctx.synthetic && outcome.success && cacheMeta._cacheKey && !req.canonical.stream && !hasTools(req.canonical)
-        && !outcome.reasoning && !outcome.refusal && !outcome.legacyFunctionCall && !outcome.thinkingBlocks?.length) {
+      if (databaseEpoch === getDatabaseEpoch() && !ctx.synthetic && outcome.success && cacheMeta._cacheKey && !req.canonical.stream && !hasTools(req.canonical)
+        && !outcome.reasoning && !outcome.refusal && !outcome.legacyFunctionCall && !outcome.thinkingBlocks?.length && !outcome.nativeMessage) {
         const payload = this.buildCachedPayload(req, ctx, outcome);
         storeCache({
           cacheKey: cacheMeta._cacheKey,
@@ -720,7 +860,7 @@ export class GatewayRunner {
         });
       }
 
-      await this.persistRequest(req, ctx, resolved, outcome, usage, attempts, false);
+      if (databaseEpoch === getDatabaseEpoch()) await this.persistRequest(req, ctx, resolved, outcome, usage, attempts, false);
       metrics.requestsTotal.inc({ protocol: req.protocol, status: String(outcome.httpStatus) });
       metrics.requestDuration.observe(outcome.latencyMs, { protocol: req.protocol });
       if (outcome.ttftMs != null) metrics.requestTtft.observe(outcome.ttftMs, { protocol: req.protocol });
@@ -729,14 +869,20 @@ export class GatewayRunner {
       metrics.tokensCacheRead.inc({ protocol: req.protocol }, usage.cacheRead);
       metrics.tokensCacheWrite.inc({ protocol: req.protocol }, usage.cacheWrite);
       metrics.tokensReasoning.inc({ protocol: req.protocol }, usage.reasoning);
-      if (ctx.key) consumeUsage(ctx.key.id, usage.input, usage.output);
-
       return outcome;
     } finally {
       if (deadlineTimer) clearTimeout(deadlineTimer);
       detachDownstream?.();
-      if (concurrencyAcquired && ctx.key) releaseConcurrent(ctx.key.id);
-      metrics.activeRequests.dec();
+      try {
+        if (ctx.key && databaseEpoch === getDatabaseEpoch()) {
+          consumeUsage(ctx.key.id, quotaInput, quotaOutput);
+          reconcileTpm(ctx.key.id, ctx.key.tpmLimit, tpmReserved, quotaInput + quotaOutput);
+        }
+      } finally {
+        quotaReservation?.release();
+        if (concurrencyAcquired && ctx.key) releaseConcurrent(ctx.key.id);
+        metrics.activeRequests.dec();
+      }
     }
   }
 
@@ -788,11 +934,13 @@ export class GatewayRunner {
     return { candidates: [candidate], rejected: [] };
   }
 
-  private loadAllModels(): CandidateModel[] {
+  private loadAllModels(nativeCodex = false): CandidateModel[] {
     const db = getDb();
     const models = db.select().from(schema.models).all();
     const providers = db.select().from(schema.providers).all();
     const providerEnabled = new Map(providers.map((p) => [p.id, p.enabled]));
+    const codexProviders = new Set(db.select().from(schema.providerIntegrations).all().filter(i => i.providerKind === 'codex' && i.authMode === 'client_oauth').map(i => i.providerId));
+    for (const p of providers) if (codexProviders.has(p.id) !== nativeCodex) providerEnabled.set(p.id, false);
     const providerCooldown = new Map(providers.map((p) => [p.id, p.cbCooldownSeconds]));
     // Deliberately unfiltered: every combo member must reach selectCandidates so
     // it can report WHY it was skipped. Pre-filtering here erased the model rows
@@ -804,7 +952,7 @@ export class GatewayRunner {
       providerId: m.providerId,
       enabled: m.enabled,
       providerEnabled: providerEnabled.get(m.providerId) ?? false,
-      upstreamAvailable: m.upstreamAvailable,
+      upstreamAvailable: m.upstreamAvailable && (!nativeCodex || (safeJson(m.capabilitiesJson).responses === true && safeJson(m.capabilitiesJson).streaming === true)),
       // Cooldown-aware: a raw `isOpen()` here froze the whole combo on one bad minute,
       // because the flags are computed once per request while the breaker stays open
       // until some request decays it — which this filter prevented from ever happening.
@@ -821,6 +969,7 @@ export class GatewayRunner {
     onStreamStart: (started: boolean) => void,
     onFirstToken: (ttftMs: number) => void
   ): Promise<AttemptResult> {
+    if (req.nativeCodex) return runCodexStreaming(req.nativeCodex, candidate.upstreamModelId, cfg, ctx, onStreamStart, onFirstToken);
     if (req.canonical.stream) {
       return this.runStreamingAttempt(req, ctx, candidate, cfg, onStreamStart, onFirstToken);
     }
@@ -860,7 +1009,7 @@ export class GatewayRunner {
       logUpstreamRequest(ctx.requestId, cfg, upstreamUrl(cfg, '/v1/chat/completions'), payload, req.canonical.stream);
       call = await callUpstreamNonStreaming(cfg, upstreamUrl(cfg, '/v1/chat/completions'), payload, ctx.requestId);
     } else {
-      const payload = canonicalToAnthropicRequest(req.canonical, upstreamModel);
+      const payload = cfg.nativeClaude && req.nativeMessages ? { ...req.nativeMessages, model: upstreamModel, max_tokens: req.canonical.maxOutputTokens ?? 1024, stream: false } : canonicalToAnthropicRequest(req.canonical, upstreamModel);
       logUpstreamRequest(ctx.requestId, cfg, upstreamUrl(cfg, '/v1/messages'), payload, req.canonical.stream);
       call = await callUpstreamNonStreaming(cfg, upstreamUrl(cfg, '/v1/messages'), payload, ctx.requestId);
     }
@@ -898,7 +1047,7 @@ export class GatewayRunner {
       usage = conv.usage;
     } else {
       const conv = anthropicResponseToCanonical(parsed as never, req.canonical.model);
-      result = { text: conv.text, toolCalls: conv.toolCalls, finishReason: conv.finishReason, thinkingBlocks: conv.thinkingBlocks };
+      result = { text: conv.text, toolCalls: conv.toolCalls, finishReason: conv.finishReason, thinkingBlocks: conv.thinkingBlocks, ...(cfg.nativeClaude && req.nativeMessages ? { nativeMessage: parsed as Record<string, unknown> } : {}) };
       usage = conv.usage;
     }
     return { statusCode: call.status, ttftMs: call.ttftMs, upstreamRequestId: call.upstreamRequestId, usage, result };
@@ -1174,7 +1323,7 @@ export class GatewayRunner {
 
     try {
       const url = cfg.type === 'openai' ? upstreamUrl(cfg, '/v1/chat/completions') : upstreamUrl(cfg, '/v1/messages');
-      const payload = cfg.type === 'openai' ? canonicalToOpenAIRequest(req.canonical, upstreamModel) : canonicalToAnthropicRequest(req.canonical, upstreamModel);
+      const payload = cfg.type === 'openai' ? canonicalToOpenAIRequest(req.canonical, upstreamModel) : cfg.nativeClaude && req.nativeMessages ? { ...req.nativeMessages, model: upstreamModel, max_tokens: req.canonical.maxOutputTokens ?? 1024, stream: true } : canonicalToAnthropicRequest(req.canonical, upstreamModel);
       logUpstreamRequest(ctx.requestId, cfg, url, payload, true);
       debugStream(ctx.requestId, 'STREAM START', [`upstreamConnected=true`]);
       streamStartTs = Date.now();
@@ -1185,7 +1334,9 @@ export class GatewayRunner {
         if (unknownEvents > 0) throw badGenerationError('Upstream stream contained unrecognized output events', 'unsupported_shape', detail);
         throw emptyGenerationError(candidate, usage, detail);
       }
-      if (!meta.terminalSeen && !finishReason) {
+      // Native Anthropic requires the actual message_stop. A stop_reason in
+      // message_delta is not a terminal frame and cannot certify completion.
+      if (!meta.terminalSeen && (cfg.nativeClaude || !finishReason)) {
         throw badGenerationError('Upstream stream ended before a completion marker', 'truncated_stream', detail);
       }
       if (reasoningEvents > 0 && textEvents === 0 && toolEvents === 0 && !isLengthFinish(finishReason)) {
@@ -1391,10 +1542,10 @@ export class GatewayRunner {
     const now = new Date().toISOString();
     let requestPayload: string | null = null;
     let responsePayload: string | null = null;
-    if (settings.contentLogMode === 'prompt' || settings.contentLogMode === 'prompt_and_response') {
+    if (!req.nativeCodex && (settings.contentLogMode === 'prompt' || settings.contentLogMode === 'prompt_and_response')) {
       requestPayload = JSON.stringify(redactValue(req.canonical));
     }
-    if (settings.contentLogMode === 'prompt_and_response') {
+    if (!req.nativeCodex && settings.contentLogMode === 'prompt_and_response') {
       responsePayload = JSON.stringify(redactValue({ text: outcome.text, toolCalls: outcome.toolCalls, finishReason: outcome.finishReason }));
     }
     const persistedAttempts = attempts.map((a) => ({
@@ -1461,6 +1612,7 @@ export class GatewayRunner {
       requestPayloadJson: requestPayload,
       responsePayloadJson: responsePayload,
       gatewayCacheHit: cacheHit ? true : false,
+      partialStream: attempts.some((attempt) => attempt.partialResponse),
     } as never).run();
 
     for (const attempt of persistedAttempts) db.insert(schema.requestAttempts).values(attempt as never).run();
@@ -1510,6 +1662,16 @@ export function isQuotaFailure(err: GatewayError): boolean {
 /** Whether a failed attempt should advance to the next configured candidate. */
 export function shouldRetryAttempt(comboPlan: ComboPlan | null, err: GatewayError): boolean {
   if (err.code === 'client_disconnected' || err.code === 'combo_overall_timeout') return false;
+  if (comboPlan?.comboKind === 'codex_native') {
+    const causeStatus = (err.cause as { status?: number } | undefined)?.status;
+    const status = causeStatus ?? err.status;
+    if (err.type === 'upstream_auth_error' || err.type === 'authentication_error' || err.type === 'permission_error' ||
+        err.type === 'upstream_rate_limit' || [401, 403, 429].includes(status) || [401, 403, 429].includes(err.status)) return false;
+    // An unsuccessful SSE terminal can encode an account/auth/quota error
+    // even when the HTTP status is 200. Do not replay a semantic failure.
+    if (err.code === 'upstream_bad_response' || err.code === 'upstream_empty_response') return false;
+    return shouldFallback(comboPlan, { type: classifyFailure(err), status });
+  }
   if (isQuotaFailure(err)) return true;
   if (err.code === 'upstream_empty_response' || err.code === 'upstream_bad_response') return comboPlan?.trigger.on5xx ?? false;
   if (err.code === 'combo_slow_response_timeout') return comboPlan?.slowResponseFallbackEnabled ?? false;

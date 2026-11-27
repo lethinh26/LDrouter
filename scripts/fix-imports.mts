@@ -20,6 +20,16 @@ function walkDir(dir: string): void {
   }
 }
 
+function emittedSpecifier(filePath: string, specifier: string): string {
+  if (specifier.endsWith('.js')) return specifier;
+  const resolved = path.resolve(path.dirname(filePath), specifier);
+  // Node ESM does not resolve directory imports to index.js automatically.
+  if (!fs.existsSync(`${resolved}.js`) && fs.existsSync(path.join(resolved, 'index.js'))) {
+    return `${specifier.replace(/\/$/, '')}/index.js`;
+  }
+  return `${specifier}.js`;
+}
+
 function fixFile(filePath: string): void {
   let content = fs.readFileSync(filePath, 'utf8');
   const original = content;
@@ -36,12 +46,11 @@ function fixFile(filePath: string): void {
 
   content = content.replace(regex, (match, p1, p2, p3) => {
     if (p2.endsWith('.js')) return match;
-    // Avoid double .js
-    return `${p1}${p2}.js${p3}`;
+    return `${p1}${emittedSpecifier(filePath, p2)}${p3}`;
   });
   content = content.replace(dynamicRegex, (match, p1, p2, p3) => {
     if (p2.endsWith('.js')) return match;
-    return `${p1}${p2}.js${p3}`;
+    return `${p1}${emittedSpecifier(filePath, p2)}${p3}`;
   });
 
   if (content !== original) {

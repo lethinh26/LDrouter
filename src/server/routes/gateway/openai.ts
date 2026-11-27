@@ -4,7 +4,7 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { eq, inArray } from 'drizzle-orm';
 import { getDb, schema } from '../../db/index';
-import { authenticateGatewayKey, type AuthenticatedKey } from '../../auth/api-key';
+import { requireGatewayKey, type AuthenticatedKey } from '../../auth/api-key';
 import { resolveClientIp } from '../../util/client-ip';
 import { openAIToCanonical, openAIModelList, type OpenAIChatRequest } from '../../protocols/canonical';
 import { GatewayError, toOpenAIError, outcomeError } from '../../errors';
@@ -38,6 +38,7 @@ const ResponsesBody = z.object({
   input: z.any(),
   stream: z.boolean().optional(),
   reasoning: z.object({ effort: ChatBody.shape.reasoning_effort }).optional(),
+  max_output_tokens: z.number().int().min(1).optional(),
   // Accept and pass through; full Responses support is a v1 subset.
 });
 
@@ -45,16 +46,10 @@ export async function registerOpenAIRoutes(app: FastifyInstance): Promise<void> 
   const runner = new GatewayRunner();
 
   app.get('/v1/models', async (req) => {
-    const key = authenticateGatewayHeaders(req);
+    const key = requireGatewayKey(req);
     const db = getDb();
-    let models = db.select().from(schema.models).all();
-    if (!key.allowAllModels) {
-      const perms = db.select().from(schema.apiKeyModelPermissions).where(eq(schema.apiKeyModelPermissions.apiKeyId, key.id)).all();
-      const allowedModelIds = new Set(perms.filter((p) => p.targetKind === 'model').map((p) => p.targetId));
-      models = models.filter((m) => allowedModelIds.has(m.id) || (m.enabled && m.upstreamAvailable));
-    } else {
-      models = models.filter((m) => m.enabled && m.upstreamAvailable);
-    }
+    const clientProviders = new Set(db.select().from(schema.providerIntegrations).all().filter(i => i.authMode === 'client_oauth').map(i => i.providerId));
+    const models = db.select().from(schema.models).all().filter((m) => m.enabled && m.upstreamAvailable && !clientProviders.has(m.providerId));
     const ids = listRoutableModelIds(models, key, db);
     return openAIModelList(ids.map((id) => ({ publicModelId: id, upstreamModelId: id })));
   });
@@ -65,7 +60,7 @@ export async function registerOpenAIRoutes(app: FastifyInstance): Promise<void> 
       `POST ${req.url}`,
       ...summarizeHeaders(req.headers as Record<string, unknown>),
     ]);
-    const key = authenticateGatewayHeaders(req);
+    const key = requireGatewayKey(req);
     const body = ChatBody.parse(req.body);
     logIncomingChatBody(requestId, body);
     const req1: OpenAIChatRequest = body as never;
@@ -153,7 +148,7 @@ export async function registerOpenAIRoutes(app: FastifyInstance): Promise<void> 
       `POST ${req.url}`,
       ...summarizeHeaders(req.headers as Record<string, unknown>),
     ]);
-    const key = authenticateGatewayHeaders(req);
+    const key = requireGatewayKey(req);
     // v1 subset: accept Responses-style input, flatten to chat-completions messages.
     const body = ResponsesBody.parse(req.body);
     debugHttp(requestId, 'BODY SUMMARY', [
@@ -168,6 +163,7 @@ export async function registerOpenAIRoutes(app: FastifyInstance): Promise<void> 
       tools: flat.tools,
       stream: body.stream,
       reasoning_effort: body.reasoning?.effort,
+      max_completion_tokens: body.max_output_tokens,
     };
     const canonical = openAIToCanonical(chatBody);
     const ctx: GatewayContext = {
@@ -256,7 +252,7 @@ export function listRoutableModelIds(models: ModelRow[], key: AuthenticatedKey, 
   const modelIds = new Set(models.map((m) => m.id));
   const modelById = new Map(models.map((m) => [m.id, m.publicModelId]));
 
-  let combos = db.select().from(schema.combos).where(eq(schema.combos.enabled, true)).all();
+  let combos = db.select().from(schema.combos).where(eq(schema.combos.enabled, true)).all().filter(c => c.comboKind === 'standard');
   const members = combos.length > 0
     ? db.select().from(schema.comboMembers).where(inArray(schema.comboMembers.comboId, combos.map((c) => c.id))).all()
     : [];
@@ -283,19 +279,12 @@ export function listRoutableModelIds(models: ModelRow[], key: AuthenticatedKey, 
   const perms = db.select().from(schema.apiKeyModelPermissions).where(eq(schema.apiKeyModelPermissions.apiKeyId, key.id)).all();
   const allowModels = new Set(perms.filter((p) => p.targetKind === 'model').map((p) => p.targetId));
   const allowCombos = new Set(perms.filter((p) => p.targetKind === 'combo').map((p) => p.targetId));
+  const allowAliases = new Set(perms.filter((p) => p.targetKind === 'alias').map((p) => p.targetId));
   return ids.filter((id) =>
     models.some((m) => m.publicModelId === id && allowModels.has(m.id))
     || combos.some((c) => c.publicModelId === id && allowCombos.has(c.id))
-    || aliases.some((a) => a.alias === id && (a.targetKind === 'model' ? allowModels.has(a.targetId) : allowCombos.has(a.targetId))),
+    || aliases.some((a) => a.alias === id && (allowAliases.has(a.id) || (a.targetKind === 'model' ? allowModels.has(a.targetId) : allowCombos.has(a.targetId)))),
   );
-}
-
-function authenticateGatewayHeaders(req: { headers: Record<string, string | string[] | undefined> }): AuthenticatedKey {
-  const key = authenticateGatewayKey(req);
-  if (!key) throw new GatewayError('authentication_error', 'Missing API key', { status: 401 });
-  if (!key.enabled) throw new GatewayError('authentication_error', 'API key disabled', { status: 401 });
-  if (key.expiresAt && new Date(key.expiresAt).getTime() < Date.now()) throw new GatewayError('authentication_error', 'API key expired', { status: 401 });
-  return key;
 }
 
 function responsesInputToChat(input: unknown): { messages: OpenAIChatRequest['messages']; tools?: OpenAIChatRequest['tools'] } {

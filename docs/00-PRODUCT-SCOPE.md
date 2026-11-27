@@ -54,7 +54,11 @@ A provider has:
 - retry configuration
 - health status
 
-Provider slugs must be URL/model-ID safe and unique.
+Provider slugs must be URL/model-ID safe and unique after normalization. The
+`combo` prefix is reserved; existing public model prefixes left by older
+provider renames also remain reserved. Slug collisions return HTTP 409 with an
+available alternative. A provider slug can be changed only before importing any
+models; its protocol is immutable. Existing public model IDs are not rewritten.
 
 ### Models
 
@@ -144,7 +148,12 @@ coding -> combo/coding
 fast -> latedev/gpt-fast
 ```
 
-Aliases cannot shadow existing physical or combo public IDs.
+Aliases cannot shadow existing physical or combo public IDs or a combo's bare
+slug (which is also accepted by the resolver). The reverse checks apply to new
+model imports and combo creation/renames, including disabled targets. Existing
+legacy configurations retain their exact resolution order; new conflicts are
+rejected rather than silently overwriting a route. A batch model import is
+atomic, including when a collision occurs late in the batch.
 
 ### Request logs
 

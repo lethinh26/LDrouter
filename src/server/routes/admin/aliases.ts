@@ -8,6 +8,7 @@ import { requireAdminAuth } from '../../auth/middleware';
 import { recordAudit } from '../../db/repositories/audit';
 import { uuid, slugify } from '../../auth/ids';
 import { GatewayError } from '../../errors';
+import { assertRoutingNameFree } from '../../routing/namespace';
 
 const AliasCreate = z.object({
   alias: z.string().min(1).max(64),
@@ -21,16 +22,7 @@ const AliasUpdate = AliasCreate.partial().extend({ id: z.string() });
 type AliasTargetKind = z.infer<typeof AliasCreate>['targetKind'];
 
 function assertAliasAvailable(db: ReturnType<typeof getDb>, alias: string, excludeId?: string): void {
-  const existingAlias = db.select().from(schema.modelAliases).where(eq(schema.modelAliases.alias, alias)).get();
-  if (existingAlias && existingAlias.id !== excludeId) {
-    throw new GatewayError('invalid_request_error', 'Alias already in use', { status: 400 });
-  }
-
-  const existingModel = db.select().from(schema.models).where(eq(schema.models.publicModelId, alias)).get();
-  const existingCombo = db.select().from(schema.combos).where(eq(schema.combos.publicModelId, alias)).get();
-  if (existingModel || existingCombo) {
-    throw new GatewayError('invalid_request_error', 'Alias shadows an existing model or combo ID', { status: 400 });
-  }
+  assertRoutingNameFree(db, alias, 'alias', excludeId);
 }
 
 function assertAliasTargetExists(db: ReturnType<typeof getDb>, targetKind: AliasTargetKind, targetId: string): void {

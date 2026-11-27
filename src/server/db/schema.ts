@@ -137,6 +137,14 @@ export const providers = sqliteTable(
 // Models
 // ============================================================================
 
+// Compatible providers have no integration row. Keep protocol and credentials
+// in providers; the integration is keyed exclusively by the provider UUID.
+export const providerIntegrations = sqliteTable('provider_integrations', {
+  providerId: text('provider_id').primaryKey().notNull().references(() => providers.id, { onDelete: 'cascade' }),
+  providerKind: text('provider_kind', { enum: ['codex', 'claude_code'] }).notNull(),
+  authMode: text('auth_mode', { enum: ['api_key', 'client_oauth'] }).notNull(),
+});
+
 export const models = sqliteTable(
   'models',
   {
@@ -176,6 +184,7 @@ export const combos = sqliteTable(
     name: text('name').notNull(),
     slug: text('slug').notNull().unique(),
     publicModelId: text('public_model_id').notNull().unique(),
+    comboKind: text('combo_kind', { enum: ['standard', 'codex_native'] }).notNull().default('standard'),
     mode: text('mode', { enum: ['fallback'] }).notNull(),
     enabled: integer('enabled', { mode: 'boolean' }).notNull().notNull().default(true),
     maxTotalAttempts: integer('max_total_attempts').notNull().default(3),
@@ -310,6 +319,7 @@ export const apiKeys = sqliteTable(
     tpmLimit: integer('tpm_limit'),
     dailyTokenLimit: integer('daily_token_limit'),
     monthlyTokenLimit: integer('monthly_token_limit'),
+    totalTokenLimit: integer('total_token_limit'),
     maxConcurrent: integer('max_concurrent'),
     maxOutputTokensPerRequest: integer('max_output_tokens_per_request'),
     allowAllModels: integer('allow_all_models', { mode: 'boolean' }).notNull().notNull().default(false),
@@ -537,6 +547,7 @@ export const usageMonthly = sqliteTable(
   },
   (t) => ({
     pk: uniqueIndex('uniq_usage_month_key').on(t.month, t.apiKeyId),
+    keyIdx: index('idx_usage_month_key').on(t.apiKeyId),
   })
 );
 

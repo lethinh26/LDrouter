@@ -48,6 +48,16 @@ export function checkTpm(keyId: string, tpmLimit: number | null, tokensToConsume
   return { allowed: true };
 }
 
+/** Refund unused estimated tokens or carry debt for usage above the estimate. */
+export function reconcileTpm(keyId: string, tpmLimit: number | null, reserved: number, actual: number): void {
+  if (tpmLimit == null || tpmLimit <= 0) return;
+  const bucket = tpmBuckets.get(keyId);
+  if (!bucket) return;
+  const now = Date.now();
+  const refilled = Math.min(tpmLimit, bucket.tokens + Math.max(0, now - bucket.lastRefill) * tpmLimit / 60_000);
+  tpmBuckets.set(keyId, { tokens: Math.min(tpmLimit, refilled + reserved - actual), lastRefill: now });
+}
+
 export function acquireConcurrent(keyId: string, max: number | null): boolean {
   if (max == null || max <= 0) {
     concurrentCounters.set(keyId, (concurrentCounters.get(keyId) ?? 0) + 1);

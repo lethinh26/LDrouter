@@ -1,6 +1,6 @@
 // Unit tests: rate limit buckets.
 import { describe, expect, it } from 'vitest';
-import { checkRpm, checkTpm, acquireConcurrent, releaseConcurrent } from '../../src/server/routing/ratelimit';
+import { checkRpm, checkTpm, acquireConcurrent, releaseConcurrent, reconcileTpm } from '../../src/server/routing/ratelimit';
 
 describe('rate limits', () => {
   it('RPM bucket allows then denies', () => {
@@ -20,6 +20,15 @@ describe('rate limits', () => {
   it('TPM denies when over', () => {
     expect(checkTpm('k3', 10, 8).allowed).toBe(true);
     expect(checkTpm('k3', 10, 8).allowed).toBe(false);
+  });
+
+  it('reconciles unused reserved TPM and carries debt for larger actual usage', () => {
+    expect(checkTpm('refund', 10, 9).allowed).toBe(true);
+    reconcileTpm('refund', 10, 9, 2);
+    expect(checkTpm('refund', 10, 8).allowed).toBe(true);
+    expect(checkTpm('debt', 10, 5).allowed).toBe(true);
+    reconcileTpm('debt', 10, 5, 12);
+    expect(checkTpm('debt', 10, 1).allowed).toBe(false);
   });
 
   it('concurrency acquire/release', () => {

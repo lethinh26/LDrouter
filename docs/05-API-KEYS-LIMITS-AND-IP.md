@@ -2,7 +2,7 @@
 
 ## Key generation
 
-Every key begins with `ld-`.
+Automatically generated keys begin with `ld-`. An administrator may also provide a unique custom secret for compatibility; prefer generated high-entropy secrets.
 
 Use a cryptographically secure random generator with at least 256 bits of entropy. Recommended representation:
 
@@ -59,6 +59,8 @@ Never interpret an accidentally empty allowlist as unrestricted.
 
 If a combo is allowed, the key may use that combo but must not automatically gain direct access to each physical member unless those physical model IDs are also allowed. Internal combo execution is allowed because authorization was granted to the combo.
 
+An alias grant permits that alias, not direct access to its target. A grant on a model or combo also permits aliases pointing to that target. Listing models and counting tokens use the same authentication and scope checks.
+
 ## IP rules
 
 Support IPv4 and IPv6:
@@ -93,6 +95,7 @@ Per API key support:
 - tokens per minute (TPM)
 - daily token limit
 - monthly token limit
+- total lifetime token limit (input plus output, no periodic reset)
 - maximum concurrent in-flight requests
 - maximum output tokens per request
 
@@ -115,13 +118,15 @@ Because final output tokens are not known at admission time:
 - reconcile against actual usage after completion
 - choose behavior that cannot be trivially bypassed by omitting `max_tokens`
 
-Document the exact policy and test it.
+Admission estimates input from the serialized canonical messages, system instructions, tools and response format, at approximately four characters per token. For a key with any configured token limit, omitted output limits default to 1,024 tokens or the configured per-request output cap, whichever is smaller. Explicit `max_tokens`, `max_completion_tokens` and `max_output_tokens` are normalized and clamped to the key's output cap before upstream dispatch. The upstream must honor that cap. TPM reservations are reconciled against actual reported usage, with estimated usage when a successful generation does not report it.
 
-### Daily/monthly tokens
+### Daily/monthly/lifetime tokens
 
 Persist usage so process restarts do not erase period quotas.
 
 Avoid scanning the entire requests table on every request. Maintain or query indexed usage aggregates efficiently.
+
+Daily and monthly periods use UTC. Lifetime usage is the sum of all retained monthly aggregates, including usage recorded before the limit was configured. All three quotas reserve estimated capacity for in-flight requests in the single gateway process, and account for known usage across fallback attempts and cache hits. A request whose estimate exceeds the remaining budget is rejected before dispatch. Provider tokenization and reported usage can differ from admission estimates, so one admitted request may exceed the remaining quota; subsequent requests are blocked until sufficient capacity is available. Lifetime usage does not reset automatically. Clear a limit by setting it to null, not by deleting usage history.
 
 ### Concurrency
 
