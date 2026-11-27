@@ -43,7 +43,7 @@ interface ModelRow {
   discoveredCapabilities: Record<string, unknown> | null; maxContextTokens: number | null; maxOutputTokens: number | null;
 }
 interface Provider { id: string; name: string; slug: string; type: string; providerKind?: string; }
-interface Discovered { upstreamId: string; displayName: string; capabilities: Record<string, unknown>; alreadyImported: boolean; existingModelId: string | null; }
+interface Discovered { upstreamId: string; displayName: string; capabilities: Record<string, unknown>; alreadyImported: boolean; existingModelId: string | null; boundElsewhere?: boolean; boundConnectionName?: string | null; }
 interface TestResult {
   success: boolean;
   text: string;
@@ -340,7 +340,7 @@ export function Models() {
                     </div>
                     <div className="flex items-center gap-2">
                       <span className="text-sm text-muted-foreground">{filteredDiscovered.length} / {discovered.length} · {selected.size} selected</span>
-                      <Button variant="outline" size="sm" onClick={() => setSelected(new Set(filteredDiscovered.filter((d) => !d.alreadyImported).map((d) => d.upstreamId)))}>Select All (new)</Button>
+                      <Button variant="outline" size="sm" onClick={() => setSelected(new Set(filteredDiscovered.filter((d) => !d.alreadyImported && !d.boundElsewhere).map((d) => d.upstreamId)))}>Select All (new)</Button>
                       <Button variant="outline" size="sm" onClick={() => setSelected(new Set())}>Clear</Button>
                     </div>
                   </div>
@@ -352,6 +352,7 @@ export function Models() {
                         <label key={d.upstreamId} className="flex items-center gap-2 rounded p-1 text-sm hover:bg-accent">
                           <Checkbox
                             checked={selected.has(d.upstreamId)}
+                            disabled={d.boundElsewhere}
                             onCheckedChange={(c) => {
                               const next = new Set(selected);
                               if (c) next.add(d.upstreamId); else next.delete(d.upstreamId);
@@ -360,6 +361,7 @@ export function Models() {
                           />
                           <span className="font-mono text-xs">{d.upstreamId}</span>
                           {d.alreadyImported && <Badge variant="secondary">imported</Badge>}
+                          {d.boundElsewhere && <Badge variant="outline">Bound to {d.boundConnectionName ?? 'another connection'}</Badge>}
                         </label>
                       ))
                     )}

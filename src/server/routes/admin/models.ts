@@ -5,6 +5,7 @@ import { eq, sql } from 'drizzle-orm';
 import { getDb, getDatabaseEpoch, schema } from '../../db/index';
 import { assertRoutingNameFree } from '../../routing/namespace';
 import { providerIntegration } from '../../providers/integration';
+import { BUILTIN_PROVIDERS, assertBuiltinNamespaceAvailable, connectionNamespaceMode, providerPublicPrefix } from '../../providers/builtin';
 import { requireAdminAuth } from '../../auth/middleware';
 import { recordAudit } from '../../db/repositories/audit';
 import { uuid } from '../../auth/ids';
@@ -50,6 +51,7 @@ export async function registerModelRoutes(app: FastifyInstance): Promise<void> {
     let rows = db.select().from(schema.models).all();
     const providers = db.select().from(schema.providers).all();
     const providerMap = new Map(providers.map((p) => [p.id, p]));
+    const providerPrefixes = new Map(providers.map(p => [p.id, providerPublicPrefix(db, p)]));
     const integrationMap = new Map(db.select().from(schema.providerIntegrations).all().map(i => [i.providerId, i]));
     if (q.providerId) rows = rows.filter((r) => r.providerId === q.providerId);
     if (q.enabled !== undefined) rows = rows.filter((r) => r.enabled === (q.enabled === 'true'));
@@ -63,7 +65,7 @@ export async function registerModelRoutes(app: FastifyInstance): Promise<void> {
     const models = rows.map((m) => ({
       id: m.id,
       providerId: m.providerId,
-      providerSlug: providerMap.get(m.providerId)?.slug ?? '',
+      providerSlug: providerPrefixes.get(m.providerId) ?? '',
       providerType: providerMap.get(m.providerId)?.type ?? 'openai',
       providerKind: integrationMap.get(m.providerId)?.providerKind ?? 'compatible',
       publicModelId: m.publicModelId,
@@ -121,6 +123,13 @@ export async function registerModelRoutes(app: FastifyInstance): Promise<void> {
     if (!current || current.slug !== provider.slug || current.updatedAt !== provider.updatedAt) {
       throw new GatewayError('invalid_request_error', 'Provider changed during discovery; retry import', { status: 409 });
     }
+    const canonical = connectionNamespaceMode(tx, provider.id) === 'canonical';
+    const prefix = providerPublicPrefix(tx, current);
+    if (canonical) {
+      const builtin = BUILTIN_PROVIDERS.find(b => b.kind === integration.providerKind);
+      if (!builtin) throw new GatewayError('gateway_error', 'Invalid built-in connection', { status: 500 });
+      assertBuiltinNamespaceAvailable(tx, builtin);
+    }
     for (const upstreamId of new Set(body.modelIds)) {
       const existing = tx.select().from(schema.models).where(sql`provider_id = ${provider.id} AND upstream_model_id = ${upstreamId}`).get();
       const disc = discMap.get(upstreamId);
@@ -145,7 +154,10 @@ export async function registerModelRoutes(app: FastifyInstance): Promise<void> {
           .run();
         continue;
       }
-      const publicModelId = `${provider.slug}/${upstreamId}`;
+      const publicModelId = `${prefix}/${upstreamId}`;
+      if (canonical && tx.select({ id: schema.models.id }).from(schema.models).where(eq(schema.models.publicModelId, publicModelId)).get()) {
+        throw new GatewayError('invalid_request_error', 'This built-in model is already bound to another connection; its identity and permissions were not changed', { status: 409, code: 'builtin_model_bound' });
+      }
       assertRoutingNameFree(tx, publicModelId, 'model');
       tx.insert(schema.models).values({
         id: uuid(),

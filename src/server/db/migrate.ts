@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
-export const CURRENT_SCHEMA_VERSION = 18;
+export const CURRENT_SCHEMA_VERSION = 19;
 
 interface MigrationFile {
   version: number;
@@ -49,6 +49,7 @@ export function runMigrations(raw: Database.Database, log: Logger, migrationsDir
   if (latest >= 15 && applied.includes(15)) assertAdaptiveSchema(raw);
   if (latest >= 17 && applied.includes(17)) assertIntegrationSchema(raw, parsed[16]!);
   if (latest >= 18 && applied.includes(18)) assertComboKindSchema(raw, parsed[17]!);
+  if (latest >= 19 && applied.includes(19)) assertConnectionSchema(raw, parsed[18]!);
 
   for (const migration of parsed.slice(applied.length)) {
     log.info({ version: migration.version, name: migration.name }, 'applying migration');
@@ -69,6 +70,7 @@ export function runMigrations(raw: Database.Database, log: Logger, migrationsDir
       }
       if (migration.version === 17) assertIntegrationSchema(raw, migration);
       if (migration.version === 18) assertComboKindSchema(raw, migration);
+      if (migration.version === 19) assertConnectionSchema(raw, migration);
       raw.prepare('INSERT INTO schema_migrations (version, name) VALUES (?, ?)').run(migration.version, migration.name);
     });
     tx.immediate();
@@ -78,6 +80,29 @@ export function runMigrations(raw: Database.Database, log: Logger, migrationsDir
     ensureSettingsRow(raw, log);
     raw.prepare('UPDATE app_settings SET schema_version = ? WHERE id = 1').run(latest);
   })();
+}
+
+function assertConnectionSchema(raw: Database.Database, migration: MigrationFile): void {
+  const fail = () => new Error('Database schema is inconsistent with provider connections migration (0019)');
+  const normalize = (ddl: string) => ddl.replace(/\s+/g, ' ').replace(/;$/, '').trim();
+  for (const [type, name, pattern] of [
+    ['table', 'provider_connections', /^CREATE TABLE provider_connections \([\s\S]*?^\);/m],
+    ['trigger', 'provider_connection_default', /^CREATE TRIGGER provider_connection_default[\s\S]*?^END;/m],
+  ] as const) {
+    const expected = migration.sql.match(pattern)?.[0];
+    const actual = raw.prepare('SELECT sql FROM sqlite_schema WHERE type=? AND name=?').get(type, name) as { sql: string } | undefined;
+    if (!expected || !actual?.sql || normalize(expected) !== normalize(actual.sql)) throw fail();
+  }
+  if (raw.prepare('PRAGMA foreign_key_check(provider_connections)').all().length > 0 ||
+      raw.prepare(`SELECT 1 FROM provider_integrations i LEFT JOIN provider_connections c ON c.provider_id=i.provider_id
+        WHERE c.provider_id IS NULL OR c.namespace_mode NOT IN ('legacy','canonical') LIMIT 1`).get() ||
+      raw.prepare(`SELECT 1 FROM provider_connections c JOIN providers p ON p.id=c.provider_id
+        WHERE c.namespace_mode='canonical' AND p.slug IS NOT ('builtin-connection-' || p.id) LIMIT 1`).get() ||
+      raw.prepare(`SELECT count(*) FROM provider_connections c JOIN provider_integrations i ON i.provider_id=c.provider_id
+        WHERE c.namespace_mode='canonical' AND i.provider_kind='codex' HAVING count(*)>1`).get() ||
+      raw.prepare(`SELECT 1 FROM models m JOIN provider_connections c ON c.provider_id=m.provider_id
+        JOIN provider_integrations i ON i.provider_id=c.provider_id WHERE c.namespace_mode='canonical'
+        AND m.public_model_id IS NOT ((CASE i.provider_kind WHEN 'codex' THEN 'cx' ELSE 'cc' END) || '/' || m.upstream_model_id) LIMIT 1`).get()) throw fail();
 }
 
 function assertComboKindSchema(raw: Database.Database, migration: MigrationFile): void {

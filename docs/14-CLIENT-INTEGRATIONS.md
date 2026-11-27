@@ -1,5 +1,59 @@
 # Client integrations
 
+## Built-in Provider Center (schema 0019)
+
+The Providers page separates the immutable built-in registry from ordinary
+compatible providers. Codex has the canonical prefix `cx/`; Claude Code has
+`cc/`. They are visible even before any connection is configured. Custom
+providers cannot claim either slug or the reserved `builtin-connection-`
+storage prefix.
+
+Migration 0019 adds `provider_connections` linked to integration identities.
+Existing integration rows become **legacy connections** without changing any
+provider UUID, public model ID, model UUID, encrypted credential, combo member,
+alias, API-key permission or history. Legacy providers can still be managed in
+the built-in detail page, using their original prefixes. If a custom/legacy
+provider or historical model, combo or alias occupies a canonical namespace,
+the page reports the conflicts and prevents creation in that namespace. Existing
+routes remain usable. Resolve the conflicts explicitly; do not delete or
+rename a production route without first checking its clients and ACLs.
+
+New built-in connections have a fixed public prefix and an internal transport
+UUID. Each imported canonical model is **bound to the chosen connection**.
+If a second connection offers the same upstream model ID, discovery marks it
+as already bound elsewhere and import returns 409 instead of changing its
+credential or expanding existing permissions. The same provider may contain
+several independent authorized Claude API-key connections for different
+workspaces. The Codex client-owned authentication method has one canonical
+profile (older legacy profiles remain usable); the actual signed-in identity
+is chosen and held by the Codex client, not by the router.
+
+Manage connections from Providers → Built-in Providers → Manage. Rename,
+disable/enable, inspect model assignments, test Claude API-key connectivity,
+and copy client configuration. Disabling stops new dispatch to that connection
+without deleting the models, permissions or encrypted key. It is **not**
+upstream credential revocation. Canonical credential replacement is rejected
+to prevent silently changing the owner of a routed model; removing an empty
+connection is allowed by the compatibility API, while removing one with bound
+models is rejected. Retire or explicitly reconfigure those routes first.
+
+Connection usage is the gateway's existing daily provider aggregate keyed by
+the transport UUID: upstream attempts and input + output tokens. It survives
+compact export and raw request-log retention. It is not a subscription quota,
+remaining balance, unique client-request count, or billing data.
+
+The dedicated API is `GET /api/admin/builtin-providers` and
+`POST /api/admin/builtin-providers/:kind/connections`. Both require admin
+authentication; mutations also require CSRF. The existing provider APIs are
+retained for compatibility and for connection operations by UUID.
+
+The Provider Center does not implement browser-based subscription OAuth,
+callback-token collection, managed refresh, subscription account pools, or
+automatic cross-account switching. An approved upstream integration grant
+would be required for the applicable managed login flow. Do not interpret a
+saved Codex profile as a verified signed-in account or a newly saved Claude
+API key as verified until its connection test succeeds.
+
 ## Identity and credential boundary
 
 Migration 0017 introduces `provider_integrations`, keyed by the existing
@@ -29,7 +83,7 @@ signs in and refreshes its own credential. LateDev validates a separate
 ChatGPT-Account-ID to the fixed `https://chatgpt.com/backend-api/codex` origin.
 Redirects, stored client credentials, and custom upstream headers are forbidden.
 
-1. Create a Codex provider and import the exact upstream model IDs you are
+1. Create the Codex client profile in the built-in Provider Center and import the exact upstream model IDs you are
    authorized to use. The actual account catalog is fetched only with the
    signed-in client; admin discovery does not invent model availability.
 2. Create a gateway key limited to the desired models, native Codex combos or aliases. RPM, IP,
@@ -42,7 +96,7 @@ Redirects, stored client credentials, and custom upstream headers are forbidden.
 
 ```toml
 model_provider = "latedev-codex"
-model = "codex/YOUR_IMPORTED_MODEL"
+model = "cx/YOUR_IMPORTED_MODEL"
 
 [model_providers.latedev-codex]
 name = "LateDev Codex"
@@ -113,7 +167,7 @@ Claude subscription OAuth credentials. The Claude Code integration is therefore
 API-key based, for the key owner's own authorized use. There is no Claude
 subscription login button or account-pool implementation.
 
-1. Create a Claude Code provider using the authorized Anthropic API key. The
+1. Add a Claude Code connection in the built-in Provider Center using the authorized Anthropic API key. The
    destination is fixed to `https://api.anthropic.com`; arbitrary custom
    upstream headers and redirects are disabled. Existing Anthropic-compatible
    providers are unchanged.
@@ -125,7 +179,7 @@ subscription login button or account-pool implementation.
 ```sh
 export ANTHROPIC_BASE_URL="https://YOUR_GATEWAY"
 export ANTHROPIC_AUTH_TOKEN="YOUR_GATEWAY_API_KEY"
-export ANTHROPIC_MODEL="claude-code/YOUR_IMPORTED_MODEL"
+export ANTHROPIC_MODEL="cc/YOUR_IMPORTED_MODEL"
 ```
 
 For Windows PowerShell, set the same variables via `$env:NAME = "value"`.

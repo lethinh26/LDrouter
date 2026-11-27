@@ -6,6 +6,19 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Separate built-in Codex and Claude Code Provider Center, with fixed canonical model prefixes `cx/` and `cc/`, connection management, independent authorized Claude API-key connections and per-connection gateway usage.
+- Migration 0019 preserves existing integration identities as legacy connections without changing public model IDs, credentials or ACLs. New canonical imports bind a model to one selected connection; namespace conflicts and duplicate bindings fail closed.
+
+### Fixed
+
+- Reject native Codex routes on Anthropic token counting; revalidate native Claude token-count authorization and configuration after upstream I/O, and sanitize malformed upstream count responses.
+
+### Limitations
+
+- Codex authentication remains client-held; no managed subscription OAuth, callback import, upstream subscription quota lookup or cross-account rotation is implemented.
+
 ## [2.1.0] - 2026-11-27
 
 ### Added

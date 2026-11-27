@@ -55,10 +55,15 @@ A provider has:
 - health status
 
 Provider slugs must be URL/model-ID safe and unique after normalization. The
-`combo` prefix is reserved; existing public model prefixes left by older
+`combo`, `cx` and `cc` prefixes and the internal `builtin-connection-` prefix
+are reserved for new custom providers; existing public model prefixes left by older
 provider renames also remain reserved. Slug collisions return HTTP 409 with an
 available alternative. A provider slug can be changed only before importing any
 models; its protocol is immutable. Existing public model IDs are not rewritten.
+The built-in Provider Center groups client integrations by immutable identity
+and manages their connections separately from custom providers. See
+[client integrations](14-CLIENT-INTEGRATIONS.md) for the connection lifecycle,
+credential boundaries, canonical model bindings and collision handling.
 
 ### Models
 

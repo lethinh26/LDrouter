@@ -2,7 +2,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { sql, eq, inArray } from 'drizzle-orm';
-import { getDb, schema } from '../../db/index';
+import { getDb, getDatabaseEpoch, schema } from '../../db/index';
 import { requireAdminAuth } from '../../auth/middleware';
 import { recordAudit } from '../../db/repositories/audit';
 import { encryptSecret, decryptSecret, encryptCustomHeaders, decryptCustomHeaders, isMasterKeyConfigured } from '../../auth/crypto';
@@ -12,6 +12,8 @@ import { GatewayError } from '../../errors';
 import type { Provider } from '../../db/schema';
 import { probeProvider, discoverProviderModels, type DiscoveredModel, type ProbeResult } from '../../providers/index';
 import { CODEX_ORIGIN, CLAUDE_CODE_ORIGIN, providerIntegration } from '../../providers/integration';
+import { connectionNamespaceMode, providerPublicPrefix } from '../../providers/builtin';
+import { registerBuiltinProviderRoutes } from './builtin-providers';
 
 const ProviderCreate = z.object({
   // Providers use one encrypted API key and a compatible HTTP endpoint.
@@ -45,7 +47,7 @@ function providerToSummary(p: Provider, modelCount: number, recentErrorRate: num
   return {
     id: p.id,
     name: p.name,
-    slug: p.slug,
+    slug: providerPublicPrefix(getDb(), p),
     type: p.type,
     ...providerIntegration(p),
     baseUrl: p.baseUrl,
@@ -59,6 +61,7 @@ function providerToSummary(p: Provider, modelCount: number, recentErrorRate: num
 
 export async function registerProviderRoutes(app: FastifyInstance): Promise<void> {
   app.addHook('preHandler', requireAdminAuth);
+  await registerBuiltinProviderRoutes(app);
 
   app.get('/api/admin/providers', async () => {
     const db = getDb();
@@ -139,6 +142,10 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
     const p = db.select().from(schema.providers).where(eq(schema.providers.id, body.id)).get();
     if (!p) throw new GatewayError('invalid_request_error', 'Provider not found', { status: 404 });
     const integration = providerIntegration(p);
+    const canonical = connectionNamespaceMode(db, p.id) === 'canonical';
+    if (canonical && ((body.slug !== undefined && body.slug !== p.slug && body.slug !== providerPublicPrefix(db, p)) || body.apiKey !== undefined)) {
+      throw new GatewayError('invalid_request_error', 'Built-in namespace and connection credentials are immutable; add a separate connection instead', { status: 409, code: 'builtin_connection_locked' });
+    }
     if ((body.providerKind !== undefined && body.providerKind !== integration.providerKind) || (body.authMode !== undefined && body.authMode !== integration.authMode)) {
       throw new GatewayError('invalid_request_error', 'Provider integration and authentication mode are immutable; create a new provider', { status: 400 });
     }
@@ -154,7 +161,7 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
     }
     const update: Partial<typeof schema.providers.$inferInsert> = { updatedAt: new Date().toISOString() };
     if (body.name) update.name = body.name;
-    if (body.slug !== undefined && body.slug !== p.slug) {
+    if (!canonical && body.slug !== undefined && body.slug !== p.slug) {
       const slug = normalizeProviderSlug(body.slug);
       if (slug !== p.slug) {
         if (db.select({ id: schema.models.id }).from(schema.models).where(eq(schema.models.providerId, p.id)).get()) {
@@ -199,6 +206,9 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
     if (!p) throw new GatewayError('invalid_request_error', 'Provider not found', { status: 404 });
     const models = db.select({ id: schema.models.id }).from(schema.models).where(eq(schema.models.providerId, id)).all();
     const modelIds = models.map((model) => model.id);
+    if (modelIds.length > 0 && connectionNamespaceMode(db, p.id) === 'canonical') {
+      throw new GatewayError('invalid_request_error', 'Disable this connection instead; removing it would delete bound models and routing permissions', { status: 409, code: 'builtin_connection_in_use' });
+    }
     db.transaction((tx) => {
       if (modelIds.length > 0) {
         tx.delete(schema.comboMembers).where(inArray(schema.comboMembers.modelId, modelIds)).run();
@@ -219,6 +229,7 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
     const p = db.select().from(schema.providers).where(eq(schema.providers.id, id)).get();
     if (!p) throw new GatewayError('invalid_request_error', 'Provider not found', { status: 404 });
     if (providerIntegration(p).authMode === 'client_oauth') return { ok: false, detail: 'Connect with a signed-in Codex client to verify this provider. No server credential is stored.', latencyMs: 0 };
+    const epoch = getDatabaseEpoch();
     if (!p.encryptedApiKey || !p.apiKeyNonce) throw new GatewayError('invalid_request_error', 'Provider credentials are missing', { status: 501 });
     const apiKey = decryptSecret({ ciphertext: p.encryptedApiKey, nonce: p.apiKeyNonce, version: p.apiKeyVersion });
     const headers = decryptCustomHeaders(p.customHeadersEncrypted && p.customHeadersNonce ? { ciphertext: p.customHeadersEncrypted, nonce: p.customHeadersNonce, version: 1 } : null);
@@ -231,6 +242,10 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
       connectTimeoutMs: p.connectTimeoutMs,
       totalTimeoutMs: Math.min(p.totalTimeoutMs, 20000),
     } as never);
+    const current = epoch === getDatabaseEpoch() ? getDb().select().from(schema.providers).where(eq(schema.providers.id, id)).get() : undefined;
+    if (!current || current.updatedAt !== p.updatedAt || current.encryptedApiKey !== p.encryptedApiKey || current.apiKeyNonce !== p.apiKeyNonce || current.enabled !== p.enabled) {
+      throw new GatewayError('invalid_request_error', 'Connection changed during verification; retry the test', { status: 409 });
+    }
     if (result.ok) {
       db.update(schema.providers).set({ healthState: 'healthy', updatedAt: new Date().toISOString() }).where(eq(schema.providers.id, id)).run();
     } else {
@@ -246,6 +261,7 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
     const p = db.select().from(schema.providers).where(eq(schema.providers.id, id)).get();
     if (!p) throw new GatewayError('invalid_request_error', 'Provider not found', { status: 404 });
     if (providerIntegration(p).authMode === 'client_oauth') throw new GatewayError('invalid_request_error', 'Codex discovery requires the signed-in client. Import approved model IDs manually, then use the authenticated client catalog.', { status: 400, code: 'client_catalog_required' });
+    const epoch = getDatabaseEpoch();
     let discovered: DiscoveredModel[];
     if (!p.encryptedApiKey || !p.apiKeyNonce) throw new GatewayError('invalid_request_error', 'Provider credentials are missing', { status: 501 });
     const apiKey = decryptSecret({ ciphertext: p.encryptedApiKey, nonce: p.apiKeyNonce, version: p.apiKeyVersion });
@@ -259,17 +275,32 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
       connectTimeoutMs: 5000,
       totalTimeoutMs: 30000,
     } as never);
+    const current = epoch === getDatabaseEpoch() ? getDb().select().from(schema.providers).where(eq(schema.providers.id, id)).get() : undefined;
+    if (!current || current.updatedAt !== p.updatedAt || current.encryptedApiKey !== p.encryptedApiKey || current.apiKeyNonce !== p.apiKeyNonce || current.enabled !== p.enabled) {
+      throw new GatewayError('invalid_request_error', 'Connection changed during discovery; retry', { status: 409 });
+    }
     const existing = db
       .select()
       .from(schema.models)
       .where(eq(schema.models.providerId, p.id))
       .all();
     const existingMap = new Map(existing.map((m) => [m.upstreamModelId, m]));
-    const enriched = discovered.map((d) => ({
+    const canonical = connectionNamespaceMode(db, id) === 'canonical';
+    const prefix = providerPublicPrefix(db, current);
+    const allModels = canonical ? db.select({ publicModelId: schema.models.publicModelId, providerId: schema.models.providerId }).from(schema.models).all() : [];
+    const ownerMap = new Map(allModels.map(m => [m.publicModelId, m.providerId]));
+    const names = canonical ? new Map(db.select({ id: schema.providers.id, name: schema.providers.name }).from(schema.providers).all().map(row => [row.id, row.name])) : new Map<string, string>();
+    const enriched = discovered.map((d) => {
+      const owner = ownerMap.get(prefix + '/' + d.upstreamId);
+      const boundElsewhere = owner !== undefined && owner !== id;
+      return {
       ...d,
       alreadyImported: existingMap.has(d.upstreamId),
       existingModelId: existingMap.get(d.upstreamId)?.id ?? null,
-    }));
+      boundElsewhere,
+      boundConnectionName: boundElsewhere ? names.get(owner) ?? null : null,
+      };
+    });
     recordAudit({ action: 'provider.discover', success: true, targetType: 'provider', targetId: id, targetName: p.name, ip: req.ip, metadata: { count: discovered.length } });
     return { models: enriched };
   });

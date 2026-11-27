@@ -145,6 +145,11 @@ export const providerIntegrations = sqliteTable('provider_integrations', {
   authMode: text('auth_mode', { enum: ['api_key', 'client_oauth'] }).notNull(),
 });
 
+export const providerConnections = sqliteTable('provider_connections', {
+  providerId: text('provider_id').primaryKey().notNull().references(() => providerIntegrations.providerId, { onDelete: 'cascade' }),
+  namespaceMode: text('namespace_mode', { enum: ['legacy', 'canonical'] }).notNull().default('legacy'),
+});
+
 export const models = sqliteTable(
   'models',
   {

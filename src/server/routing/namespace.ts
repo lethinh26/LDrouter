@@ -2,6 +2,7 @@
 import { eq, sql } from 'drizzle-orm';
 import { getDb, schema } from '../db/index';
 import { GatewayError } from '../errors';
+import { isBuiltinSlugReserved } from '../providers/builtin';
 
 type NamespaceDb = Pick<ReturnType<typeof getDb>, 'select'>;
 
@@ -12,7 +13,7 @@ export function normalizeProviderSlug(value: string): string {
 }
 
 function providerSlugTaken(db: NamespaceDb, slug: string, excludeId?: string): boolean {
-  if (slug === 'combo') return true;
+  if (slug === 'combo' || isBuiltinSlugReserved(slug)) return true;
   const owner = db.select({ id: schema.providers.id }).from(schema.providers).where(eq(schema.providers.slug, slug)).get();
   if (owner && owner.id !== excludeId) return true;
   // Older versions allowed renaming a provider without renaming its existing
@@ -22,7 +23,7 @@ function providerSlugTaken(db: NamespaceDb, slug: string, excludeId?: string): b
 
 export function assertProviderSlugFree(db: NamespaceDb, slug: string, excludeId?: string): void {
   if (!providerSlugTaken(db, slug, excludeId)) return;
-  const base = slug === 'combo' ? 'provider' : slug;
+  const base = slug === 'combo' || slug.startsWith('builtin-connection-') ? 'provider' : slug;
   let suggested = `${base.slice(0, 58).replace(/-+$/, '')}-oauth`;
   for (let n = 2; providerSlugTaken(db, suggested, excludeId); n++) {
     const suffix = `-${n}`;

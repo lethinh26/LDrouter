@@ -3,9 +3,9 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { eq } from 'drizzle-orm';
-import { getDb, schema } from '../../db';
-import { requireGatewayKey, keyAllowedForTarget } from '../../auth/api-key';
-import { resolveRequestedModel } from '../../routing/resolver';
+import { getDb, getDatabaseEpoch, schema } from '../../db/index';
+import { authenticateGatewayKey, requireGatewayKey, keyAllowedForTarget, keyIsActive, keyIpAllowed } from '../../auth/api-key';
+import { resolveRequestedModel, unwrapAlias } from '../../routing/resolver';
 import { resolveClientIp } from '../../util/client-ip';
 import { anthropicToCanonical, type AnthropicRequest } from '../../protocols/anthropic';
 import { GatewayError, toAnthropicError, outcomeError } from '../../errors';
@@ -128,23 +128,64 @@ export async function registerAnthropicRoutes(app: FastifyInstance): Promise<voi
     const body = CountTokensBody.parse(req.body);
     const target = resolveRequestedModel(body.model);
     if (!keyAllowedForTarget(key, target)) throw new GatewayError('permission_error', 'Model not permitted for this API key', { status: 403 });
-    const resolved = target.kind === 'alias' ? target.resolved : target;
+    const resolved = unwrapAlias(target);
+    const db = getDb();
+    if (resolved.kind === 'combo') {
+      const combo = db.select().from(schema.combos).where(eq(schema.combos.id, resolved.comboId)).get();
+      if (combo?.comboKind === 'codex_native') throw new GatewayError('authentication_error', 'Use the dedicated Codex gateway with the signed-in client credential', { status: 401, code: 'codex_client_auth_required' });
+    }
     if (resolved.kind === 'model') {
-      const db = getDb();
       const model = db.select().from(schema.models).where(eq(schema.models.id, resolved.modelId)).get();
       const provider = model && db.select().from(schema.providers).where(eq(schema.providers.id, model.providerId)).get();
-      if (model && provider && providerIntegration(provider).providerKind === 'claude_code') {
+      const integration = provider && providerIntegration(provider);
+      if (integration?.authMode === 'client_oauth') throw new GatewayError('authentication_error', 'Use the dedicated Codex gateway with the signed-in client credential', { status: 401, code: 'codex_client_auth_required' });
+      if (model && provider && integration?.providerKind === 'claude_code') {
         if (!model.enabled || !model.upstreamAvailable || !provider.enabled) throw new GatewayError('upstream_unavailable', 'Claude model is unavailable', { status: 503 });
         if (!checkRpm(key.id, key.rpmLimit).allowed) throw new GatewayError('rate_limit_error', 'Rate limit exceeded (RPM)', { status: 429 });
         if (!acquireConcurrent(key.id, key.maxConcurrent)) throw new GatewayError('rate_limit_error', 'Too many concurrent requests', { status: 429 });
         try {
+          const epoch = getDatabaseEpoch();
+          const clientIp = resolveClientIp(req);
           const cfg = providerToUpstreamConfig(provider);
           if (!cfg.apiKey || !/^sk-ant-api[A-Za-z0-9_-]+$/.test(cfg.apiKey)) throw new GatewayError('authentication_error', 'Claude Code requires an Anthropic API key', { status: 400 });
           const payload: Record<string, unknown> = { ...body, model: model.upstreamModelId };
           delete payload.stream; delete payload.max_tokens;
           const call = await callUpstreamNonStreaming({ ...cfg, nativeClaude: true, customHeaders: { 'anthropic-version': '2023-06-01', ...nativeHeaders(req.headers) } }, 'https://api.anthropic.com/v1/messages/count_tokens', payload, String(req.id));
+          // Never release an upstream result to a revoked caller or into a new
+          // database epoch. Reauthenticate without touching lastUsedAt, and
+          // resolve the original public name rather than trusting a stale ACL.
+          if (epoch !== getDatabaseEpoch()) throw new GatewayError('permission_error', 'Database changed during token count', { status: 409, code: 'database_changed' });
+          const revoked = new GatewayError('permission_error', 'Gateway credential no longer permitted', { status: 403 });
+          let currentKey: ReturnType<typeof authenticateGatewayKey>;
+          try { currentKey = authenticateGatewayKey(req); }
+          catch (error) {
+            if (error instanceof GatewayError && error.type === 'authentication_error') throw revoked;
+            throw error;
+          }
+          if (!currentKey || currentKey.id !== key.id || !keyIsActive(currentKey) || !keyIpAllowed(key.id, clientIp)) throw revoked;
+          const changed = new GatewayError('permission_error', 'Claude token count target changed during request', { status: 409 });
+          let currentTarget: ReturnType<typeof resolveRequestedModel>;
+          try { currentTarget = resolveRequestedModel(body.model); }
+          catch (error) {
+            if (error instanceof GatewayError && error.type === 'model_not_found') throw changed;
+            throw error;
+          }
+          const currentResolved = unwrapAlias(currentTarget);
+          if (currentTarget.kind !== target.kind || (target.kind === 'alias' && (currentTarget.kind !== 'alias' || currentTarget.aliasId !== target.aliasId)) ||
+              currentResolved.kind !== 'model' || currentResolved.modelId !== model.id || currentResolved.publicModelId !== resolved.publicModelId) throw changed;
+          if (!keyAllowedForTarget(currentKey, currentTarget)) throw revoked;
+          const currentDb = getDb();
+          const currentModel = currentDb.select().from(schema.models).where(eq(schema.models.id, model.id)).get();
+          const currentProvider = currentDb.select().from(schema.providers).where(eq(schema.providers.id, provider.id)).get();
+          if (!currentModel || !currentProvider || currentModel.providerId !== provider.id || currentModel.upstreamModelId !== model.upstreamModelId ||
+              currentModel.createdAt !== model.createdAt || currentProvider.createdAt !== provider.createdAt ||
+              currentProvider.encryptedApiKey !== provider.encryptedApiKey || currentProvider.apiKeyNonce !== provider.apiKeyNonce || currentProvider.apiKeyVersion !== provider.apiKeyVersion ||
+              currentProvider.type !== provider.type || currentProvider.baseUrl !== provider.baseUrl || providerIntegration(currentProvider).providerKind !== 'claude_code') throw changed;
+          if (!currentModel.enabled || !currentModel.upstreamAvailable || !currentProvider.enabled) throw new GatewayError('upstream_unavailable', 'Claude model is unavailable', { status: 503 });
           if (!call.ok) throw upstreamHttpError(call.status, '', { status: call.status, retryAfterMs: retryAfterMs(call.headers['retry-after']) });
-          const result = z.object({ input_tokens: z.number().int().nonnegative() }).parse(JSON.parse(call.text));
+          let result: { input_tokens: number };
+          try { result = z.object({ input_tokens: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER) }).parse(JSON.parse(call.text)); }
+          catch { throw new GatewayError('upstream_error', 'Invalid Claude token count response', { status: 502, code: 'upstream_bad_response' }); }
           return reply.send(result);
         } finally { releaseConcurrent(key.id); }
       }

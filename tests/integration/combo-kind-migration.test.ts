@@ -29,7 +29,7 @@ describe('combo kind migration 0018', () => {
       const before = db.prepare('SELECT * FROM combos').get();
       const members = db.prepare('SELECT * FROM combo_members').all();
       runMigrations(db, MIGRATION_LOG, MIGRATIONS_DIR, CURRENT_SCHEMA_VERSION);
-      expect(CURRENT_SCHEMA_VERSION).toBe(18);
+      expect(CURRENT_SCHEMA_VERSION).toBeGreaterThanOrEqual(18);
       expect(db.prepare('SELECT * FROM combos').get()).toEqual({ ...(before as object), combo_kind: 'standard' });
       expect(db.prepare('SELECT * FROM combo_members').all()).toEqual(members);
       native(db);

@@ -65,6 +65,7 @@ def smoke(base, upstream):
         browser = p.chromium.launch()
         page = browser.new_page(base_url=base, viewport={"width": 1440, "height": 1200},
                                 reduced_motion="reduce")
+        page.context.grant_permissions(["clipboard-read", "clipboard-write"], origin=base)
         page.set_default_timeout(15000)
 
         def get(path, headers=None):
@@ -72,9 +73,12 @@ def smoke(base, upstream):
             assert response.ok, f"GET {path}: {response.status}"
             return response.json()
 
-        def admin_post(path, data):
+        def admin_request(method, path, data):
             csrf = get("/api/admin/csrf")["csrfToken"]
-            response = page.request.post(path, data=data, headers={"x-csrf-token": csrf})
+            return page.request.fetch(path, method=method, data=data, headers={"x-csrf-token": csrf})
+
+        def admin_post(path, data):
+            response = admin_request("POST", path, data)
             assert response.ok, f"POST {path}: {response.status}"
             return response.json()
 
@@ -83,6 +87,12 @@ def smoke(base, upstream):
 
         def models():
             return {row["publicModelId"]: row for row in get("/api/admin/models")["models"]}
+
+        def builtins():
+            return {row["kind"]: row for row in get("/api/admin/builtin-providers")["providers"]}
+
+        def connection(kind, connection_id):
+            return next(c for c in builtins()[kind]["connections"] if c["id"] == connection_id)
 
         def choose(dialog, option):
             dialog.get_by_role("combobox").click()
@@ -105,6 +115,144 @@ def smoke(base, upstream):
             response = page.request.post(path, data=credentials)
             assert response.ok, f"POST {path}: {response.status}"
         page.goto("/providers")
+        builtin = page.get_by_role("region", name="Built-in Providers")
+        custom = page.get_by_role("region", name="Custom Providers")
+        expect(builtin.get_by_role("button", name="Manage Codex", exact=True)).to_be_enabled()
+        expect(builtin.get_by_role("button", name="Manage Claude Code", exact=True)).to_be_enabled()
+        expect(builtin.get_by_text("cx/", exact=True)).to_be_visible()
+        expect(builtin.get_by_text("cc/", exact=True)).to_be_visible()
+        expect(custom.get_by_text("No custom providers yet.")).to_be_visible()
+        fresh = builtins()
+        assert set(fresh) == {"codex", "claude_code"}
+        for kind, name, slug, mode in (("codex", "Codex", "cx", "client_oauth"),
+                                       ("claude_code", "Claude Code", "cc", "api_key")):
+            entry = fresh[kind]
+            assert (entry["name"], entry["slug"], entry["authMode"]) == (name, slug, mode)
+            assert entry["namespaceAvailable"] and not entry["conflicts"] and not entry["connections"]
+        assert not providers() and not models()
+
+        # Exercise real browser creation on a fresh database. Codex profiles
+        # are not stored accounts: no token/key/base URL/custom-header fields.
+        def add_connection(kind, name, api_key=None):
+            codex = kind == "codex"
+            builtin.get_by_role("button", name="Add profile" if codex else "Add connection", exact=True).click()
+            dialog = page.get_by_role("dialog", name="Create Codex profile" if codex else "Add Claude Code connection")
+            dialog.get_by_label("Name", exact=True).fill(name)
+            expect(dialog.get_by_label("Base URL", exact=True)).to_have_count(0)
+            expect(dialog.get_by_label("Custom headers (JSON)")).to_have_count(0)
+            create = dialog.get_by_role("button", name="Create", exact=True)
+            if codex:
+                expect(dialog.locator("input[type=password]")).to_have_count(0)
+                expect(dialog.get_by_label("Anthropic API key", exact=True)).to_have_count(0)
+            else:
+                key_input = dialog.get_by_label("Anthropic API key", exact=True)
+                expect(key_input).to_have_attribute("type", "password")
+                key_input.fill("sk-ant-oat-fixture-not-supported")
+                expect(create).to_be_disabled()
+                key_input.fill(api_key)
+            with page.expect_response(lambda r: r.url.endswith(f"/api/admin/builtin-providers/{kind}/connections")
+                                      and r.request.method == "POST") as created:
+                create.click()
+            assert created.value.ok
+            result = created.value.json()
+            assert result["slug"] == ("cx" if codex else "cc")
+            expect(dialog).not_to_be_visible()
+            expect(builtin.get_by_label("Connection name", exact=True)).to_have_value(name)
+            expect(builtin.get_by_role("button", name="Disable connection", exact=True)).to_be_enabled()
+            current = connection(kind, result["id"])
+            assert current["namespaceMode"] == "canonical" and current["slug"] == result["slug"]
+            assert current["enabled"] and current["modelCount"] == 0
+            assert current["usage"] == {"requests": 0, "totalTokens": 0}
+            assert providers()[name]["id"] == result["id"]
+            assert providers()[name]["baseUrl"] == ("https://chatgpt.com" if codex else "https://api.anthropic.com")
+            return result["id"]
+
+        def manage_connection(name):
+            builtin.get_by_role("button", name=f"Manage connection {name}", exact=True).click()
+            expect(builtin.get_by_label("Connection name", exact=True)).to_have_value(name)
+
+        def rename_connection(kind, connection_id, name):
+            builtin.get_by_label("Connection name", exact=True).fill(name)
+            builtin.get_by_role("button", name="Save name", exact=True).click()
+            expect(builtin.get_by_role("button", name="Save name", exact=True)).to_be_disabled()
+            expect(builtin.get_by_text(name, exact=True).first).to_be_visible()
+            assert connection(kind, connection_id)["name"] == name
+
+        def disable_connection(kind, connection_id):
+            builtin.get_by_role("button", name="Disable connection", exact=True).click()
+            alert = page.get_by_role("alertdialog", name="Disable connection?")
+            expect(alert).to_be_visible()
+            alert.get_by_role("button", name="Disable", exact=True).click()
+            expect(alert).not_to_be_visible()
+            expect(builtin.get_by_role("button", name="Enable connection", exact=True)).to_be_enabled()
+            expect(builtin.get_by_text("Connection status", exact=True).locator("..").get_by_text("Disabled", exact=True)).to_be_visible()
+            expect(builtin.get_by_role("button", name="Test connection", exact=True)).to_be_disabled()
+            assert not connection(kind, connection_id)["enabled"]
+
+        def enable_connection(kind, connection_id):
+            builtin.get_by_role("button", name="Enable connection", exact=True).click()
+            expect(builtin.get_by_role("button", name="Disable connection", exact=True)).to_be_enabled()
+            assert connection(kind, connection_id)["enabled"]
+
+        def check_config(kind, prefix, copy=False):
+            config = builtin.locator("pre")
+            if kind == "codex":
+                expect(config).to_contain_text(f'model = "{prefix}/YOUR_IMPORTED_MODEL"')
+                expect(config).to_contain_text(base + "/backend-api/codex")
+                expect(config).to_contain_text(base + "/backend-api/codex/models")
+                expect(config).to_contain_text('env_http_headers = { "X-API-Key" = "LATEDEV_API_KEY" }')
+            else:
+                expect(config).to_contain_text("ANTHROPIC_BASE_URL=" + base)
+                expect(config).to_contain_text(f"ANTHROPIC_MODEL={prefix}/YOUR_IMPORTED_MODEL")
+                expect(config).to_contain_text("ANTHROPIC_AUTH_TOKEN=YOUR_GATEWAY_API_KEY")
+            if copy:
+                builtin.get_by_role("button", name="Copy configuration", exact=True).click()
+                expect(page.get_by_text("Configuration copied", exact=True).last).to_be_visible()
+                page.wait_for_function("async expected => await navigator.clipboard.readText() === expected",
+                                       arg=config.inner_text())
+
+        builtin.get_by_role("button", name="Manage Codex", exact=True).click()
+        expect(builtin.get_by_text("No profile configured.", exact=True)).to_be_visible()
+        canonical_codex_id = add_connection("codex", "Canonical Codex fixture")
+        expect(builtin.get_by_role("button", name="Test connection", exact=True)).to_be_disabled()
+        expect(builtin.get_by_text("Client account unverified", exact=True)).to_be_visible()
+        check_config("codex", "cx", copy=True)
+        canonical_codex_name = "Canonical Codex renamed"
+        rename_connection("codex", canonical_codex_id, canonical_codex_name)
+        disable_connection("codex", canonical_codex_id)
+        builtin.get_by_role("button", name="Back to Codex", exact=True).click()
+        expect(builtin.get_by_role("button", name="Add profile", exact=True)).to_be_disabled()
+        manage_connection(canonical_codex_name)
+        enable_connection("codex", canonical_codex_id)
+        check_config("codex", "cx")
+        assert admin_request("POST", "/api/admin/builtin-providers/codex/connections", {"name": "Duplicate canonical profile"}).status == 409
+        assert admin_request("PATCH", "/api/admin/providers", {"id": canonical_codex_id, "slug": "changed-cx"}).status == 409
+        builtin.get_by_role("button", name="Back to Codex", exact=True).click()
+        builtin.get_by_role("button", name="All built-in providers", exact=True).click()
+
+        builtin.get_by_role("button", name="Manage Claude Code", exact=True).click()
+        expect(builtin.get_by_text("No connections configured.", exact=True)).to_be_visible()
+        claude_key_a, claude_key_b = "sk-ant-api-ci-first-fixture", "sk-ant-api-ci-second-fixture"
+        canonical_claude_a = add_connection("claude_code", "Canonical Claude first", claude_key_a)
+        check_config("claude_code", "cc", copy=True)
+        expect(builtin.locator("input[type=password]")).to_have_count(0)
+        builtin.get_by_role("button", name="Back to Claude Code", exact=True).click()
+        canonical_claude_b = add_connection("claude_code", "Canonical Claude second", claude_key_b)
+        assert canonical_claude_a != canonical_claude_b
+        check_config("claude_code", "cc")
+        disable_connection("claude_code", canonical_claude_b)
+        assert connection("claude_code", canonical_claude_a)["enabled"]
+        enable_connection("claude_code", canonical_claude_b)
+        assert len(builtins()["claude_code"]["connections"]) == 2
+        for key_value in (claude_key_a, claude_key_b):
+            assert key_value not in json.dumps(builtins()) and key_value not in json.dumps(providers())
+            assert key_value not in builtin.inner_text()
+        # These synthetic keys are intentionally never used for discovery or
+        # Test connection. All network-backed generation remains loopback.
+        builtin.get_by_role("button", name="Back to Claude Code", exact=True).click()
+        builtin.get_by_role("button", name="All built-in providers", exact=True).click()
+        expect(custom.get_by_text("No custom providers yet.")).to_be_visible()
+
         dialog = new_provider("Compatible fixture", "codex")
         dialog.get_by_label("Base URL", exact=True).fill(upstream)
         dialog.get_by_label("API key", exact=True).fill("fixture-compatible-key")
@@ -117,63 +265,57 @@ def smoke(base, upstream):
         compatible_id = providers()["Compatible fixture"]["id"]
         assert providers()["Compatible fixture"]["providerKind"] == "compatible"
 
-        # A pre-existing compatible provider using the codex prefix keeps its
-        # identity; the new integration must explicitly choose another slug.
-        dialog = new_provider("Native Codex fixture", " CODEX ")
-        choose(dialog, "Codex (client sign-in)")
-        expect(dialog.get_by_label("Base URL", exact=True)).to_be_disabled()
-        expect(dialog.get_by_label("API key", exact=True)).to_have_count(0)
-        expect(dialog.get_by_label("Custom headers (JSON)")).to_have_count(0)
-        with page.expect_response(lambda r: r.url.endswith("/api/admin/providers")
-                                  and r.request.method == "POST") as conflict:
-            dialog.get_by_role("button", name="Create", exact=True).click()
-        assert conflict.value.status == 409
-        expect(page.get_by_text("Try 'codex-oauth'", exact=False)).to_be_visible()
-        expect(dialog).to_be_visible()
-        dialog.get_by_label("Slug (optional)", exact=True).fill("codex-oauth")
-        dialog.get_by_role("button", name="Create", exact=True).click()
-        expect(dialog).not_to_be_visible()
+        # Keep the old namespace collision/rename coverage using the legacy
+        # creation API; the custom provider form no longer creates native kinds.
+        legacy_codex = {"name": "Native Codex fixture", "slug": " CODEX ",
+                        "type": "openai", "providerKind": "codex"}
+        conflict = admin_request("POST", "/api/admin/providers", legacy_codex)
+        assert conflict.status == 409
+        assert "Try 'codex-oauth'" in conflict.json()["error"]["message"]
+        assert "Native Codex fixture" not in providers()
+        legacy_codex["slug"] = "codex-oauth"
+        legacy = admin_post("/api/admin/providers", legacy_codex)
         native = providers()["Native Codex fixture"]
         assert native["providerKind"] == "codex" and native["authMode"] == "client_oauth"
+        assert native["id"] == legacy["id"] and native["baseUrl"] == "https://chatgpt.com"
         assert providers()["Compatible fixture"]["id"] == compatible_id
-        row = page.get_by_role("row").filter(has_text="Native Codex fixture")
-        expect(row.get_by_title("Test from signed-in Codex client")).to_be_disabled()
-
-        dialog = open_edit("Native Codex fixture")
-        expect(dialog.get_by_role("combobox")).to_be_disabled()
-        expect(dialog.locator("input[type=password]")).to_have_count(0)
-        expect(dialog.get_by_label("Slug", exact=True)).to_be_enabled()
-        dialog.get_by_label("Slug", exact=True).fill("coding-ci")
-        dialog.get_by_role("button", name="Save changes", exact=True).click()
-        expect(dialog).not_to_be_visible()
-        expect(row.get_by_text("coding-ci", exact=True)).to_be_visible()
+        assert connection("codex", native["id"])["namespaceMode"] == "legacy"
+        for forbidden in ({"providerKind": "compatible"}, {"apiKey": "fixture-not-stored"},
+                          {"baseUrl": upstream}, {"customHeaders": {"X-Fixture": "invalid"}}):
+            assert admin_request("PATCH", "/api/admin/providers", {"id": native["id"], **forbidden}).status == 400
+        assert admin_request("PATCH", "/api/admin/providers", {"id": native["id"], "slug": "coding-ci"}).ok
         assert providers()["Native Codex fixture"]["id"] == native["id"]
-        dialog = open_edit("Native Codex fixture")
-        config = dialog.locator("pre")
-        expect(config).to_contain_text('model = "coding-ci/YOUR_IMPORTED_MODEL"')
-        expect(config).to_contain_text(base + "/backend-api/codex")
-        expect(config).to_contain_text('env_http_headers = { "X-API-Key" = "LATEDEV_API_KEY" }')
-        dialog.get_by_role("button", name="Cancel", exact=True).click()
+        assert providers()["Native Codex fixture"]["slug"] == "coding-ci"
 
-        # Create the Claude Code config only: its origin is fixed and this
-        # test intentionally never discovers or tests an external endpoint.
-        dialog = new_provider("Claude Code fixture", "claude-ci")
-        choose(dialog, "Claude Code (API key)")
-        expect(dialog.get_by_label("Base URL", exact=True)).to_have_value("https://api.anthropic.com")
-        expect(dialog.get_by_label("Base URL", exact=True)).to_be_disabled()
-        expect(dialog.get_by_label("Custom headers (JSON)")).to_have_count(0)
-        dialog.get_by_label("API key", exact=True).fill("sk-ant-api-fixture-only")
-        dialog.get_by_role("button", name="Create", exact=True).click()
-        expect(dialog).not_to_be_visible()
+        # Retain a legacy Claude Code config without calling its fixed origin.
+        admin_post("/api/admin/providers", {"name": "Claude Code fixture", "slug": "claude-ci",
+                   "type": "anthropic", "providerKind": "claude_code", "apiKey": "sk-ant-api-fixture-only"})
         claude = providers()["Claude Code fixture"]
         assert claude["providerKind"] == "claude_code" and claude["authMode"] == "api_key"
-        dialog = open_edit("Claude Code fixture")
-        expect(dialog.locator("input[type=password]")).to_have_value("")
-        expect(dialog.locator("pre")).to_contain_text("ANTHROPIC_BASE_URL=" + base)
-        expect(dialog.locator("pre")).to_contain_text("ANTHROPIC_MODEL=claude-ci/YOUR_IMPORTED_MODEL")
-        dialog.get_by_role("button", name="Cancel", exact=True).click()
+        assert claude["baseUrl"] == "https://api.anthropic.com"
+        assert connection("claude_code", claude["id"])["namespaceMode"] == "legacy"
+        for forbidden in ({"baseUrl": upstream}, {"customHeaders": {"X-Fixture": "invalid"}},
+                          {"apiKey": "sk-ant-oat-fixture-not-supported"}):
+            assert admin_request("PATCH", "/api/admin/providers", {"id": claude["id"], **forbidden}).status == 400
+        page.goto("/providers")
+        expect(custom.get_by_role("row").filter(has_text="Native Codex fixture")).to_have_count(0)
+        expect(custom.get_by_role("row").filter(has_text="Claude Code fixture")).to_have_count(0)
+        builtin.get_by_role("button", name="Manage Codex", exact=True).click()
+        manage_connection("Native Codex fixture")
+        expect(builtin.get_by_text("Legacy", exact=True)).to_be_visible()
+        expect(builtin.get_by_title("Test from signed-in Codex client")).to_be_disabled()
+        expect(builtin.locator("input[type=password]")).to_have_count(0)
+        check_config("codex", "coding-ci")
+        builtin.get_by_role("button", name="Back to Codex", exact=True).click()
+        builtin.get_by_role("button", name="All built-in providers", exact=True).click()
+        builtin.get_by_role("button", name="Manage Claude Code", exact=True).click()
+        manage_connection("Claude Code fixture")
+        expect(builtin.get_by_text("Legacy", exact=True)).to_be_visible()
+        expect(builtin.locator("input[type=password]")).to_have_count(0)
+        check_config("claude_code", "claude-ci")
         assert "fixture-compatible-key" not in json.dumps(providers())
         assert "sk-ant-api-fixture-only" not in json.dumps(providers())
+        assert "sk-ant-api-fixture-only" not in json.dumps(builtins())
 
         page.goto("/models")
         page.get_by_role("button", name="Fetch models").click()
@@ -221,11 +363,50 @@ def smoke(base, upstream):
         expect(native_row.get_by_role("button", name="Test", exact=True)).to_be_disabled()
         expect(native_row.get_by_text("Account unverified", exact=True)).to_be_visible()
 
+        # Canonical imports use cx/, not a user-supplied or legacy slug.
+        # Exercise the actual per-connection importer before checking the
+        # same models on the global Models page.
         page.goto("/providers")
-        for provider in ("Compatible fixture", "Native Codex fixture"):
-            dialog = open_edit(provider)
-            expect(dialog.get_by_label("Slug", exact=True)).to_be_disabled()
-            dialog.get_by_role("button", name="Cancel", exact=True).click()
+        dialog = open_edit("Compatible fixture")
+        expect(dialog.get_by_label("Slug", exact=True)).to_be_disabled()
+        dialog.get_by_role("button", name="Cancel", exact=True).click()
+        locked = admin_request("PATCH", "/api/admin/providers", {"id": native["id"], "slug": "coding-ci-renamed"})
+        assert locked.status == 409 and locked.json()["error"]["code"] == "provider_slug_locked"
+        builtin.get_by_role("button", name="Manage Codex", exact=True).click()
+        manage_connection(canonical_codex_name)
+        check_config("codex", "cx")
+        builtin.get_by_label("Codex upstream model IDs").fill("fixture-a, fixture-a\nfixture-b")
+        with page.expect_response(lambda r: r.url.endswith("/api/admin/models/import") and r.request.method == "POST") as imported:
+            builtin.get_by_role("button", name="Import models (2)", exact=True).click()
+        assert imported.value.ok
+        expect(builtin.get_by_text("cx/fixture-a", exact=True)).to_be_visible()
+        expect(builtin.get_by_text("cx/fixture-b", exact=True)).to_be_visible()
+        canonical_catalog = models()
+        assert set(canonical_catalog) == set(catalog) | {"cx/fixture-a", "cx/fixture-b"}
+        assert canonical_catalog["cx/fixture-a"]["providerId"] == canonical_codex_id
+        assert canonical_catalog["cx/fixture-a"]["providerKind"] == "codex"
+        assert canonical_catalog["cx/fixture-a"]["providerSlug"] == "cx"
+        assert canonical_catalog["cx/fixture-a"]["id"] not in {
+            catalog["codex/fixture-a"]["id"], catalog["coding-ci/fixture-a"]["id"],
+        }
+        builtin.get_by_role("link", name="Manage models", exact=True).click()
+        expect(page).to_have_url(base + "/models")
+        page.get_by_role("button", name="Expand all").click()
+        canonical_row = page.get_by_role("row").filter(has_text="cx/fixture-a")
+        expect(canonical_row.get_by_role("button", name="Test", exact=True)).to_be_disabled()
+        expect(canonical_row.get_by_text("Account unverified", exact=True)).to_be_visible()
+        page.goto("/providers")
+        builtin.get_by_role("button", name="Manage Codex", exact=True).click()
+        manage_connection(canonical_codex_name)
+        assert connection("codex", canonical_codex_id)["modelCount"] == 2
+        disable_connection("codex", canonical_codex_id)
+        disabled_catalog = models()
+        assert disabled_catalog["cx/fixture-a"]["id"] == canonical_catalog["cx/fixture-a"]["id"]
+        assert not disabled_catalog["cx/fixture-a"]["providerEnabled"]
+        assert disabled_catalog["coding-ci/fixture-a"]["providerEnabled"]
+        enable_connection("codex", canonical_codex_id)
+        assert models()["cx/fixture-a"]["providerEnabled"]
+        assert models()["cx/fixture-a"]["id"] == canonical_catalog["cx/fixture-a"]["id"]
 
         # Seed a second Codex configuration to verify that duplicate upstream
         # IDs are excluded across provider UUIDs, not just within one provider.
@@ -246,6 +427,7 @@ def smoke(base, upstream):
         expect(dialog.get_by_role("switch", name="HTTP 429")).to_be_checked()
         expect(dialog.get_by_role("switch", name="Adaptive fallback and recovery")).to_be_checked()
         expect(dialog.get_by_role("button", name="Add coding-ci/fixture-a", exact=True)).to_have_count(0)
+        expect(dialog.get_by_role("button", name="Add cx/fixture-a", exact=True)).to_have_count(0)
         dialog.get_by_role("button", name="Add codex/fixture-a", exact=True).click()
         expect(dialog.get_by_role("button", name="Reorder codex/fixture-a")).to_be_visible()
         kind.click()
@@ -259,6 +441,7 @@ def smoke(base, upstream):
         dialog.get_by_label("Name", exact=True).fill("Native fallback fixture")
         dialog.get_by_role("button", name="Add coding-ci/fixture-a", exact=True).click()
         expect(dialog.get_by_role("button", name="Add coding-peer/fixture-a", exact=True)).to_have_count(0)
+        expect(dialog.get_by_role("button", name="Add cx/fixture-a", exact=True)).to_have_count(0)
         dialog.get_by_role("button", name="Add coding-peer/fixture-c", exact=True).click()
         with page.expect_response(lambda r: r.url.endswith("/api/admin/combos")
                                   and r.request.method == "POST") as combo_created:
@@ -387,9 +570,24 @@ def smoke(base, upstream):
             with page.expect_response(lambda r: r.url.endswith("/api/admin/stats?preset=" + preset)) as stats:
                 page.get_by_role("tab", name=period, exact=True).click()
             assert stats.value.ok
+            # Verify the actual snapshot before locating the rendered row. The
+            # model label is publicId, not the provider name or bare upstream ID.
+            # This distinguishes missing server data from a DOM locator failure.
+            snapshot = stats.value.json()
+            expected = next((m for m in snapshot["topModels"] if m["publicId"] == "codex/fixture-a"), None)
+            assert expected is not None, f"{preset}: missing fixture in topModels: {snapshot['topModels']}"
+            assert expected["requests"] == 1 and expected["totalTokens"] == 6 and expected["errorRate"] == 0
             expect(page.get_by_role("tab", name=period, exact=True)).to_have_attribute("aria-selected", "true")
-            top_models = page.get_by_role("table").filter(has=page.get_by_role("columnheader", name="Req", exact=True))
-            expect(top_models.get_by_role("cell", name="codex/fixture-a", exact=True)).to_be_visible()
+            # Anchor the table to its real card heading, not an inferred ARIA
+            # role on a scope-less <th>. Keep exact visible label and totals.
+            heading = page.get_by_role("heading", name="Top Models", exact=True)
+            expect(heading).to_be_visible()
+            top_models = heading.locator("xpath=../..").locator("table")
+            expect(top_models).to_have_count(1)
+            row = top_models.locator("tbody tr").filter(has=page.get_by_text(expected["publicId"], exact=True))
+            expect(row).to_have_count(1)
+            expect(row.locator("td")).to_have_text(["codex/fixture-a", "1", "0.0%", "6"])
+            expect(row.locator("td").first).to_be_visible()
         browser.close()
 
 

@@ -14,6 +14,7 @@ import { circuitBlocks, modelThrottleBlocks } from '../../routing/circuit';
 import { listAdaptiveStates } from '../../routing/combo-adaptive-state';
 import { freshSamples, median, SAMPLE_TTL_MS } from '../../routing/combo-policy';
 import { assertRoutingNameFree } from '../../routing/namespace';
+import { providerPublicPrefix } from '../../providers/builtin';
 
 const MemberSpec = z.object({ modelId: z.string(), position: z.number().int().min(0), enabled: z.boolean().default(true) });
 
@@ -268,7 +269,7 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
           publicModelId: modelMap.get(m.modelId)?.publicModelId ?? '',
           upstreamModelId: modelMap.get(m.modelId)?.upstreamModelId ?? '',
           displayName: modelMap.get(m.modelId)?.displayName ?? '',
-          providerSlug: providerMap.get(modelMap.get(m.modelId)?.providerId ?? '')?.slug ?? '',
+          providerSlug: providerMap.get(modelMap.get(m.modelId)?.providerId ?? '') ? providerPublicPrefix(db, providerMap.get(modelMap.get(m.modelId)?.providerId ?? '')!) : '',
           position: m.position,
           enabled: m.enabled,
            upstreamAvailable: modelMap.get(m.modelId)?.upstreamAvailable ?? false,
@@ -341,7 +342,7 @@ export async function registerComboRoutes(app: FastifyInstance): Promise<void> {
       selectedModel: selectedModel ? {
         publicModelId: selectedModel.publicModelId,
         upstreamModelId: selectedModel.upstreamModelId,
-        providerSlug: providerMap.get(selectedModel.providerId)?.slug ?? '',
+        providerSlug: providerMap.get(selectedModel.providerId) ? providerPublicPrefix(db, providerMap.get(selectedModel.providerId)!) : '',
       } : null,
       attempts: outcome.attempts.map((attempt) => {
         const model = modelMap.get(attempt.modelId);
