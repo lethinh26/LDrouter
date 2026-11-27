@@ -5,15 +5,19 @@ The fixture uses a fresh SQLite database, loopback upstream and synthetic keys.
 No signed-in client or external provider endpoint is contacted.
 """
 
+import base64
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import subprocess
 import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlencode, urlsplit
 from urllib.request import urlopen
 
 from playwright.sync_api import expect, sync_playwright
@@ -588,6 +592,109 @@ def smoke(base, upstream):
             expect(row).to_have_count(1)
             expect(row.locator("td")).to_have_text(["codex/fixture-a", "1", "0.0%", "6"])
             expect(row.locator("td").first).to_be_visible()
+
+        # Exercise LDrouter's own gateway OAuth consent and revocation with the
+        # already-created scoped fixture key. No upstream account is involved.
+        redirect_uri = "http://127.0.0.1:43127/callback"
+        verifier = base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("=")
+        challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest()).decode().rstrip("=")
+        state = base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("=")
+        authorize_path = "/api/admin/gateway-oauth/authorize"
+        grants_path = "/api/admin/gateway-oauth/grants"
+        prior_grant_ids = {grant["id"] for grant in get(grants_path)["grants"]}
+        callback_pattern = re.compile(r"^http://127\.0\.0\.1:43127/callback\?[^#]*$")
+        intercepted = []
+
+        def intercept_callback(route):
+            assert route.request.method == "GET" and route.request.is_navigation_request()
+            intercepted.append(route.request.url)
+            # Fulfill locally: never contact a callback listener or echo the code.
+            route.fulfill(status=200, content_type="text/plain", body="Fixture callback received")
+
+        page.route(callback_pattern, intercept_callback)
+        try:
+            navigation = page.goto("/oauth/authorize?" + urlencode({
+                "client_id": "ldrouter-codex", "response_type": "code",
+                "redirect_uri": redirect_uri, "code_challenge_method": "S256",
+                "code_challenge": challenge, "state": state,
+            }))
+            assert navigation is not None and navigation.ok
+            expect(page.get_by_text("Authorize Codex gateway access", exact=True)).to_be_visible()
+            approve = page.get_by_role("button", name="Authorize gateway access", exact=True)
+            selection = page.get_by_role("radio", name=re.compile(r"^Provider scoped fixture"))
+            expect(selection).to_be_enabled()
+            expect(selection).not_to_be_checked()
+            expect(approve).to_be_disabled()
+            assert {grant["id"] for grant in get(grants_path)["grants"]} == prior_grant_ids
+            selection.check()
+            expect(approve).to_be_enabled()
+            with page.expect_response(lambda r: r.url == base + authorize_path
+                                      and r.request.method == "POST") as authorized:
+                approve.click()
+            assert authorized.value.ok, f"Gateway authorization: {authorized.value.status}"
+            page.wait_for_url(callback_pattern, wait_until="domcontentloaded")
+            assert len(intercepted) == 1
+            assert authorized.value.json()["redirectUrl"] == intercepted[0]
+            parsed = urlsplit(intercepted[0])
+            assert (parsed.scheme, parsed.netloc, parsed.path, parsed.fragment) == (
+                "http", "127.0.0.1:43127", "/callback", "",
+            )
+            params = parse_qs(parsed.query, strict_parsing=True, keep_blank_values=True)
+            assert set(params) == {"code", "state"} and params["state"] == [state]
+            assert len(params["code"]) == 1 and re.fullmatch(r"ldo-c-[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]", params["code"][0])
+            expect(page.get_by_text("Fixture callback received", exact=True)).to_be_visible()
+        finally:
+            page.unroute(callback_pattern, intercept_callback)
+
+        # Use an independent unauthenticated HTTP context for the public token
+        # endpoint, not the browser's admin session or a mocked token response.
+        public_client = p.request.new_context(base_url=base, timeout=15000)
+        try:
+            token = public_client.post("/api/oauth/token", form={
+                "grant_type": "authorization_code", "client_id": "ldrouter-codex",
+                "redirect_uri": redirect_uri, "code": params["code"][0],
+                "code_verifier": verifier,
+            })
+            assert token.ok, f"Gateway token exchange: {token.status}"
+            tokens = token.json()
+            assert tokens["token_type"] == "Bearer" and 0 < tokens["expires_in"] <= 900
+            assert re.fullmatch(r"ldo-a-[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]", tokens["access_token"])
+            assert re.fullmatch(r"ldo-r-[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]", tokens["refresh_token"])
+            grants = [grant for grant in get(grants_path)["grants"] if grant["id"] not in prior_grant_ids]
+            assert len(grants) == 1
+            grant = grants[0]
+            assert set(grant) == {
+                "id", "apiKeyId", "apiKeyName", "createdAt", "accessExpiresAt",
+                "refreshExpiresAt", "absoluteExpiresAt", "lastRefreshedAt", "status",
+            }
+            assert grant["apiKeyId"] == key["id"] and grant["apiKeyName"] == "Provider scoped fixture"
+            assert grant["status"] == "active" and grant["lastRefreshedAt"] is None
+            assert grant["createdAt"] < grant["accessExpiresAt"] < grant["refreshExpiresAt"] < grant["absoluteExpiresAt"]
+            page.goto("/providers")
+            grant_card = page.locator('[aria-label="Gateway OAuth grants"]')
+            grant_row = grant_card.get_by_role("row").filter(has_text=grant["id"])
+            expect(grant_row.get_by_text("active", exact=True)).to_be_visible()
+            expect(grant_row.get_by_text("Provider scoped fixture", exact=True)).to_be_visible()
+            revoke = grant_row.get_by_role("button", name="Revoke grant " + grant["id"], exact=True)
+            revoke.click()
+            confirmation = page.get_by_role("alertdialog", name="Revoke gateway OAuth grant?")
+            expect(confirmation).to_be_visible()
+            with page.expect_response(lambda r: r.url == base + grants_path + "/" + grant["id"]
+                                      and r.request.method == "DELETE") as revoked:
+                confirmation.get_by_role("button", name="Revoke grant", exact=True).click()
+            assert revoked.value.ok, f"Gateway grant revoke: {revoked.value.status}"
+            expect(grant_row.get_by_text("revoked", exact=True)).to_be_visible()
+            expect(revoke).to_be_disabled()
+            assert next(g for g in get(grants_path)["grants"] if g["id"] == grant["id"])["status"] == "revoked"
+            refresh = public_client.post("/api/oauth/token", form={
+                "grant_type": "refresh_token", "client_id": "ldrouter-codex",
+                "refresh_token": tokens["refresh_token"],
+            })
+            assert refresh.status == 400 and refresh.json() == {"error": "invalid_grant"}
+            assert get("/api/admin/api-keys/" + key["id"])["apiKey"]["enabled"]
+            assert ProviderFixture.calls == ["fixture-a"]
+        finally:
+            public_client.dispose()
         browser.close()
 
 

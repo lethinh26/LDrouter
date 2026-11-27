@@ -36,7 +36,7 @@ describe('built-in connection migration 0019', () => {
       const tables = ['providers','provider_integrations','models','combos','combo_members','model_aliases','api_keys','api_key_model_permissions'];
       const before = tables.map(table => db.prepare('SELECT * FROM ' + table + ' ORDER BY 1').all());
       runMigrations(db, MIGRATION_LOG, MIGRATIONS_DIR, CURRENT_SCHEMA_VERSION);
-      expect(CURRENT_SCHEMA_VERSION).toBe(19);
+      expect(CURRENT_SCHEMA_VERSION).toBeGreaterThanOrEqual(19);
       expect(tables.map(table => db.prepare('SELECT * FROM ' + table + ' ORDER BY 1').all())).toEqual(before);
       expect(db.prepare('SELECT * FROM provider_connections ORDER BY provider_id').all()).toEqual([
         { provider_id: 'old-claude', namespace_mode: 'legacy' },

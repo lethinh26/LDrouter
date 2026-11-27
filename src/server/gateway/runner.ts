@@ -42,6 +42,8 @@ export interface GatewayContext {
   synthetic?: boolean;
   codexAuth?: { authorization: string; accountId?: string };
   codexClientVersion?: string;
+  /** A first-party gateway grant must remain valid for every new dispatch. */
+  gatewayOAuthStillActive?: () => boolean;
 }
 
 export interface GatewayRequest {
@@ -322,6 +324,9 @@ export class GatewayRunner {
         }
         candidates = orderCandidates(comboPlan, eligibleFiltered);
         if (nativeCombo) {
+          if (ctx.gatewayOAuthStillActive && !ctx.gatewayOAuthStillActive()) {
+            throw new GatewayError('authentication_error', 'Gateway OAuth credential is no longer valid', { status: 401, code: 'gateway_oauth_invalid' });
+          }
           const catalog = await fetchCodexCatalog(ctx.codexAuth!, ctx.codexClientVersion, requestAbort.signal);
           const cancelled = abortError();
           if (cancelled) throw cancelled;
@@ -445,6 +450,10 @@ export class GatewayRunner {
           candidates = this.loadModelCandidate(resolved.modelId, required, ctx.requestId).candidates;
         }
         if (ctx.key) {
+          if (ctx.gatewayOAuthStillActive && !ctx.gatewayOAuthStillActive()) {
+            lastError = new GatewayError('authentication_error', 'Gateway OAuth credential is no longer valid', { status: 401, code: 'gateway_oauth_invalid' });
+            break;
+          }
           const currentKey = getDb().select().from(schema.apiKeys).where(eq(schema.apiKeys.id, ctx.key.id)).get();
           const currentAlias = target.kind === 'alias' ? getDb().select().from(schema.modelAliases).where(eq(schema.modelAliases.id, target.aliasId)).get() : null;
           if (!currentKey || !keyIsActive(currentKey) || !keyIpAllowed(ctx.key.id, ctx.clientIp)

@@ -117,7 +117,14 @@ The manifest carries only: `format` (`latedev-backup`), `version` (2), `profile`
 ### Profiles
 
 - **Compact (default)** — retains all gateway configuration and entities, schema migrations/settings, admin credential/TOTP/recovery state, encrypted provider credentials, API-key configuration, quota aggregates, and daily statistics by model, provider, and API key. It excludes the forensic/volatile tables `requests`, `request_attempts`, `audit_logs`, the gateway response cache (`response_cache`), admin sessions (`admin_sessions`), csrf tokens (`csrf_tokens`), and `backups`. A compact backup is materially smaller and is the recommended routine download.
-- **Full (forensic)** — keeps every row, including raw request/attempt/audit/cache content. It can be much larger and contains sensitive logged and cached content, so treat the file as confidential. It is explicitly labeled sensitive in the UI.
+- **Full (forensic)** — retains raw request/attempt/audit/cache content. It can be much larger and contains sensitive logged and cached content, so treat the file as confidential. It is explicitly labeled sensitive in the UI.
+
+Both profiles exclude rows from `gateway_oauth_codes`, `gateway_oauth_grants`,
+and `gateway_oauth_used_refresh`. These first-party authorization records hold
+digests only; excluding them prevents export from preserving bearer sessions.
+Restore also clears these tables in the validated staging database and the
+pre-restore rollback snapshot so old grants cannot be resurrected. Normal
+process restart is not a restore and preserves valid grants.
 
 A compact backup **cannot restore individual request, attempt, or audit history**; only a full backup preserves that row-level detail. Aggregate statistics survive a compact restore, but per-request detail does not.
 

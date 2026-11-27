@@ -529,4 +529,41 @@ describe('streamed multipart restore', () => {
       expect(await waitForEmptyTmp()).toEqual([]);
     } finally { fs.rmSync(dir,{recursive:true,force:true}); }
   });
+
+  it('never restores first-party OAuth credentials even from a valid full snapshot containing active grants', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'latedev-oauth-restore-'));
+    const access = 'ldo-a-' + crypto.randomBytes(32).toString('base64url');
+    const refresh = 'ldo-r-' + crypto.randomBytes(32).toString('base64url');
+    const digest = (value: string) => crypto.createHash('sha256').update(value).digest('hex');
+    try {
+      const { CURRENT_SCHEMA_VERSION, runMigrations } = await import('../../src/server/db/migrate');
+      const { MIGRATIONS_DIR, MIGRATION_LOG } = await import('../fixtures/legacy-db');
+      const staged = createLegacyDatabase(dir);
+      try {
+        runMigrations(staged, MIGRATION_LOG, MIGRATIONS_DIR, CURRENT_SCHEMA_VERSION);
+        const now = Date.now();
+        staged.prepare('INSERT INTO admin_sessions(id,token_digest,expires_at) VALUES(?,?,?)')
+          .run('oauth-restore-session', digest('fixture-restore-session'), new Date(now + 3600000).toISOString());
+        staged.prepare(`INSERT INTO gateway_oauth_grants(id,key_id,key_digest,access_digest,refresh_digest,
+          created_at_ms,access_expires_at_ms,refresh_expires_at_ms,absolute_expires_at_ms)
+          VALUES(?,?,?,?,?,?,?,?,?)`).run('old-grant','key-all',digest(ALL_KEY),digest(access),digest(refresh),now,now+900000,now+86400000,now+86400000*2);
+        staged.prepare('INSERT INTO gateway_oauth_used_refresh(token_digest,grant_id) VALUES (?,?)').run(digest('used-fixture'), 'old-grant');
+        staged.prepare(`INSERT INTO gateway_oauth_codes(code_digest,key_id,key_digest,challenge,redirect_uri,session_id,expires_at_ms)
+          VALUES(?,?,?,?,?,?,?)`).run(digest('code-fixture'),'key-all',digest(ALL_KEY),'x'.repeat(43),'http://127.0.0.1:43127/callback','oauth-restore-session',now+300000);
+      } finally { staged.close(); }
+      const bytes = fs.readFileSync(path.join(dir, 'legacy.sqlite'));
+      const result = await uploadBuffer(await buildContainer(zlib.gzipSync(bytes), {
+        profile:'full', excludedTables:[], schemaVersion:CURRENT_SCHEMA_VERSION, uncompressedBytes:bytes.length,
+      }));
+      expect(result.status, JSON.stringify(result.json)).toBe(200);
+      const { getRawDb } = await import('../../src/server/db');
+      const { resolveGatewayOAuthAccess } = await import('../../src/server/auth/gateway-oauth');
+      for (const table of ['gateway_oauth_codes','gateway_oauth_grants','gateway_oauth_used_refresh']) {
+        expect(getRawDb().prepare('SELECT count(*) n FROM '+table).get()).toEqual({n:0});
+      }
+      expect(resolveGatewayOAuthAccess(access)).toBeNull();
+      const { authenticateGatewayKey } = await import('../../src/server/auth/api-key');
+      expect(authenticateGatewayKey({headers:{authorization:'Bearer '+ALL_KEY}})?.id).toBe('key-all');
+    } finally { fs.rmSync(dir, { recursive:true, force:true }); }
+  });
 });

@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
-export const CURRENT_SCHEMA_VERSION = 19;
+export const CURRENT_SCHEMA_VERSION = 20;
 
 interface MigrationFile {
   version: number;
@@ -50,6 +50,7 @@ export function runMigrations(raw: Database.Database, log: Logger, migrationsDir
   if (latest >= 17 && applied.includes(17)) assertIntegrationSchema(raw, parsed[16]!);
   if (latest >= 18 && applied.includes(18)) assertComboKindSchema(raw, parsed[17]!);
   if (latest >= 19 && applied.includes(19)) assertConnectionSchema(raw, parsed[18]!);
+  if (latest >= 20 && applied.includes(20)) assertGatewayOAuthSchema(raw, parsed[19]!);
 
   for (const migration of parsed.slice(applied.length)) {
     log.info({ version: migration.version, name: migration.name }, 'applying migration');
@@ -71,6 +72,7 @@ export function runMigrations(raw: Database.Database, log: Logger, migrationsDir
       if (migration.version === 17) assertIntegrationSchema(raw, migration);
       if (migration.version === 18) assertComboKindSchema(raw, migration);
       if (migration.version === 19) assertConnectionSchema(raw, migration);
+      if (migration.version === 20) assertGatewayOAuthSchema(raw, migration);
       raw.prepare('INSERT INTO schema_migrations (version, name) VALUES (?, ?)').run(migration.version, migration.name);
     });
     tx.immediate();
@@ -80,6 +82,20 @@ export function runMigrations(raw: Database.Database, log: Logger, migrationsDir
     ensureSettingsRow(raw, log);
     raw.prepare('UPDATE app_settings SET schema_version = ? WHERE id = 1').run(latest);
   })();
+}
+
+function assertGatewayOAuthSchema(raw: Database.Database, migration: MigrationFile): void {
+  const fail = () => new Error('Database schema is inconsistent with gateway OAuth migration (0020)');
+  const normalize = (ddl: string) => ddl.replace(/\s+/g, ' ').replace(/;$/, '').trim();
+  const expectedObjects = [...migration.sql.matchAll(/^CREATE (TABLE|INDEX) (\w+)[\s\S]*?;/gm)];
+  if (expectedObjects.length !== 9) throw fail();
+  for (const [ddl, type, name] of expectedObjects) {
+    const actual = raw.prepare('SELECT sql FROM sqlite_schema WHERE type=? AND name=?').get(type!.toLowerCase(), name) as { sql: string } | undefined;
+    if (!actual?.sql || normalize(actual.sql) !== normalize(ddl)) throw fail();
+  }
+  for (const table of ['gateway_oauth_codes', 'gateway_oauth_grants', 'gateway_oauth_used_refresh']) {
+    if (raw.prepare(`PRAGMA foreign_key_check(${table})`).all().length) throw fail();
+  }
 }
 
 function assertConnectionSchema(raw: Database.Database, migration: MigrationFile): void {

@@ -10,6 +10,8 @@ All notable changes to this project are documented here. The format follows
 
 - Separate built-in Codex and Claude Code Provider Center, with fixed canonical model prefixes `cx/` and `cc/`, connection management, independent authorized Claude API-key connections and per-connection gateway usage.
 - Migration 0019 preserves existing integration identities as legacy connections without changing public model IDs, credentials or ACLs. New canonical imports bind a model to one selected connection; namespace conflicts and duplicate bindings fail closed.
+- First-party Codex Gateway OAuth (migration 0020): admin consent, fixed loopback callback with PKCE, expiring access tokens, refresh rotation and replay revocation, scoped gateway key authorization, grant inspection and revocation. No upstream account tokens are collected.
+- Both backup profiles exclude gateway OAuth sessions; restore invalidates them without changing the underlying API-key identities.
 
 ### Fixed
 
@@ -17,7 +19,7 @@ All notable changes to this project are documented here. The format follows
 
 ### Limitations
 
-- Codex authentication remains client-held; no managed subscription OAuth, callback import, upstream subscription quota lookup or cross-account rotation is implemented.
+- Codex upstream authentication remains client-held; no managed subscription OAuth, upstream callback import, subscription quota lookup or cross-account rotation is implemented. Claude Code remains API-key based. First-party Gateway OAuth is independent of upstream login.
 
 ## [2.1.0] - 2026-11-27
 

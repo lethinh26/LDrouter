@@ -278,6 +278,7 @@ function safeStringify(v: unknown): string {
 const SENSITIVE_HEADERS = new Set([
   'authorization',
   'x-api-key',
+  'x-gateway-token',
   'cookie',
   'set-cookie',
   'x-goog-api-key',

@@ -7,6 +7,7 @@ import { Label } from '../../components/ui/label';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../../components/ui/card';
 import { useAuth } from '../auth';
 import { toast } from 'sonner';
+import { adminLoginReturnPath } from '../../lib/gateway-oauth';
 
 export function Login() {
   const { login } = useAuth();
@@ -56,8 +57,7 @@ export function Login() {
             try {
               const r = await login(username, password, totp || undefined, recovery || undefined);
               if (r.totpRequired) { setNeedsTotp(true); return; }
-              const from = (location.state as { from?: { pathname?: string } } | null)?.from?.pathname ?? '/';
-              navigate(from, { replace: true });
+              navigate(adminLoginReturnPath(location.state), { replace: true });
             } catch (e) {
               toast.error((e as Error).message);
             } finally { setSubmitting(false); }

@@ -18,6 +18,7 @@ import { decryptBackupMasterKey } from '../auth/backup-crypto';
 import { parseMasterKey } from '../auth/crypto';
 import { migrateDatabase } from '../db/index';
 import { CURRENT_SCHEMA_VERSION } from '../db/migrate';
+import { removeGatewayOAuthState } from './gateway-oauth-state';
 import {
   readBackupContainerHeader,
   streamBackupPayload,
@@ -417,6 +418,9 @@ async function upgradeStagedBackup(file: string): Promise<void> {
     db.pragma('journal_mode = DELETE');
     migrateDatabase(db);
     if (db.prepare('PRAGMA foreign_key_check').all().length > 0) throw integrityFailed();
+    // Clear authentication sessions BEFORE the validated file can replace the
+    // live DB (also for legacy containers and after a process crash).
+    removeGatewayOAuthState(db);
     const result = db.prepare('PRAGMA integrity_check').get() as { integrity_check?: string } | undefined;
     if (result?.integrity_check !== 'ok') throw integrityFailed();
   } catch (error) {

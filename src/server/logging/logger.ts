@@ -22,6 +22,7 @@ export function getLogger(): pino.Logger {
       paths: [
         'req.headers.authorization',
         'req.headers["x-api-key"]',
+        'req.headers["x-gateway-token"]',
         'req.headers.cookie',
         'res.headers["set-cookie"]',
         'apiKey',

@@ -339,6 +339,46 @@ export const apiKeys = sqliteTable(
   })
 );
 
+// OAuth grants are issued by LateDev itself, scoped to an existing gateway
+// key. Store one-way digests only; these are never provider access tokens.
+export const gatewayOAuthCodes = sqliteTable('gateway_oauth_codes', {
+  codeDigest: text('code_digest').primaryKey().notNull(),
+  keyId: text('key_id').notNull().references(() => apiKeys.id, { onDelete: 'cascade' }),
+  keyDigest: text('key_digest').notNull(),
+  challenge: text('challenge').notNull(),
+  redirectUri: text('redirect_uri').notNull(),
+  sessionId: text('session_id').notNull().references(() => adminSessions.id, { onDelete: 'cascade' }),
+  expiresAtMs: integer('expires_at_ms').notNull(),
+}, (t) => ({
+  keyIdx: index('idx_gateway_oauth_codes_key').on(t.keyId),
+  expiryIdx: index('idx_gateway_oauth_codes_expiry').on(t.expiresAtMs),
+  sessionIdx: index('idx_gateway_oauth_codes_session').on(t.sessionId),
+}));
+
+export const gatewayOAuthGrants = sqliteTable('gateway_oauth_grants', {
+  id: text('id').primaryKey().notNull(),
+  keyId: text('key_id').notNull().references(() => apiKeys.id, { onDelete: 'cascade' }),
+  keyDigest: text('key_digest').notNull(),
+  accessDigest: text('access_digest').notNull().unique(),
+  refreshDigest: text('refresh_digest').notNull().unique(),
+  accessExpiresAtMs: integer('access_expires_at_ms').notNull(),
+  refreshExpiresAtMs: integer('refresh_expires_at_ms').notNull(),
+  absoluteExpiresAtMs: integer('absolute_expires_at_ms').notNull(),
+  createdAtMs: integer('created_at_ms').notNull(),
+  lastRefreshedAtMs: integer('last_refreshed_at_ms'),
+  revokedAtMs: integer('revoked_at_ms'),
+}, (t) => ({
+  keyIdx: index('idx_gateway_oauth_grants_key').on(t.keyId),
+  expiryIdx: index('idx_gateway_oauth_grants_expiry').on(t.absoluteExpiresAtMs),
+}));
+
+export const gatewayOAuthUsedRefresh = sqliteTable('gateway_oauth_used_refresh', {
+  tokenDigest: text('token_digest').primaryKey().notNull(),
+  grantId: text('grant_id').notNull().references(() => gatewayOAuthGrants.id, { onDelete: 'cascade' }),
+}, (t) => ({
+  grantIdx: index('idx_gateway_oauth_used_refresh_grant').on(t.grantId),
+}));
+
 export const apiKeyModelPermissions = sqliteTable(
   'api_key_model_permissions',
   {

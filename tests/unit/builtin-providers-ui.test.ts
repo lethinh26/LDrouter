@@ -58,6 +58,7 @@ describe('Providers UI', () => {
         { id: 'custom-id', name: 'Compatible fixture', slug: 'codex', providerKind: 'compatible', type: 'openai', enabled: true, health: 'healthy', modelCount: 0, baseUrl: 'https://example.test' },
       ] } as never;
       if (url.startsWith('/api/admin/models?providerId=')) return { models: [] } as never;
+      if (url === '/api/admin/gateway-oauth/grants') return { grants: [] } as never;
       throw new Error('Unexpected GET ' + url);
     });
     vi.spyOn(api, 'patch').mockImplementation(async (_url, body) => {

@@ -18,7 +18,8 @@ process.env.LATEDEV_LOG_LEVEL = 'error';
 process.env.NODE_ENV = 'test';
 
 const PASSPHRASE = '123456';
-const EXCLUDED_TABLES = ['requests', 'request_attempts', 'audit_logs', 'response_cache', 'admin_sessions', 'csrf_tokens', 'backups'];
+const OAUTH_TABLES = ['gateway_oauth_used_refresh', 'gateway_oauth_codes', 'gateway_oauth_grants'];
+const EXCLUDED_TABLES = ['requests', 'request_attempts', 'audit_logs', 'response_cache', 'admin_sessions', 'csrf_tokens', 'backups', ...OAUTH_TABLES];
 const RETAINED_TABLES = ['app_settings', 'admin_account', 'providers', 'models', 'api_keys', 'daily_model_stats', 'daily_provider_stats', 'daily_api_key_stats'];
 
 let app: import('fastify').FastifyInstance | undefined;
@@ -73,7 +74,14 @@ beforeAll(async () => {
   const apiKeyId = uuid();
   raw.prepare('INSERT INTO providers (id,name,slug,type,base_url) VALUES (?,?,?,?,?)').run(providerId, 'mock', 'mockbackup', 'openai', 'http://127.0.0.1:9');
   raw.prepare('INSERT INTO models (id,provider_id,upstream_model_id,public_model_id,display_name) VALUES (?,?,?,?,?)').run(modelId, providerId, 'm', 'mockbackup/m', 'M');
-  raw.prepare('INSERT INTO api_keys (id,name,key_prefix,key_digest) VALUES (?,?,?,?)').run(apiKeyId, 'k', 'ld-test', uuid());
+  const keyDigest = 'a'.repeat(64);
+  raw.prepare('INSERT INTO api_keys (id,name,key_prefix,key_digest) VALUES (?,?,?,?)').run(apiKeyId, 'k', 'ld-test', keyDigest);
+  raw.prepare(`INSERT INTO gateway_oauth_grants(id,key_id,key_digest,access_digest,refresh_digest,created_at_ms,
+    access_expires_at_ms,refresh_expires_at_ms,absolute_expires_at_ms) VALUES(?,?,?,?,?,1,2,3,4)`).run('fixture-oauth', apiKeyId, keyDigest, 'b'.repeat(64), 'c'.repeat(64));
+  raw.prepare('INSERT INTO gateway_oauth_used_refresh(token_digest,grant_id) VALUES(?,?)').run('d'.repeat(64), 'fixture-oauth');
+  const session = raw.prepare('SELECT id FROM admin_sessions LIMIT 1').get() as { id: string };
+  raw.prepare(`INSERT INTO gateway_oauth_codes(code_digest,key_id,key_digest,challenge,redirect_uri,session_id,expires_at_ms)
+    VALUES(?,?,?,?,?,?,?)`).run('e'.repeat(64), apiKeyId, keyDigest, 'x'.repeat(43), 'http://127.0.0.1:43127/callback', session.id, Date.now()+60000);
   raw.prepare('INSERT INTO daily_model_stats (day,model_id,requests,successful_requests) VALUES (?,?,?,?)').run('2026-01-01', modelId, 5, 5);
   raw.prepare('INSERT INTO daily_provider_stats (day,provider_id,attempts,successful_attempts) VALUES (?,?,?,?)').run('2026-01-01', providerId, 5, 5);
   raw.prepare('INSERT INTO daily_api_key_stats (day,api_key_id,requests) VALUES (?,?,?)').run('2026-01-01', apiKeyId, 5);
@@ -115,12 +123,16 @@ describe('compact/full backup export', () => {
 
   it('keeps request, attempt, audit, and cache rows in the full profile', async () => {
     const { file } = await exportToFile('full');
-    const { sqlite } = await openExportedPayload(file);
+    const { manifest, sqlite } = await openExportedPayload(file);
     try {
       expect(countOf(sqlite, 'requests')).toBe(200);
       expect(countOf(sqlite, 'request_attempts')).toBe(200);
       expect(countOf(sqlite, 'audit_logs')).toBeGreaterThan(0);
       expect(countOf(sqlite, 'response_cache')).toBe(200);
+      expect(manifest.excludedTables).toEqual(OAUTH_TABLES);
+      for (const table of OAUTH_TABLES) expect(countOf(sqlite, table), table).toBe(0);
+      const { getRawDb } = await import('../../src/server/db/index');
+      for (const table of OAUTH_TABLES) expect(countOf(getRawDb(), table), table).toBe(1);
     } finally {
       sqlite.close();
       fs.rmSync(file, { force: true });

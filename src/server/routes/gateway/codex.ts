@@ -4,7 +4,8 @@ import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { eq } from 'drizzle-orm';
 import { z } from 'zod';
 import { getDb, getDatabaseEpoch, schema } from '../../db/index';
-import { requireGatewayKey, keyAllowedForTarget, keyIsActive, keyIpAllowed } from '../../auth/api-key';
+import { type AuthenticatedKey, keyAllowedForTarget, keyIsActive, keyIpAllowed } from '../../auth/api-key';
+import { requireCodexGatewayKey } from '../../auth/codex-gateway-key';
 import { GatewayError, outcomeError, toOpenAIError } from '../../errors';
 import { resolveClientIp } from '../../util/client-ip';
 import { resolveRequestedModel, unwrapAlias } from '../../routing/resolver';
@@ -25,12 +26,14 @@ function clientAuth(req: FastifyRequest) {
       (accountId !== undefined && (typeof accountId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(accountId)))) {
     throw new GatewayError('authentication_error', 'Signed-in Codex credential is required', { status: 401, code: 'codex_client_auth_required' });
   }
-  if (typeof req.headers['x-api-key'] !== 'string' || authorization.slice(7) === req.headers['x-api-key']) throw new GatewayError('authentication_error', 'A separate gateway API key is required', { status: 401 });
+  if (authorization.slice(7) === req.headers['x-api-key'] || /^ldo-[arc]-/i.test(authorization.slice(7))) {
+    throw new GatewayError('authentication_error', 'A separate upstream credential is required', { status: 401 });
+  }
   return { authorization, ...(accountId ? { accountId } : {}) };
 }
 
 /** Match current configured public routes to this caller's account catalog. */
-function catalogTargets(key: ReturnType<typeof requireGatewayKey>) {
+function catalogTargets(key: AuthenticatedKey) {
   const db = getDb();
   const providers = new Map(db.select().from(schema.providers).all().filter(p => p.enabled && providerIntegration(p).authMode === 'client_oauth').map(p => [p.id, p]));
   const models = db.select().from(schema.models).all().filter(m => {
@@ -67,7 +70,7 @@ function catalogTargets(key: ReturnType<typeof requireGatewayKey>) {
 export async function registerCodexRoutes(app: FastifyInstance): Promise<void> {
   const runner = new GatewayRunner();
   app.get(`${CODEX_API_PATH}/models`, async (req, reply) => {
-    const key = requireGatewayKey(req, 'x-api-key');
+    const { key, oauthStillActive } = requireCodexGatewayKey(req);
     const auth = clientAuth(req);
     const targets = catalogTargets(key);
     reply.header('cache-control', 'no-store');
@@ -79,6 +82,7 @@ export async function registerCodexRoutes(app: FastifyInstance): Promise<void> {
     try {
       const catalog = await fetchCodexCatalog(auth, query.client_version);
       if (epoch !== getDatabaseEpoch()) throw new GatewayError('permission_error', 'Database changed during catalog request', { status: 409 });
+      if (oauthStillActive && !oauthStillActive()) throw new GatewayError('authentication_error', 'Gateway OAuth credential is no longer valid', { status: 401, code: 'gateway_oauth_invalid' });
       const current = getDb().select().from(schema.apiKeys).where(eq(schema.apiKeys.id, key.id)).get();
       if (!current || !keyIsActive(current) || !keyIpAllowed(key.id, resolveClientIp(req))) throw new GatewayError('permission_error', 'Gateway credential no longer permitted', { status: 403 });
       const fresh = catalogTargets({ ...key, allowAllModels: current.allowAllModels });
@@ -91,12 +95,12 @@ export async function registerCodexRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.post(`${CODEX_API_PATH}/responses`, async (req, reply) => {
-    const key = requireGatewayKey(req, 'x-api-key');
+    const { key, oauthStillActive } = requireCodexGatewayKey(req);
     const auth = clientAuth(req);
     const query = z.object({ client_version: z.string().regex(/^\d+\.\d+\.\d+$/).optional() }).parse(req.query);
     const body = Body.parse(req.body);
     validateCodexRequest(body);
-    const ctx = { requestId: String(req.id), clientIp: resolveClientIp(req), protocol: 'openai' as const, endpoint: 'responses', requestedModel: body.model, key, reply, codexAuth: auth, codexClientVersion: query.client_version };
+    const ctx = { requestId: String(req.id), clientIp: resolveClientIp(req), protocol: 'openai' as const, endpoint: 'responses', requestedModel: body.model, key, reply, codexAuth: auth, codexClientVersion: query.client_version, gatewayOAuthStillActive: oauthStillActive };
     // Native payload is not converted to Chat Completions or written to content
     // logs. Shared runner still owns ACL, admission, dispatch and accounting.
     try {

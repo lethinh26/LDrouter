@@ -22,6 +22,7 @@ import { registerAdminRoutes } from './routes/admin';
 import { registerGatewayRoutes } from './routes/gateway';
 import { registerHealthRoutes } from './routes/health';
 import { registerAdminIpGate } from './security/admin-ip-gate';
+import { redactString, redactValue } from './security/redact';
 import { metricsRegistry } from './metrics/registry';
 import { runDailyRequestHistoryCleanup } from './maintenance/retention';
 import { fatal, lifecycle, formatError, getDebugFlags, errorLine, requestLogFields, requestLogLevel, requestLogMessage } from './logging/debug';
@@ -69,7 +70,11 @@ export async function buildApp(opts: AppOptions = {}): Promise<App> {
     logger: false,
     bodyLimit: 64 * 1024 * 1024,
     trustProxy: cfg.trustProxyHops > 0,
-    genReqId: (req: { headers: Record<string, string | string[] | undefined> }) => (req.headers['x-request-id'] as string) || generateRequestId(),
+    requestIdHeader: false,
+    genReqId: (req: { headers: Record<string, string | string[] | undefined> }) => {
+      const id = req.headers['x-request-id'];
+      return typeof id === 'string' && /^[A-Za-z0-9._-]{1,128}$/.test(id) && redactString(id) === id ? id : generateRequestId();
+    },
   } as never) as unknown as App;
 
   await app.register(cookie, { secret: cfg.masterKey ?? 'latedev-dev-secret' });
@@ -84,13 +89,13 @@ export async function buildApp(opts: AppOptions = {}): Promise<App> {
   // are intentionally excluded; sensitive values must never reach logs.
   app.addHook('onRequest', async (req) => {
     (req as typeof req & { requestStartedAt?: number }).requestStartedAt = Date.now();
-    log.info({ requestId: req.id, method: req.method, url: req.url }, 'request received');
+    log.info({ requestId: req.id, method: req.method, url: redactString(req.url.split('?')[0] ?? '') }, 'request received');
   });
   app.addHook('onResponse', async (req, reply) => {
     reply.header('x-request-id', req.id as string);
     const startedAt = (req as typeof req & { requestStartedAt?: number }).requestStartedAt ?? Date.now();
     const statusCode = reply.statusCode;
-    const fields = requestLogFields(String(req.id), req.method, req.url, statusCode, Date.now() - startedAt, req.routeOptions?.url);
+    const fields = requestLogFields(String(req.id), req.method, redactString(req.url.split('?')[0] ?? ''), statusCode, Date.now() - startedAt, req.routeOptions?.url);
     const level = requestLogLevel(statusCode);
     log[level](fields, requestLogMessage(statusCode));
   });
@@ -119,16 +124,19 @@ export async function buildApp(opts: AppOptions = {}): Promise<App> {
       stack: normalized instanceof Error ? normalized.stack : undefined,
       cause: normalized instanceof Error ? (normalized as { cause?: unknown }).cause : undefined,
     };
-    if (status >= 500) log.error({ requestId, url: req.url, err: errDetail }, 'request error');
-    else log.warn({ requestId, url: req.url, err: { type: (g?.type ?? 'error'), message: errMsg } }, 'request rejected');
+    const safePath = redactString(req.url.split('?')[0] ?? '');
+    const oauthRoute = /^\/(?:oauth(?:\/|$)|api\/oauth(?:\/|$)|api\/admin\/gateway-oauth(?:\/|$))/.test(safePath);
+    const safeDetail = oauthRoute ? { message: 'Gateway OAuth request failed' } : redactValue(errDetail);
+    if (status >= 500) log.error({ requestId, url: safePath, err: safeDetail }, 'request error');
+    else log.warn({ requestId, url: safePath, err: { type: (g?.type ?? 'error'), message: oauthRoute ? 'Gateway OAuth request rejected' : redactString(errMsg) } }, 'request rejected');
 
     // docs/13 §19: server-side stack with request context (never to client).
     if (status >= 500) {
       errorLine(requestId, 'SERVER ERROR', [
-        `route=${req.routeOptions?.url ?? req.url}`,
+        `route=${req.routeOptions?.url ?? safePath}`,
         `method=${req.method}`,
         `statusCode=${status}`,
-        ...formatError(normalized),
+        ...(oauthRoute ? ['Gateway OAuth request failed'] : formatError(normalized).map(line => redactString(line))),
       ]);
     }
 

@@ -79,7 +79,7 @@ state or impersonate its OAuth client ID.
 The [documented Codex gateway integration](https://learn.chatgpt.com/docs/enterprise/connect-to-a-gateway)
 is distinct from the Sign in with ChatGPT OSS token-sharing preview. Codex
 signs in and refreshes its own credential. LateDev validates a separate
-`X-API-Key` and forwards only the signed-in Authorization and optional
+`X-API-Key` or first-party `X-Gateway-Token` and forwards only the signed-in Authorization and optional
 ChatGPT-Account-ID to the fixed `https://chatgpt.com/backend-api/codex` origin.
 Redirects, stored client credentials, and custom upstream headers are forbidden.
 
@@ -126,7 +126,7 @@ model IDs. Existing combos remain standard after migration 0018; kind is
 immutable. Mixed API-key providers and native OAuth members are rejected.
 Use the saved combo public ID (or a permitted alias) in the client configuration.
 The ordinary OpenAI-compatible endpoints and synthetic admin Test cannot invoke
-this combo; both client authorization and the gateway API key are required.
+this combo; both client authorization and gateway authorization are required.
 
 Configured availability is not an account entitlement. For every native combo
 request the gateway fetches the signed-in account's catalog using that same
@@ -148,10 +148,52 @@ switching, shared adaptive state, token rotation or same-model replay is used.
 Attempt and overall deadline limits still apply. No request payload or opaque
 upstream request identifier is persisted for native Codex.
 
-### OAuth authorization boundary
+### First-party Gateway OAuth (schema 0020)
 
-The gateway does not currently provide browser OAuth login, persistent profile
-management or automatic refresh. Client sign-in and refresh remain with Codex.
+This is LDrouter's own authorization server for the documented Codex Gateway
+OAuth integration. It is **not** a ChatGPT or Claude subscription login.
+Create an appropriately scoped, uncapped native Codex gateway API key first.
+In the Codex connection detail, copy the Gateway OAuth configuration, rather
+than the static API-key configuration. The fixed public client uses:
+
+```toml
+[model_providers.latedev-codex.gateway_oauth]
+authorization_url = "https://YOUR_GATEWAY/oauth/authorize"
+token_url = "https://YOUR_GATEWAY/api/oauth/token"
+client_id = "ldrouter-codex"
+redirect_port = 43127
+delivery = { kind = "header", name = "X-Gateway-Token", scheme = "Bearer" }
+```
+
+Keep the native model provider settings above, including
+`requires_openai_auth = true`, but omit `env_http_headers` for this method.
+Use HTTPS remotely. When proxy trust is enabled, restrict direct access to
+the gateway origin to the trusted reverse proxy and ensure the proxy replaces
+untrusted client-supplied forwarded protocol and IP headers. The current
+Fastify proxy trust setting is not a per-proxy address allowlist. HTTP is
+supported only for local loopback OAuth transport. The admin IP access policy
+applies to consent and token endpoints.
+
+The client opens the browser, the operator signs into LDrouter and explicitly
+approves an existing gateway key, and the browser returns a one-time code to
+the fixed loopback callback `http://127.0.0.1:43127/callback`. The client uses
+PKCE S256 to exchange the code (five-minute expiry), receives a 15-minute
+access token and a rotating refresh token with a 30-day idle expiry and a
+90-day absolute grant lifetime. Successful rotation invalidates the previous
+access token; reuse of a spent refresh token revokes the family. The client
+must reauthorize after expiry, replay or revocation. Only token digests are
+stored. Providers displays grant metadata and a revoke action; no token is
+displayed or exported. A normal restart preserves valid grants, but database
+restore invalidates them. The underlying API-key identity, ACL, IP restrictions,
+rate/concurrency limits and usage accounting remain authoritative. Disable or
+delete that key to block new gateway authorization. Revocation prevents new
+requests and fallback dispatches; it cannot retract an already sent request.
+Gateway OAuth is accepted only on native Codex endpoints; legacy API keys still
+work. The two gateway credential headers must not be combined.
+
+### Upstream OAuth authorization boundary
+
+Client ChatGPT sign-in and refresh remain with Codex.
 A future integration-specific managed OAuth flow requires a provider-approved
 registration, grant and deployment/storage policy permitting that specific use;
 the official [Sign in with ChatGPT terms](https://openai.com/policies/sign-in-with-chatgpt-terms/)

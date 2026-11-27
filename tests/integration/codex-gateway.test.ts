@@ -2,6 +2,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'latedev-codex-'));
@@ -76,6 +77,33 @@ beforeAll(async () => {
 });
 beforeEach(() => { calls.length = 0; nextStatus = 200; truncated = false; nativeEvents = null; catalogEntries = null; modelStatuses = {}; onMockCall = null; });
 afterAll(async () => { vi.restoreAllMocks(); await app?.close(); (await import('../../src/server/db')).closeDb(); fs.rmSync(dataDir, { recursive: true, force: true }); });
+
+async function issueGatewayOAuth(apiKeyId: string) {
+  const verifier = crypto.randomBytes(32).toString('base64url');
+  const redirectUri = 'http://127.0.0.1:43127/callback';
+  const approved = await app.inject({
+    method: 'POST', url: '/api/admin/gateway-oauth/authorize',
+    headers: { cookie, 'x-csrf-token': csrf, host: '127.0.0.1' },
+    payload: { client_id: 'ldrouter-codex', response_type: 'code', redirect_uri: redirectUri,
+      code_challenge: crypto.createHash('sha256').update(verifier).digest('base64url'),
+      code_challenge_method: 'S256', state: crypto.randomBytes(32).toString('base64url'), apiKeyId },
+  });
+  expect(approved.statusCode, approved.body).toBe(200);
+  const code = new URL(approved.json().redirectUrl).searchParams.get('code')!;
+  const exchanged = await app.inject({
+    method: 'POST', url: '/api/oauth/token',
+    headers: { 'content-type': 'application/x-www-form-urlencoded', host: '127.0.0.1' },
+    payload: new URLSearchParams({ grant_type: 'authorization_code', client_id: 'ldrouter-codex', code, redirect_uri: redirectUri, code_verifier: verifier }).toString(),
+  });
+  expect(exchanged.statusCode, exchanged.body).toBe(200);
+  return exchanged.json<{ access_token: string; refresh_token: string }>();
+}
+
+function oauthResponses(access: string, model = 'coding-alias') {
+  return app.inject({ method: 'POST', url: '/backend-api/codex/responses',
+    headers: { 'x-gateway-token': 'Bearer ' + access, authorization, 'chatgpt-account-id': 'fixture-account' },
+    payload: { model, stream: true, store: false, input: [{ type: 'message', role: 'user', content: 'fixture' }] } });
+}
 
 describe('native Codex gateway', () => {
   it('keeps client OAuth immutable and separate from compatible providers', async () => {
@@ -244,7 +272,7 @@ describe('native Codex gateway', () => {
 });
 
 describe('native Codex combo', () => {
-  let comboName = '', comboSecret = '', comboAlias = '';
+  let comboName = '', comboSecret = '', comboAlias = '', comboKeyId = '';
   const entries = [
     { slug: 'fixture-model', display_name: 'Fixture A', supported_reasoning_levels: ['high'], context_window: 10000 },
     { slug: 'fixture-fallback', display_name: 'Fixture B', supported_reasoning_levels: ['high'], context_window: 10000 },
@@ -259,7 +287,7 @@ describe('native Codex combo', () => {
     const alias = await admin('POST', 'aliases', { alias: 'native-coding-alias', targetKind: 'combo', targetId: combo.json().id });
     expect(alias.statusCode).toBe(200); comboAlias = 'native-coding-alias';
     const key = await admin('POST', 'api-keys', { name: 'Native combo only', allowAllModels: false, permissions: [{ targetKind: 'combo', targetId: combo.json().id }], maxConcurrent: 1 });
-    expect(key.statusCode).toBe(200); comboSecret = key.json().secret;
+    expect(key.statusCode).toBe(200); comboSecret = key.json().secret; comboKeyId = key.json().id;
   });
   beforeEach(() => { catalogEntries = entries.map(e => ({ ...e })); });
 
@@ -355,6 +383,23 @@ describe('native Codex combo', () => {
     expect(getRawDb().prepare('SELECT COUNT(*) AS n FROM requests').get()).toEqual(before);
   });
 
+  it('blocks a new fallback dispatch when the gateway OAuth grant is revoked during the first attempt', async () => {
+    const pair = await issueGatewayOAuth(comboKeyId);
+    const { getRawDb } = await import('../../src/server/db');
+    const { sha256Hex } = await import('../../src/server/auth/ids');
+    const grant = getRawDb().prepare('SELECT id FROM gateway_oauth_grants WHERE access_digest=?').get(sha256Hex(pair.access_token)) as { id: string };
+    modelStatuses = { 'fixture-model': 503 };
+    onMockCall = async url => {
+      if (!url.endsWith('/responses')) return;
+      onMockCall = null;
+      const revoked = await app.inject({ method: 'DELETE', url: '/api/admin/gateway-oauth/grants/' + grant.id, headers: { cookie, 'x-csrf-token': csrf } });
+      expect(revoked.statusCode).toBe(200);
+    };
+    const result = await oauthResponses(pair.access_token, comboName);
+    expect(result.statusCode).toBe(401);
+    expect(calls.map(c => c.body.model)).toEqual([undefined, 'fixture-model']);
+  });
+
   it('does not route a combo with missing or incompatible catalog metadata', async () => {
     catalogEntries = [{ ...entries[0] }, { ...entries[1], context_window: 5000 }];
     const list = await app.inject({ method: 'GET', url: '/backend-api/codex/models', headers: { authorization, 'x-api-key': comboSecret } });
@@ -381,5 +426,50 @@ describe('native Codex combo', () => {
     } finally {
       expect((await admin('PATCH', 'models', { id: modelId, capabilities: { image_input: null } })).statusCode).toBe(200);
     }
+  });
+});
+
+describe('first-party OAuth access to native Codex only', () => {
+  it('uses real issued tokens with the backing key ACL, shared accounting and no upstream disclosure', async () => {
+    const pair = await issueGatewayOAuth(keyId);
+    const header = { authorization, 'x-gateway-token': 'Bearer ' + pair.access_token };
+    const catalog = await app.inject({ method: 'GET', url: '/backend-api/codex/models', headers: header });
+    expect(catalog.statusCode).toBe(200);
+    expect(catalog.json().models.map((m: { slug: string }) => m.slug)).toEqual(['coding-alias']);
+    expect((await oauthResponses(pair.access_token, 'codex/fixture-model')).statusCode).toBe(403);
+    expect((await oauthResponses(pair.access_token, compatibleModel)).statusCode).toBe(403);
+    expect((await app.inject({ method: 'GET', url: '/v1/models', headers: { authorization: 'Bearer ' + pair.access_token } })).statusCode).toBe(401);
+    expect((await app.inject({ method: 'GET', url: '/backend-api/codex/models', headers: { ...header, authorization: 'Bearer ' + pair.access_token } })).statusCode).toBe(401);
+    expect((await app.inject({ method: 'GET', url: '/backend-api/codex/models', headers: { ...header, 'x-api-key': secret } })).statusCode).toBe(401);
+    expect((await app.inject({ method: 'GET', url: '/backend-api/codex/models', headers: { ...header, host: 'gateway.example' }, remoteAddress: '192.0.2.10' })).statusCode).toBe(401);
+    const result = await oauthResponses(pair.access_token);
+    expect(result.statusCode).toBe(200);
+    expect(result.body).toContain('response.completed');
+    expect(calls).toHaveLength(2);
+    for (const call of calls) {
+      expect(call.headers.get('authorization')).toBe(authorization);
+      expect(call.headers.has('x-gateway-token')).toBe(false);
+      expect(call.headers.has('x-api-key')).toBe(false);
+    }
+    const { getRawDb } = await import('../../src/server/db');
+    expect(getRawDb().prepare('SELECT api_key_id,success,total_tokens FROM requests WHERE id=?').get(result.headers['x-request-id'])).toEqual({ api_key_id: keyId, success: 1, total_tokens: 20 });
+  });
+
+  it('fences catalog results after revocation and does not fall back to a static key', async () => {
+    const pair = await issueGatewayOAuth(keyId);
+    const { getRawDb } = await import('../../src/server/db');
+    const { sha256Hex } = await import('../../src/server/auth/ids');
+    const grant = getRawDb().prepare('SELECT id FROM gateway_oauth_grants WHERE access_digest=?').get(sha256Hex(pair.access_token)) as { id: string };
+    onMockCall = async () => {
+      onMockCall = null;
+      const revoke = await app.inject({ method: 'DELETE', url: '/api/admin/gateway-oauth/grants/' + grant.id, headers: { cookie, 'x-csrf-token': csrf } });
+      expect(revoke.statusCode).toBe(200);
+    };
+    const header = { authorization, 'x-gateway-token': 'Bearer ' + pair.access_token };
+    expect((await app.inject({ method: 'GET', url: '/backend-api/codex/models', headers: header })).statusCode).toBe(401);
+    expect((await oauthResponses(pair.access_token)).statusCode).toBe(401);
+    expect((await app.inject({ method: 'GET', url: '/backend-api/codex/models', headers: { ...header, 'x-api-key': secret } })).statusCode).toBe(401);
+    expect(calls).toHaveLength(1);
+    expect((await responses()).statusCode).toBe(200);
   });
 });

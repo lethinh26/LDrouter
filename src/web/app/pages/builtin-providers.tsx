@@ -12,6 +12,8 @@ import { Input } from '../../components/ui/input';
 import { Label } from '../../components/ui/label';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../../components/ui/table';
 import { api } from '../../lib/api';
+import { GATEWAY_OAUTH_CLIENT_ID, GATEWAY_OAUTH_PATH, GATEWAY_OAUTH_REDIRECT_PORT } from '../../lib/gateway-oauth';
+import { GatewayOAuthGrants } from './gateway-oauth-grants';
 
 export type BuiltinKind = 'codex' | 'claude_code';
 export interface BuiltinConnection {
@@ -49,6 +51,29 @@ export function builtinClientConfiguration(kind: BuiltinKind, prefix: string, or
   return `ANTHROPIC_BASE_URL=${origin}\nANTHROPIC_AUTH_TOKEN=YOUR_GATEWAY_API_KEY\nANTHROPIC_MODEL=${prefix}/YOUR_IMPORTED_MODEL`;
 }
 
+/** Gateway OAuth supplies a distinct gateway credential, not the upstream bearer. */
+export function codexGatewayOAuthConfiguration(prefix: string, origin: string): string {
+  return [
+    'model_provider = "latedev-codex"',
+    `model = "${prefix}/YOUR_IMPORTED_MODEL"`,
+    '',
+    '[model_providers.latedev-codex]',
+    'name = "LateDev Codex"',
+    `base_url = "${origin}/backend-api/codex"`,
+    `model_catalog_url = "${origin}/backend-api/codex/models"`,
+    'wire_api = "responses"',
+    'requires_openai_auth = true',
+    'supports_websockets = false',
+    '',
+    '[model_providers.latedev-codex.gateway_oauth]',
+    `client_id = "${GATEWAY_OAUTH_CLIENT_ID}"`,
+    `authorization_url = "${origin}${GATEWAY_OAUTH_PATH}"`,
+    `token_url = "${origin}/api/oauth/token"`,
+    `redirect_port = ${GATEWAY_OAUTH_REDIRECT_PORT}`,
+    'delivery = { kind = "header", name = "X-Gateway-Token", scheme = "Bearer" }',
+  ].join('\n');
+}
+
 export function canCreateBuiltinConnection(provider: BuiltinProvider): boolean {
   // Existing legacy profiles stay addressable without consuming the single
   // canonical profile slot. A disabled canonical profile still occupies it.
@@ -57,7 +82,7 @@ export function canCreateBuiltinConnection(provider: BuiltinProvider): boolean {
 
 function description(kind: BuiltinKind) {
   return kind === 'codex'
-    ? 'One canonical client-sign-in profile for native Codex Responses. Existing legacy profiles retain their model prefixes. Sign in inside the Codex client, not in LateDev.'
+    ? 'One canonical profile for native Codex Responses. Existing legacy profiles retain their model prefixes. Upstream account sign-in remains inside Codex; LDrouter gateway authorization is separate.'
     : 'Connect authorized Anthropic API keys for Claude Code. Models are pinned to a connection; there is no automatic credential rotation.';
 }
 
@@ -185,6 +210,7 @@ export function BuiltinProviders({ revision }: { revision: number }) {
   }
 
   const config = provider && connection ? builtinClientConfiguration(provider.kind, builtinModelPrefix(provider, connection), window.location.origin) : '';
+  const gatewayOAuthConfig = provider?.kind === 'codex' && connection ? codexGatewayOAuthConfiguration(builtinModelPrefix(provider, connection), window.location.origin) : '';
 
   return <section aria-label="Built-in Providers" className="space-y-4">
     <div className="flex flex-wrap items-center justify-between gap-3">
@@ -263,10 +289,19 @@ export function BuiltinProviders({ revision }: { revision: number }) {
                 if (!navigator.clipboard) toast.error('Clipboard unavailable; copy the configuration manually');
               }}><Copy className="mr-1 h-3.5 w-3.5" />Copy configuration</Button></div>
               <p className="text-sm text-muted-foreground">In Models, choose the backing connection named <strong>{connection.name}</strong> ({connection.slug}). Import the desired upstream model first, then replace the placeholder with its exact public model ID.</p>
-              {provider.kind === 'codex' ? <p className="text-sm text-muted-foreground">Sign in and test inside Codex. The profile is not a stored account or browser OAuth session. Use a separate scoped gateway key without token caps. Native Codex combos or their aliases may be used when eligible for the same signed-in account.</p>
+              {provider.kind === 'codex' ? <p className="text-sm text-muted-foreground">Sign in to the upstream account and test inside Codex. The profile is not a stored upstream account. The API-key configuration below remains supported; use a separate scoped gateway key without token caps. Native Codex combos or their aliases may be used when eligible for the same signed-in account.</p>
                 : <p className="text-sm text-muted-foreground">Use a scoped gateway API key in the client environment, not the upstream Anthropic API key. Model IDs select their pinned backing connection. Claude subscription OAuth is not supported.</p>}
               <p className="text-xs text-muted-foreground">Use HTTPS for remote clients.</p>
               <pre className="overflow-x-auto whitespace-pre-wrap break-all rounded-md bg-muted p-3 font-mono text-xs leading-relaxed">{config}</pre>
+              {provider.kind === 'codex' && <div className="space-y-2 border-t pt-3">
+                <div className="flex flex-wrap items-center justify-between gap-2"><h4 className="text-sm font-semibold">Alternative: Gateway OAuth</h4><Button variant="outline" size="sm" onClick={() => {
+                  void navigator.clipboard?.writeText(gatewayOAuthConfig).then(() => toast.success('Gateway OAuth configuration copied'), () => toast.error('Clipboard unavailable'));
+                  if (!navigator.clipboard) toast.error('Clipboard unavailable; copy the configuration manually');
+                }}><Copy className="mr-1 h-3.5 w-3.5" />Copy Gateway OAuth config</Button></div>
+                <p className="text-sm text-muted-foreground">Use this complete configuration instead of the API-key configuration, with a Codex version that supports gateway OAuth. Keep upstream sign-in enabled. Start gateway sign-in inside Codex, then approve an existing scoped API key in LDrouter. Do not combine both gateway credential methods.</p>
+                <p className="text-xs text-muted-foreground">The client receives LDrouter access and refresh tokens using the fixed loopback callback; these do not replace upstream account sign-in or refresh upstream tokens.</p>
+                <pre className="overflow-x-auto whitespace-pre-wrap break-all rounded-md bg-muted p-3 font-mono text-xs leading-relaxed">{gatewayOAuthConfig}</pre>
+              </div>}
             </div>
           </> : <>
             {connectionId && <p role="alert" className="text-sm text-destructive">Connection is no longer present in the current catalog.</p>}
@@ -298,6 +333,7 @@ export function BuiltinProviders({ revision }: { revision: number }) {
           </>}
         </CardContent>
       </Card>}
+    <GatewayOAuthGrants />
 
     <Dialog open={createOpen && !!provider} onOpenChange={(next) => { if (!next && busy === null) clearCreate(); }}>
       <DialogContent className="max-h-[90vh] overflow-y-auto">
