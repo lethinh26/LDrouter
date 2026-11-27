@@ -34,6 +34,8 @@ export function Providers() {
   const [editForm, setEditForm] = useState(EMPTY);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [deleteSubmitting, setDeleteSubmitting] = useState(false);
+  const editingProvider = rows.find((row) => row.id === editingId);
+  const slugLocked = (editingProvider?.modelCount ?? 0) > 0;
 
   const reload = async () => {
     try {
@@ -113,7 +115,7 @@ export function Providers() {
               </DialogHeader>
               <div className="space-y-3">
                 <div><Label htmlFor="provider-name">Name</Label><Input id="provider-name" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></div>
-                <div><Label htmlFor="provider-slug">Slug (optional)</Label><Input id="provider-slug" value={form.slug} onChange={(e) => setForm({ ...form, slug: e.target.value })} /></div>
+                <div><Label htmlFor="provider-slug">Slug (optional)</Label><Input id="provider-slug" value={form.slug} onChange={(e) => setForm({ ...form, slug: e.target.value })} /><p className="mt-1 text-xs text-muted-foreground">Unique model prefix. Defaults to the normalized name. Reserved prefix: combo. The slug is locked after models are imported.</p></div>
                 <div><Label>Type</Label>
                   <Select value={form.type} onValueChange={(v) => setForm((current) => ({ ...current, type: v as 'openai' | 'anthropic', baseUrl: DEFAULT_BASE_URL[v as 'openai' | 'anthropic'] }))}>
                     <SelectTrigger><SelectValue /></SelectTrigger>
@@ -181,9 +183,9 @@ export function Providers() {
           <DialogHeader><DialogTitle>Edit provider</DialogTitle></DialogHeader>
           <div className="space-y-3">
             <div><Label>Name</Label><Input value={editForm.name} onChange={(e) => setEditForm({ ...editForm, name: e.target.value })} /></div>
-            <div><Label>Slug (optional)</Label><Input value={editForm.slug} onChange={(e) => setEditForm({ ...editForm, slug: e.target.value })} /></div>
+            <div><Label htmlFor="edit-provider-slug">Slug</Label><Input id="edit-provider-slug" value={editForm.slug} disabled={slugLocked} onChange={(e) => setEditForm({ ...editForm, slug: e.target.value })} /><p className="mt-1 text-xs text-muted-foreground">{slugLocked ? 'Locked to preserve existing public model IDs and client configurations.' : 'Unique model prefix; may be changed before importing models.'}</p></div>
             <div><Label>Type</Label>
-              <Select value={editForm.type} onValueChange={(v) => setEditForm({ ...editForm, type: v as 'openai' | 'anthropic' })}>
+              <Select value={editForm.type} disabled>
                 <SelectTrigger><SelectValue /></SelectTrigger>
                 <SelectContent>
                   <SelectItem value="openai">OpenAI-compatible</SelectItem>

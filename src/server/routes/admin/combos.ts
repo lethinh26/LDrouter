@@ -13,6 +13,7 @@ import type { CanonicalRequest } from '../../routing/capabilities';
 import { circuitBlocks, modelThrottleBlocks } from '../../routing/circuit';
 import { listAdaptiveStates } from '../../routing/combo-adaptive-state';
 import { freshSamples, median, SAMPLE_TTL_MS } from '../../routing/combo-policy';
+import { assertRoutingNameFree } from '../../routing/namespace';
 
 const MemberSpec = z.object({ modelId: z.string(), position: z.number().int().min(0), enabled: z.boolean().default(true) });
 
@@ -75,9 +76,8 @@ function assertComboIdFree(db: ComboDb, slug: string, publicModelId: string, exc
     .all()
     .find((c) => c.id !== excludeId);
   if (clash) throw new GatewayError('invalid_request_error', 'Combo ID already in use', { status: 400 });
-  if (db.select().from(schema.models).where(eq(schema.models.publicModelId, publicModelId)).get()) {
-    throw new GatewayError('invalid_request_error', `A model with ID "${publicModelId}" already exists`, { status: 400 });
-  }
+  assertRoutingNameFree(db, publicModelId, 'combo', excludeId);
+  if (slug !== publicModelId) assertRoutingNameFree(db, slug, 'combo', excludeId);
 }
 
 /** Slug triple the route / slug triple the runtime resolver expects. */

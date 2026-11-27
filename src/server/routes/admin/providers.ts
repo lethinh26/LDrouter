@@ -6,7 +6,8 @@ import { getDb, schema } from '../../db/index';
 import { requireAdminAuth } from '../../auth/middleware';
 import { recordAudit } from '../../db/repositories/audit';
 import { encryptSecret, decryptSecret, encryptCustomHeaders, decryptCustomHeaders, isMasterKeyConfigured } from '../../auth/crypto';
-import { uuid, slugify } from '../../auth/ids';
+import { uuid } from '../../auth/ids';
+import { normalizeProviderSlug, assertProviderSlugFree } from '../../routing/namespace';
 import { GatewayError } from '../../errors';
 import type { Provider } from '../../db/schema';
 import { probeProvider, discoverProviderModels, type DiscoveredModel, type ProbeResult } from '../../providers/index';
@@ -84,11 +85,8 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
     if (!baseUrl) throw new GatewayError('invalid_request_error', 'Base URL is required', { status: 400 });
     requireMasterKey(); // Need master key to encrypt new credentials
     const db = getDb();
-    const slug = slugify(body.slug ?? name);
-    const dup = db.select().from(schema.providers).where(eq(schema.providers.slug, slug)).get();
-    if (dup) {
-      throw new GatewayError('invalid_request_error', `Provider slug '${slug}' is already in use`, { status: 400 });
-    }
+    const slug = normalizeProviderSlug(body.slug ?? name);
+    assertProviderSlugFree(db, slug);
     const enc = encryptSecret(body.apiKey);
     const headersEnc = body.customHeaders ? encryptCustomHeaders(body.customHeaders) : null;
     const id = uuid();
@@ -124,7 +122,19 @@ export async function registerProviderRoutes(app: FastifyInstance): Promise<void
     if (!p) throw new GatewayError('invalid_request_error', 'Provider not found', { status: 404 });
     const update: Partial<typeof schema.providers.$inferInsert> = { updatedAt: new Date().toISOString() };
     if (body.name) update.name = body.name;
-    if (body.slug) update.slug = slugify(body.slug);
+    if (body.slug !== undefined && body.slug !== p.slug) {
+      const slug = normalizeProviderSlug(body.slug);
+      if (slug !== p.slug) {
+        if (db.select({ id: schema.models.id }).from(schema.models).where(eq(schema.models.providerId, p.id)).get()) {
+          throw new GatewayError('invalid_request_error', 'Provider slug cannot be changed after importing models; existing public model IDs must remain stable', { status: 409, code: 'provider_slug_locked' });
+        }
+        assertProviderSlugFree(db, slug, p.id);
+        update.slug = slug;
+      }
+    }
+    if (body.type !== undefined && body.type !== p.type) {
+      throw new GatewayError('invalid_request_error', 'Provider protocol is immutable; create a new provider instead', { status: 400 });
+    }
     if (body.baseUrl) update.baseUrl = body.baseUrl;
     if (body.enabled !== undefined) update.enabled = body.enabled;
     if (body.connectTimeoutMs !== undefined) update.connectTimeoutMs = body.connectTimeoutMs;

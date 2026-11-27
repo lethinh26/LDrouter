@@ -2,7 +2,8 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { eq, sql } from 'drizzle-orm';
-import { getDb, schema } from '../../db/index';
+import { getDb, getDatabaseEpoch, schema } from '../../db/index';
+import { assertRoutingNameFree } from '../../routing/namespace';
 import { requireAdminAuth } from '../../auth/middleware';
 import { recordAudit } from '../../db/repositories/audit';
 import { uuid } from '../../auth/ids';
@@ -86,6 +87,7 @@ export async function registerModelRoutes(app: FastifyInstance): Promise<void> {
     const db = getDb();
     const provider = db.select().from(schema.providers).where(eq(schema.providers.id, body.providerId)).get();
     if (!provider) throw new GatewayError('invalid_request_error', 'Provider not found', { status: 404 });
+    const epoch = getDatabaseEpoch();
 
     // Fetch discovered model metadata fresh (so import uses current discovery data)
     // For simplicity: re-discover and match by upstream id.
@@ -102,9 +104,15 @@ export async function registerModelRoutes(app: FastifyInstance): Promise<void> {
     }
     const discMap = new Map(discovered.map((d) => [d.upstreamId, d]));
     const now = new Date().toISOString();
+    if (epoch !== getDatabaseEpoch()) throw new GatewayError('invalid_request_error', 'Database changed during discovery; retry import', { status: 409 });
     let imported = 0;
-    for (const upstreamId of body.modelIds) {
-      const existing = db.select().from(schema.models).where(sql`provider_id = ${provider.id} AND upstream_model_id = ${upstreamId}`).get();
+    db.transaction((tx) => {
+    const current = tx.select().from(schema.providers).where(eq(schema.providers.id, provider.id)).get();
+    if (!current || current.slug !== provider.slug || current.updatedAt !== provider.updatedAt) {
+      throw new GatewayError('invalid_request_error', 'Provider changed during discovery; retry import', { status: 409 });
+    }
+    for (const upstreamId of new Set(body.modelIds)) {
+      const existing = tx.select().from(schema.models).where(sql`provider_id = ${provider.id} AND upstream_model_id = ${upstreamId}`).get();
       const disc = discMap.get(upstreamId);
       const caps = (disc?.capabilities as Record<string, unknown>) ?? { chat: true, streaming: true, tools: true };
       if (existing) {
@@ -115,7 +123,7 @@ export async function registerModelRoutes(app: FastifyInstance): Promise<void> {
           existing.discoveredMetadataJson ? safeJson(existing.discoveredMetadataJson) : null,
           caps
         );
-        db.update(schema.models)
+        tx.update(schema.models)
           .set({
             upstreamAvailable: true,
             lastSeenUpstreamAt: now,
@@ -128,7 +136,8 @@ export async function registerModelRoutes(app: FastifyInstance): Promise<void> {
         continue;
       }
       const publicModelId = `${provider.slug}/${upstreamId}`;
-      db.insert(schema.models).values({
+      assertRoutingNameFree(tx, publicModelId, 'model');
+      tx.insert(schema.models).values({
         id: uuid(),
         providerId: provider.id,
         upstreamModelId: upstreamId,
@@ -144,6 +153,7 @@ export async function registerModelRoutes(app: FastifyInstance): Promise<void> {
       }).run();
       imported++;
     }
+    });
     recordAudit({ action: 'model.import', success: true, targetType: 'provider', targetId: provider.id, targetName: provider.name, ip: req.ip, metadata: { count: body.modelIds.length, imported } });
     return { ok: true, imported, requested: body.modelIds.length };
   });
