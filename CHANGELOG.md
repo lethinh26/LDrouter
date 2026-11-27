@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-11-27
+
 ### Added
 
 - Separate built-in Codex and Claude Code Provider Center, with fixed canonical model prefixes `cx/` and `cc/`, connection management, independent authorized Claude API-key connections and per-connection gateway usage.

@@ -689,7 +689,8 @@ def smoke(base, upstream):
             grant_card = page.locator('[aria-label="Gateway OAuth grants"]')
             grant_row = grant_card.get_by_role("row").filter(has_text=grant["id"])
             expect(grant_row.get_by_text("active", exact=True)).to_be_visible()
-            expect(grant_row.get_by_text("Provider scoped fixture", exact=True)).to_be_visible()
+            # The first cell contains both the key name and grant UUID.
+            expect(grant_row.get_by_role("cell").first).to_have_text(re.compile(r"^Provider scoped fixture\s*" + re.escape(grant["id"]) + r"$"))
             revoke = grant_row.get_by_role("button", name="Revoke grant " + grant["id"], exact=True)
             revoke.click()
             confirmation = page.get_by_role("alertdialog", name="Revoke gateway OAuth grant?")
